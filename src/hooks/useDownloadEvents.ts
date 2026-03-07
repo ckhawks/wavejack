@@ -1,7 +1,7 @@
 import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useDownloadStore } from "../stores/downloadStore";
-import type { DownloadStatusEvent } from "../lib/types";
+import type { DownloadItem, DownloadStatusEvent } from "../lib/types";
 
 /**
  * Hook that listens to Tauri "download-status" events from the Rust backend
@@ -18,10 +18,10 @@ export function useDownloadEvents() {
         const { id, status, progress, message, backend, title, file_path } =
           event.payload;
         updateDownload(id, {
-          status: status as DownloadStatusEvent["status"],
+          status: status as DownloadItem["status"],
           progress,
           message,
-          backend,
+          backend: backend as DownloadItem["backend"],
           ...(title ? { title } : {}),
           ...(file_path ? { filePath: file_path } : {}),
         });

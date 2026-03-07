@@ -7,7 +7,7 @@ export function DownloadQueue() {
   const clearCompleted = useDownloadStore((s) => s.clearCompleted);
 
   const hasCompleted = downloads.some(
-    (d) => d.status === "complete" || d.status === "error"
+    (d) => d.status === "complete" || d.status === "error" || d.status === "file_missing"
   );
 
   return (

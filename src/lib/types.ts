@@ -3,11 +3,12 @@ export interface DownloadItem {
   id: string;
   url: string;
   format: "mp4" | "mp3";
-  status: "pending" | "downloading" | "converting" | "complete" | "error";
+  status: "pending" | "downloading" | "converting" | "complete" | "error" | "file_missing";
   progress: number;
   message: string;
   backend: "ytdlp" | "cobalt" | "none" | "";
   title?: string;
+  artist?: string;
   filePath?: string;
 }
 
@@ -27,6 +28,20 @@ export interface DownloadStatusEvent {
   backend: string;
   title?: string;
   file_path?: string;
+}
+
+/** A download record from the SQLite database */
+export interface DownloadRecord {
+  id: string;
+  url: string;
+  format: string;
+  status: string;
+  title: string;
+  artist: string;
+  file_path: string;
+  backend: string;
+  message: string;
+  created_at: string;
 }
 
 /** Shape of the ytdlp-download-progress event from Rust */

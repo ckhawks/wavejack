@@ -4,6 +4,7 @@
 // NOTE: The public api.cobalt.tools has bot protection, so users need
 // to configure their own cobalt instance URL in settings.
 
+use crate::downloader::DownloadResult;
 use crate::error::AppError;
 use crate::ytdlp::DownloadStatusEvent;
 use futures_util::StreamExt;
@@ -25,7 +26,7 @@ pub async fn download_with_cobalt(
     output_dir: &str,
     download_id: &str,
     app: &AppHandle,
-) -> Result<(), AppError> {
+) -> Result<DownloadResult, AppError> {
     // Build the HTTP client
     let client = reqwest::Client::new();
 
@@ -143,6 +144,8 @@ pub async fn download_with_cobalt(
         );
     }
 
+    let file_path_str = file_path.to_string_lossy().to_string();
+
     // Emit completion
     let _ = app.emit(
         "download-status",
@@ -152,12 +155,16 @@ pub async fn download_with_cobalt(
             progress: 100.0,
             message: "Download complete!".into(),
             backend: "cobalt".into(),
-            title: Some(filename),
-            file_path: Some(file_path.to_string_lossy().to_string()),
+            title: Some(filename.clone()),
+            file_path: Some(file_path_str.clone()),
         },
     );
 
-    Ok(())
+    Ok(DownloadResult {
+        title: Some(filename),
+        file_path: Some(file_path_str),
+        backend: "cobalt".to_string(),
+    })
 }
 
 /// Try to extract a filename from the HTTP response headers.

@@ -10,6 +10,13 @@ use crate::error::AppError;
 use crate::ytdlp::{download_with_ytdlp, ensure_ytdlp, DownloadStatusEvent};
 use tauri::{AppHandle, Emitter};
 
+/// Result data returned on successful download, used for DB persistence.
+pub struct DownloadResult {
+    pub title: Option<String>,
+    pub file_path: Option<String>,
+    pub backend: String,
+}
+
 /// Main download function — this is what gets called from the Tauri command.
 /// It handles the yt-dlp → cobalt fallback logic.
 ///
@@ -27,7 +34,7 @@ pub async fn download(
     format: &str,
     output_dir: &str,
     cobalt_url: &str,
-) -> Result<(), AppError> {
+) -> Result<DownloadResult, AppError> {
     // Step 1: Make sure yt-dlp is available (download if needed)
     let ytdlp_result = ensure_ytdlp(app).await;
 
@@ -37,7 +44,7 @@ pub async fn download(
             // We have yt-dlp, try using it
             match download_with_ytdlp(&ytdlp_path, url, format, output_dir, download_id, app).await
             {
-                Ok(()) => return Ok(()), // Success! We're done.
+                Ok(result) => return Ok(result), // Success! We're done.
                 Err(e) => {
                     // yt-dlp failed — log the error and try cobalt
                     let err_msg = e.to_string();
@@ -71,7 +78,7 @@ pub async fn download(
         );
 
         match download_with_cobalt(cobalt_url, url, format, output_dir, download_id, app).await {
-            Ok(()) => return Ok(()), // Cobalt succeeded!
+            Ok(result) => return Ok(result), // Cobalt succeeded!
             Err(e) => {
                 // Both backends failed — report both errors
                 let cobalt_err = e.to_string();

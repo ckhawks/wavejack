@@ -5,6 +5,7 @@
 //   3. Spawning yt-dlp as a child process and parsing its progress output
 //   4. Emitting Tauri events so the frontend can show real-time progress
 
+use crate::downloader::DownloadResult;
 use crate::error::AppError;
 use futures_util::StreamExt;
 use std::path::PathBuf;
@@ -164,7 +165,7 @@ pub async fn download_with_ytdlp(
     output_dir: &str,
     download_id: &str,
     app: &AppHandle,
-) -> Result<(), AppError> {
+) -> Result<DownloadResult, AppError> {
     // Build the yt-dlp command with the right arguments for the requested format
     let mut cmd = Command::new(ytdlp_path);
 
@@ -338,9 +339,13 @@ pub async fn download_with_ytdlp(
         progress: 100.0,
         message: "Download complete!".into(),
         backend: "ytdlp".into(),
-        title,
-        file_path,
+        title: title.clone(),
+        file_path: file_path.clone(),
     });
 
-    Ok(())
+    Ok(DownloadResult {
+        title,
+        file_path,
+        backend: "ytdlp".to_string(),
+    })
 }
