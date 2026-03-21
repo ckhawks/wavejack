@@ -50,7 +50,7 @@ export function Layout() {
             data-tauri-drag-region
             className="text-sm font-semibold tracking-tight text-white"
           >
-            Siphon
+            Wavejack
           </h1>
         </div>
         <div className="flex items-center">

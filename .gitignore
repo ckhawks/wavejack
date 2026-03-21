@@ -1,3 +1,27 @@
+# Dependencies
 node_modules/
+
+# Build output
 dist/
-src-tauri/target/
+app/src-tauri/target/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Vite
+.vite/
+
+# Rust
+*.pdb

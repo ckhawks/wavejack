@@ -1,8 +1,8 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicedoc/tauri-configs/main/schemas/tauri.conf.json",
-  "productName": "Siphon",
+  "productName": "Wavejack",
   "version": "0.1.0",
-  "identifier": "com.siphon.app",
+  "identifier": "com.wavejack.app",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Siphon",
+        "title": "Wavejack",
         "width": 900,
         "height": 700,
         "resizable": true,

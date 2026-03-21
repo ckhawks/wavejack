@@ -1,10 +1,10 @@
 [package]
-name = "media-downloader"
+name = "wavejack"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "media_downloader_lib"
+name = "wavejack_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
