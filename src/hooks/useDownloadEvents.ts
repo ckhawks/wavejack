@@ -15,15 +15,27 @@ export function useDownloadEvents() {
     const unlisten = listen<DownloadStatusEvent>(
       "download-status",
       (event) => {
-        const { id, status, progress, message, backend, title, file_path } =
+        const { id, status, progress, message, backend, title, file_path, cover_art_base64 } =
           event.payload;
+
+        // Infer artist/title from filename if it contains " - "
+        let inferredTitle = title;
+        let inferredArtist: string | undefined;
+        if (title && title.includes(" - ")) {
+          const dashIndex = title.indexOf(" - ");
+          inferredArtist = title.substring(0, dashIndex).trim();
+          inferredTitle = title.substring(dashIndex + 3).trim();
+        }
+
         updateDownload(id, {
           status: status as DownloadItem["status"],
           progress,
           message,
           backend: backend as DownloadItem["backend"],
-          ...(title ? { title } : {}),
+          ...(inferredTitle ? { title: inferredTitle } : {}),
+          ...(inferredArtist ? { artist: inferredArtist } : {}),
           ...(file_path ? { filePath: file_path } : {}),
+          ...(cover_art_base64 ? { coverArtBase64: cover_art_base64 } : {}),
         });
       }
     );

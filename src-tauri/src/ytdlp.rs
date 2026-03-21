@@ -8,6 +8,7 @@
 use crate::downloader::DownloadResult;
 use crate::error::AppError;
 use futures_util::StreamExt;
+use id3::TagLike;
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -146,6 +147,8 @@ pub struct DownloadStatusEvent {
     pub title: Option<String>,
     /// The final file path on disk (set when download completes)
     pub file_path: Option<String>,
+    /// Base64-encoded cover art (YouTube thumbnail or MusicBrainz art)
+    pub cover_art_base64: Option<String>,
 }
 
 /// Actually run yt-dlp to download a URL.
@@ -177,6 +180,14 @@ pub async fn download_with_ytdlp(
         .arg("--no-colors") // Don't use ANSI color codes
         .arg("-o") // Output filename template
         .arg(format!("{}/%(title)s.%(ext)s", output_dir));
+
+    // Prevent playlist re-expansion when downloading individual items
+    cmd.arg("--no-playlist");
+
+    // Write thumbnail so we can use it as cover art
+    cmd.arg("--write-thumbnail")
+        .arg("--convert-thumbnails")
+        .arg("jpg");
 
     // Add format-specific arguments
     match format {
@@ -243,6 +254,23 @@ pub async fn download_with_ytdlp(
             }
         }
 
+        // Catch "[download] /path/to/file has already been downloaded" (file already exists)
+        if line.contains("has already been downloaded") {
+            // Format: "[download] /path/to/file.ext has already been downloaded"
+            if let Some(rest) = line.strip_prefix("[download]") {
+                let rest = rest.trim();
+                if let Some(path_str) = rest.strip_suffix("has already been downloaded") {
+                    let path_str = path_str.trim();
+                    if !path_str.is_empty() {
+                        file_path = Some(path_str.to_string());
+                        if let Some(name) = std::path::Path::new(path_str).file_stem() {
+                            title = Some(name.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            }
+        }
+
         // Also catch "[Merger] Merging formats into ..." which gives the final path
         if line.contains("[Merger] Merging formats into") {
             if let Some(path) = line.split('"').nth(1) {
@@ -269,6 +297,7 @@ pub async fn download_with_ytdlp(
                 backend: "ytdlp".into(),
                 title: title.clone(),
                 file_path: None,
+                cover_art_base64: None,
             });
             continue;
         }
@@ -290,6 +319,7 @@ pub async fn download_with_ytdlp(
                         backend: "ytdlp".into(),
                         title: title.clone(),
                         file_path: None,
+                        cover_art_base64: None,
                     });
                 }
             }
@@ -305,6 +335,7 @@ pub async fn download_with_ytdlp(
                 backend: "ytdlp".into(),
                 title: title.clone(),
                 file_path: None,
+                cover_art_base64: None,
             });
         }
     }
@@ -332,6 +363,42 @@ pub async fn download_with_ytdlp(
         return Err(AppError::YtDlpFailed(error_msg));
     }
 
+    // Try to find and process the YouTube thumbnail
+    let mut cover_art_base64: Option<String> = None;
+    if let Some(ref fp) = file_path {
+        let media_path = std::path::Path::new(fp);
+        // yt-dlp saves thumbnails as <name>.jpg next to the media file
+        let thumb_path = media_path.with_extension("jpg");
+        if thumb_path.exists() {
+            if let Ok(thumb_bytes) = tokio::fs::read(&thumb_path).await {
+                if !thumb_bytes.is_empty() {
+                    use base64::Engine;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&thumb_bytes);
+                    cover_art_base64 = Some(b64);
+
+                    // Embed thumbnail as cover art in MP3 files
+                    if fp.ends_with(".mp3") {
+                        let mp3_path = std::path::PathBuf::from(fp);
+                        let mut tag = id3::Tag::read_from_path(&mp3_path)
+                            .unwrap_or_else(|_| id3::Tag::new());
+                        // Only embed if no cover art already present
+                        if tag.pictures().next().is_none() {
+                            tag.add_frame(id3::frame::Picture {
+                                mime_type: "image/jpeg".to_string(),
+                                picture_type: id3::frame::PictureType::CoverFront,
+                                description: String::new(),
+                                data: thumb_bytes,
+                            });
+                            let _ = tag.write_to_path(&mp3_path, id3::Version::Id3v24);
+                        }
+                    }
+                }
+            }
+            // Clean up the thumbnail file
+            let _ = tokio::fs::remove_file(&thumb_path).await;
+        }
+    }
+
     // Emit completion event with the final file path
     let _ = app.emit("download-status", DownloadStatusEvent {
         id: download_id.to_string(),
@@ -341,11 +408,105 @@ pub async fn download_with_ytdlp(
         backend: "ytdlp".into(),
         title: title.clone(),
         file_path: file_path.clone(),
+        cover_art_base64: cover_art_base64.clone(),
     });
 
     Ok(DownloadResult {
         title,
         file_path,
         backend: "ytdlp".to_string(),
+        cover_art_base64,
+    })
+}
+
+/// A single entry in a playlist.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PlaylistEntry {
+    pub url: String,
+    pub title: String,
+    pub duration: Option<f64>,
+    pub uploader: Option<String>,
+}
+
+/// Playlist metadata extracted via yt-dlp --flat-playlist.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PlaylistInfo {
+    pub title: String,
+    pub uploader: Option<String>,
+    pub entries: Vec<PlaylistEntry>,
+    pub playlist_url: String,
+}
+
+/// Extract playlist entries without downloading.
+pub async fn extract_playlist(
+    ytdlp_path: &PathBuf,
+    url: &str,
+) -> Result<PlaylistInfo, AppError> {
+    let output = Command::new(ytdlp_path)
+        .args(["--flat-playlist", "-J", "--no-warnings", url])
+        .output()
+        .await
+        .map_err(|e| AppError::YtDlpFailed(format!("Failed to spawn yt-dlp: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::YtDlpFailed(format!(
+            "yt-dlp playlist extraction failed: {}",
+            stderr
+        )));
+    }
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| AppError::YtDlpFailed(format!("Invalid JSON from yt-dlp: {}", e)))?;
+
+    let entries_arr = json["entries"]
+        .as_array()
+        .ok_or_else(|| AppError::YtDlpFailed("Not a playlist (no entries array)".to_string()))?;
+
+    let playlist_title = json["title"].as_str().unwrap_or("Playlist").to_string();
+    let uploader = json["uploader"].as_str().map(|s| s.to_string());
+
+    let entries: Vec<PlaylistEntry> = entries_arr
+        .iter()
+        .filter_map(|entry| {
+            let entry_url = entry["url"]
+                .as_str()
+                .or_else(|| entry["id"].as_str())
+                .map(|s| {
+                    if s.starts_with("http") {
+                        s.to_string()
+                    } else {
+                        format!("https://www.youtube.com/watch?v={}", s)
+                    }
+                })?;
+
+            let title = entry["title"]
+                .as_str()
+                .unwrap_or("Unknown")
+                .to_string();
+
+            let duration = entry["duration"].as_f64();
+            let uploader = entry["uploader"].as_str().map(|s| s.to_string());
+
+            Some(PlaylistEntry {
+                url: entry_url,
+                title,
+                duration,
+                uploader,
+            })
+        })
+        .collect();
+
+    if entries.is_empty() {
+        return Err(AppError::YtDlpFailed(
+            "Playlist has no entries".to_string(),
+        ));
+    }
+
+    Ok(PlaylistInfo {
+        title: playlist_title,
+        uploader,
+        entries,
+        playlist_url: url.to_string(),
     })
 }

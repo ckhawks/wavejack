@@ -13,7 +13,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   settings: {
     outputDir: "",
     cobaltUrl: "",
-    format: "mp4",
+    format: "mp3",
   },
   loaded: false,
 

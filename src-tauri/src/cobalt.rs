@@ -92,6 +92,7 @@ pub async fn download_with_cobalt(
             backend: "cobalt".into(),
             title: None,
             file_path: None,
+            cover_art_base64: None,
         },
     );
 
@@ -140,6 +141,7 @@ pub async fn download_with_cobalt(
                 backend: "cobalt".into(),
                 title: None,
                 file_path: None,
+                cover_art_base64: None,
             },
         );
     }
@@ -157,6 +159,7 @@ pub async fn download_with_cobalt(
             backend: "cobalt".into(),
             title: Some(filename.clone()),
             file_path: Some(file_path_str.clone()),
+            cover_art_base64: None,
         },
     );
 
@@ -164,6 +167,7 @@ pub async fn download_with_cobalt(
         title: Some(filename),
         file_path: Some(file_path_str),
         backend: "cobalt".to_string(),
+        cover_art_base64: None,
     })
 }
 

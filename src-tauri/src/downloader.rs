@@ -15,6 +15,7 @@ pub struct DownloadResult {
     pub title: Option<String>,
     pub file_path: Option<String>,
     pub backend: String,
+    pub cover_art_base64: Option<String>,
 }
 
 /// Main download function — this is what gets called from the Tauri command.
@@ -74,6 +75,7 @@ pub async fn download(
                 backend: "cobalt".into(),
                 title: None,
                 file_path: None,
+                cover_art_base64: None,
             },
         );
 
@@ -95,6 +97,7 @@ pub async fn download(
                         backend: "none".into(),
                         title: None,
                         file_path: None,
+                        cover_art_base64: None,
                     },
                 );
 
@@ -117,6 +120,7 @@ pub async fn download(
             backend: "none".into(),
             title: None,
             file_path: None,
+            cover_art_base64: None,
         },
     );
 

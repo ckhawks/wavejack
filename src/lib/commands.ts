@@ -1,13 +1,20 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AppSettings, DownloadRecord } from "./types";
+import type {
+  AppSettings,
+  AppliedMetadata,
+  DownloadRecord,
+  MetadataMatch,
+  PlaylistInfo,
+} from "./types";
 
 /** Start downloading a URL with the given format */
 export async function startDownload(
   id: string,
   url: string,
-  format: string
+  format: string,
+  playlistTitle?: string
 ): Promise<void> {
-  return invoke("start_download", { id, url, format });
+  return invoke("start_download", { id, url, format, playlistTitle });
 }
 
 /** Ensure yt-dlp is ready (downloads if needed). Returns the binary path. */
@@ -62,4 +69,26 @@ export async function removeDownloadHistory(id: string): Promise<void> {
 /** Clear all download history */
 export async function clearDownloadHistory(): Promise<void> {
   return invoke("clear_download_history");
+}
+
+/** Search MusicBrainz for metadata matches */
+export async function fetchMetadata(query: string): Promise<MetadataMatch[]> {
+  return invoke("fetch_metadata", { query });
+}
+
+/** Apply metadata from MusicBrainz to a downloaded MP3 */
+export async function applyMetadata(
+  id: string,
+  path: string,
+  title: string,
+  artist: string,
+  album: string,
+  releaseMbid: string
+): Promise<AppliedMetadata> {
+  return invoke("apply_metadata", { id, path, title, artist, album, releaseMbid });
+}
+
+/** Extract playlist entries from a URL */
+export async function extractPlaylist(url: string): Promise<PlaylistInfo> {
+  return invoke("extract_playlist", { url });
 }

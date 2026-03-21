@@ -50,7 +50,7 @@ export function Settings({ onClose }: Props) {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+    <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
       <div className="w-full max-w-lg rounded-xl border border-[#222] bg-[#111] shadow-2xl">
         {/* Header */}
         <div className="flex items-center justify-between border-b border-[#222] px-6 py-4">

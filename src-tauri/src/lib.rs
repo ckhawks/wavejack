@@ -11,11 +11,13 @@ mod cobalt;
 mod database;
 mod downloader;
 mod error;
+mod metadata;
 mod ytdlp;
 
 use database::{Database, DownloadRecord};
 use error::AppError;
 use id3::TagLike;
+use metadata::RateLimiter;
 use tauri::Manager;
 use tauri_plugin_store::StoreExt;
 
@@ -33,12 +35,15 @@ async fn start_download(
     id: String,
     url: String,
     format: String,
+    playlist_title: Option<String>,
 ) -> Result<(), AppError> {
     // Read settings from the persistent store
     let output_dir = get_store_value(&app, "outputDir")
         .unwrap_or_else(|| default_output_dir());
     let cobalt_url = get_store_value(&app, "cobaltUrl")
         .unwrap_or_default();
+
+    let pl_title = playlist_title.unwrap_or_default();
 
     // Spawn the download as a background task.
     // We use tauri::async_runtime::spawn so it runs independently.
@@ -65,10 +70,14 @@ async fn start_download(
                     status: "complete".to_string(),
                     title: dl.title.unwrap_or_default(),
                     artist: String::new(),
+                    album: String::new(),
+                    cover_art_path: String::new(),
                     file_path: dl.file_path.unwrap_or_default(),
                     backend: dl.backend,
                     message: "Download complete!".to_string(),
+                    playlist_title: pl_title.clone(),
                     created_at: database::now_timestamp(),
+                    cover_art_base64: dl.cover_art_base64.unwrap_or_default(),
                 };
                 if let Err(e) = db.insert_or_update(&record) {
                     eprintln!("Failed to save download record: {}", e);
@@ -82,10 +91,14 @@ async fn start_download(
                     status: "error".to_string(),
                     title: String::new(),
                     artist: String::new(),
+                    album: String::new(),
+                    cover_art_path: String::new(),
                     file_path: String::new(),
                     backend: String::new(),
                     message: e.to_string(),
+                    playlist_title: pl_title.clone(),
                     created_at: database::now_timestamp(),
+                    cover_art_base64: String::new(),
                 };
                 if let Err(db_err) = db.insert_or_update(&record) {
                     eprintln!("Failed to save error record: {}", db_err);
@@ -120,12 +133,14 @@ async fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, AppErr
     let cobalt_url = get_store_value(&app, "cobaltUrl")
         .unwrap_or_default();
     let format = get_store_value(&app, "format")
-        .unwrap_or_else(|| "mp4".to_string());
+        .unwrap_or_else(|| "mp3".to_string());
+    let player_volume = get_store_value(&app, "playerVolume");
 
     Ok(serde_json::json!({
         "outputDir": output_dir,
         "cobaltUrl": cobalt_url,
         "format": format,
+        "playerVolume": player_volume,
     }))
 }
 
@@ -283,7 +298,8 @@ async fn reveal_file(path: String) -> Result<(), AppError> {
 // Download History Commands
 // ========================================================================
 
-/// Get all download history records. Checks file existence and marks missing files.
+/// Get all download history records. Checks file existence, marks missing files,
+/// and reads embedded album art from MP3 ID3 tags.
 #[tauri::command]
 async fn get_download_history(
     app: tauri::AppHandle,
@@ -291,11 +307,22 @@ async fn get_download_history(
     let db = app.state::<Database>();
     let mut records = db.get_all().map_err(|e| AppError::Settings(e.to_string()))?;
 
-    // Check file existence for completed downloads
     for record in &mut records {
         if record.status == "complete" && !record.file_path.is_empty() {
-            if !std::path::Path::new(&record.file_path).exists() {
+            let path = std::path::Path::new(&record.file_path);
+            if !path.exists() {
                 record.status = "file_missing".to_string();
+                continue;
+            }
+            // Read embedded cover art from MP3 files
+            if record.format == "mp3" {
+                if let Ok(tag) = id3::Tag::read_from_path(path) {
+                    if let Some(pic) = tag.pictures().next() {
+                        use base64::Engine;
+                        record.cover_art_base64 =
+                            base64::engine::general_purpose::STANDARD.encode(&pic.data);
+                    }
+                }
             }
         }
     }
@@ -322,6 +349,72 @@ async fn clear_download_history(
     let db = app.state::<Database>();
     db.clear_all().map_err(|e| AppError::Settings(e.to_string()))?;
     Ok(())
+}
+
+// ========================================================================
+// Metadata Commands
+// ========================================================================
+
+/// Search MusicBrainz for metadata matches.
+#[tauri::command]
+async fn fetch_metadata(
+    app: tauri::AppHandle,
+    query: String,
+) -> Result<Vec<metadata::MetadataMatch>, AppError> {
+    let rate_limiter = app.state::<RateLimiter>();
+    metadata::search_musicbrainz(&query, &rate_limiter).await
+}
+
+/// Apply metadata from MusicBrainz to a downloaded MP3 file.
+#[tauri::command]
+async fn apply_metadata(
+    app: tauri::AppHandle,
+    id: String,
+    path: String,
+    title: String,
+    artist: String,
+    album: String,
+    release_mbid: String,
+) -> Result<metadata::AppliedMetadata, AppError> {
+    let rate_limiter = app.state::<RateLimiter>();
+    let result = metadata::apply_metadata_to_file(
+        &path,
+        &title,
+        &artist,
+        &album,
+        &release_mbid,
+        &rate_limiter,
+    )
+    .await?;
+
+    // Update database
+    let db = app.state::<Database>();
+    if let Err(e) = db.update_full_metadata(
+        &id,
+        &result.title,
+        &result.artist,
+        &result.album,
+        "",
+        &result.new_file_path,
+    ) {
+        eprintln!("Failed to update DB metadata: {}", e);
+    }
+
+    Ok(result)
+}
+
+// ========================================================================
+// Playlist Commands
+// ========================================================================
+
+/// Extract playlist entries from a URL using yt-dlp --flat-playlist.
+#[tauri::command]
+async fn extract_playlist(
+    app: tauri::AppHandle,
+    url: String,
+) -> Result<ytdlp::PlaylistInfo, AppError> {
+    let ytdlp_path = ytdlp::ensure_ytdlp(&app).await?;
+    ytdlp::extract_playlist(&ytdlp_path, &url).await
 }
 
 // ========================================================================
@@ -376,6 +469,7 @@ pub fn run() {
             let db = Database::new(&app_data_dir)
                 .expect("Failed to initialize download history database");
             app.manage(db);
+            app.manage(RateLimiter::new());
             Ok(())
         })
         // Register our command handlers — these become available to JS via invoke()
@@ -390,6 +484,9 @@ pub fn run() {
             get_download_history,
             remove_download_history,
             clear_download_history,
+            fetch_metadata,
+            apply_metadata,
+            extract_playlist,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

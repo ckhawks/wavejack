@@ -40,6 +40,10 @@ pub enum AppError {
     /// Settings read/write failure
     #[error("Settings error: {0}")]
     Settings(String),
+
+    /// Metadata lookup or embedding failed
+    #[error("Metadata error: {0}")]
+    MetadataFailed(String),
 }
 
 // Convert std::io::Error into our AppError automatically.

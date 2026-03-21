@@ -67,7 +67,10 @@ export const useDownloadStore = create<DownloadStore>((set, get) => ({
         backend: r.backend as DownloadItem["backend"],
         title: r.title || undefined,
         artist: r.artist || undefined,
+        album: r.album || undefined,
+        coverArtBase64: r.cover_art_base64 || undefined,
         filePath: r.file_path || undefined,
+        playlistTitle: r.playlist_title || undefined,
       }));
       set((state) => {
         // Merge: keep in-memory items (active downloads), add history items not already present

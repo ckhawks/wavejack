@@ -8,9 +8,14 @@ import {
   FolderOpen,
   Pencil,
   Save,
+  Wand2,
+  ExternalLink,
+  ListMusic,
 } from "lucide-react";
 import { useDownloadStore } from "../stores/downloadStore";
+import { usePlayerStore } from "../stores/playerStore";
 import { openFile, revealFile, updateMp3Metadata } from "../lib/commands";
+import { MetadataPicker } from "./MetadataPicker";
 import type { DownloadItem as DLItem } from "../lib/types";
 
 interface Props {
@@ -46,7 +51,6 @@ function StatusIcon({ status }: { status: string }) {
 
 /** Extract just the filename from a full path */
 function getFilename(filePath: string): string {
-  // Handle both Windows backslashes and Unix forward slashes
   const parts = filePath.split(/[\\/]/);
   return parts[parts.length - 1] || filePath;
 }
@@ -54,6 +58,7 @@ function getFilename(filePath: string): string {
 export function DownloadItem({ item }: Props) {
   const removeDownload = useDownloadStore((s) => s.removeDownload);
   const updateDownload = useDownloadStore((s) => s.updateDownload);
+  const playTrack = usePlayerStore((s) => s.playTrack);
 
   const isComplete = item.status === "complete" && item.filePath;
   const isFileMissing = item.status === "file_missing";
@@ -64,7 +69,7 @@ export function DownloadItem({ item }: Props) {
   const [editArtist, setEditArtist] = useState("");
   const [editFilename, setEditFilename] = useState("");
   const [saving, setSaving] = useState(false);
-  // Track whether user manually edited the filename
+  const [showMetadata, setShowMetadata] = useState(false);
   const filenameManuallyEdited = useRef(false);
 
   function startEditing() {
@@ -79,7 +84,6 @@ export function DownloadItem({ item }: Props) {
     setEditing(false);
   }
 
-  // Auto-update filename when artist/title change (unless user manually edited it)
   useEffect(() => {
     if (!editing || filenameManuallyEdited.current) return;
     if (editArtist && editTitle) {
@@ -111,14 +115,42 @@ export function DownloadItem({ item }: Props) {
     }
   }
 
+  function handlePlay() {
+    if (!item.filePath) return;
+    const track = {
+      id: item.id,
+      title: item.title || "Unknown",
+      artist: item.artist,
+      filePath: item.filePath,
+      coverArtBase64: item.coverArtBase64,
+    };
+    const current = usePlayerStore.getState().currentTrack;
+    if (current && current.id === item.id) {
+      // Same track — update metadata without resetting playback
+      usePlayerStore.setState({ currentTrack: track, isPlaying: true });
+    } else {
+      playTrack(track);
+    }
+  }
+
   return (
     <div className="group rounded-lg border border-[#222] bg-[#111] p-4 transition-all duration-200 hover:border-[#333]">
       <div className="flex items-start justify-between gap-3">
-        {/* Left side: status icon + info */}
+        {/* Left side: status icon + album art + info */}
         <div className="flex min-w-0 flex-1 items-start gap-3">
           <div className="mt-0.5">
             <StatusIcon status={item.status} />
           </div>
+
+          {/* Small album art thumbnail */}
+          {item.coverArtBase64 && (
+            <img
+              src={`data:image/jpeg;base64,${item.coverArtBase64}`}
+              alt=""
+              className="mt-0.5 h-6 w-6 shrink-0 rounded object-cover"
+            />
+          )}
+
           <div className="min-w-0 flex-1">
             {/* Title or URL */}
             <p className="truncate text-sm font-medium text-white">
@@ -127,7 +159,7 @@ export function DownloadItem({ item }: Props) {
             {/* Artist if set */}
             {item.artist && (
               <p className="truncate text-xs text-neutral-400">
-                {item.artist}
+                {item.artist}{item.album ? ` · ${item.album}` : ""}
               </p>
             )}
             {/* Status message */}
@@ -141,6 +173,13 @@ export function DownloadItem({ item }: Props) {
 
         {/* Right side: badges + actions */}
         <div className="flex shrink-0 items-center gap-2">
+          {/* Playlist badge */}
+          {item.playlistTitle && (
+            <span className="flex items-center gap-1 rounded bg-[#1a1a2e] px-2 py-0.5 text-xs font-medium text-indigo-400">
+              <ListMusic size={10} />
+              {item.playlistTitle}
+            </span>
+          )}
           {/* Format badge */}
           <span className="rounded bg-[#222] px-2 py-0.5 text-xs font-medium text-neutral-400">
             {item.format.toUpperCase()}
@@ -152,18 +191,52 @@ export function DownloadItem({ item }: Props) {
             </span>
           )}
 
-          {/* Open / Play buttons — only show when download is complete (not file_missing) */}
+          {/* Actions for completed downloads */}
           {isComplete && !isFileMissing && (
             <>
-              <button
-                onClick={() => openFile(item.filePath!)}
-                className="flex items-center gap-1 rounded-md bg-white px-2.5 py-1 text-xs font-medium text-black transition-all duration-200 hover:bg-neutral-200"
-                title={item.format === "mp3" ? "Play in default player" : "Open file"}
-              >
-                <Play size={12} />
-                {item.format === "mp3" ? "Play" : "Open"}
-              </button>
-              {/* Edit button — only for completed MP3s */}
+              {/* MP3: Play in-app; MP4: Open externally */}
+              {isMp3Complete ? (
+                <>
+                  <button
+                    onClick={handlePlay}
+                    className="flex items-center gap-1 rounded-md bg-white px-2.5 py-1 text-xs font-medium text-black transition-all duration-200 hover:bg-neutral-200"
+                    title="Play in app"
+                  >
+                    <Play size={12} />
+                    Play
+                  </button>
+                  <button
+                    onClick={() => openFile(item.filePath!)}
+                    className="rounded-md p-1 text-neutral-400 transition-all duration-200 hover:bg-[#222] hover:text-white"
+                    title="Open in system player"
+                  >
+                    <ExternalLink size={14} />
+                  </button>
+                </>
+              ) : (
+                <button
+                  onClick={() => openFile(item.filePath!)}
+                  className="flex items-center gap-1 rounded-md bg-white px-2.5 py-1 text-xs font-medium text-black transition-all duration-200 hover:bg-neutral-200"
+                  title="Open file"
+                >
+                  <Play size={12} />
+                  Open
+                </button>
+              )}
+
+              {/* Auto-tag button for MP3s */}
+              {isMp3Complete && (
+                <button
+                  onClick={() => setShowMetadata(!showMetadata)}
+                  className={`rounded-md p-1 transition-all duration-200 hover:bg-[#222] hover:text-white ${
+                    showMetadata ? "text-blue-400" : "text-neutral-400"
+                  }`}
+                  title="Auto-tag with MusicBrainz"
+                >
+                  <Wand2 size={14} />
+                </button>
+              )}
+              {/* Edit button for MP3s */}
               {isMp3Complete && (
                 <button
                   onClick={startEditing}
@@ -193,7 +266,7 @@ export function DownloadItem({ item }: Props) {
         </div>
       </div>
 
-      {/* Progress bar — only show when actively downloading */}
+      {/* Progress bar */}
       {(item.status === "downloading" || item.status === "converting") && (
         <div className="mt-3 h-1 overflow-hidden rounded-full bg-[#222]">
           <div
@@ -252,6 +325,17 @@ export function DownloadItem({ item }: Props) {
             </button>
           </div>
         </div>
+      )}
+
+      {/* Metadata picker */}
+      {showMetadata && (
+        <MetadataPicker
+          id={item.id}
+          filePath={item.filePath!}
+          currentTitle={item.title}
+          currentArtist={item.artist}
+          onClose={() => setShowMetadata(false)}
+        />
       )}
     </div>
   );

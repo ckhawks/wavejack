@@ -13,10 +13,16 @@ pub struct DownloadRecord {
     pub status: String,
     pub title: String,
     pub artist: String,
+    pub album: String,
+    pub cover_art_path: String,
     pub file_path: String,
     pub backend: String,
     pub message: String,
+    pub playlist_title: String,
     pub created_at: String,
+    /// Not stored in DB — populated at read time from embedded ID3 tags.
+    #[serde(default)]
+    pub cover_art_base64: String,
 }
 
 /// Thread-safe wrapper around a SQLite connection.
@@ -46,6 +52,11 @@ impl Database {
             );",
         )?;
 
+        // Migrations: add columns if they don't exist yet
+        conn.execute("ALTER TABLE downloads ADD COLUMN album TEXT NOT NULL DEFAULT ''", []).ok();
+        conn.execute("ALTER TABLE downloads ADD COLUMN cover_art_path TEXT NOT NULL DEFAULT ''", []).ok();
+        conn.execute("ALTER TABLE downloads ADD COLUMN playlist_title TEXT NOT NULL DEFAULT ''", []).ok();
+
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -56,8 +67,8 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO downloads
-             (id, url, format, status, title, artist, file_path, backend, message, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             (id, url, format, status, title, artist, album, cover_art_path, file_path, backend, message, playlist_title, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 r.id,
                 r.url,
@@ -65,9 +76,12 @@ impl Database {
                 r.status,
                 r.title,
                 r.artist,
+                r.album,
+                r.cover_art_path,
                 r.file_path,
                 r.backend,
                 r.message,
+                r.playlist_title,
                 r.created_at,
             ],
         )?;
@@ -78,7 +92,7 @@ impl Database {
     pub fn get_all(&self) -> Result<Vec<DownloadRecord>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, url, format, status, title, artist, file_path, backend, message, created_at
+            "SELECT id, url, format, status, title, artist, album, cover_art_path, file_path, backend, message, playlist_title, created_at
              FROM downloads ORDER BY created_at DESC",
         )?;
 
@@ -90,10 +104,14 @@ impl Database {
                 status: row.get(3)?,
                 title: row.get(4)?,
                 artist: row.get(5)?,
-                file_path: row.get(6)?,
-                backend: row.get(7)?,
-                message: row.get(8)?,
-                created_at: row.get(9)?,
+                album: row.get(6)?,
+                cover_art_path: row.get(7)?,
+                file_path: row.get(8)?,
+                backend: row.get(9)?,
+                message: row.get(10)?,
+                playlist_title: row.get(11)?,
+                created_at: row.get(12)?,
+                cover_art_base64: String::new(),
             })
         })?;
 
@@ -112,6 +130,24 @@ impl Database {
         conn.execute(
             "UPDATE downloads SET title = ?1, artist = ?2, file_path = ?3 WHERE id = ?4",
             params![title, artist, file_path, id],
+        )?;
+        Ok(())
+    }
+
+    /// Update metadata fields including album and cover art path.
+    pub fn update_full_metadata(
+        &self,
+        id: &str,
+        title: &str,
+        artist: &str,
+        album: &str,
+        cover_art_path: &str,
+        file_path: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE downloads SET title = ?1, artist = ?2, album = ?3, cover_art_path = ?4, file_path = ?5 WHERE id = ?6",
+            params![title, artist, album, cover_art_path, file_path, id],
         )?;
         Ok(())
     }
