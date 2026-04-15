@@ -1,7 +1,13 @@
 import { useState, useRef, useEffect, useCallback } from "react";
-import { Volume2, VolumeX, X } from "lucide-react";
+import { Volume2, VolumeX, X, Shuffle, Maximize2 } from "lucide-react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { usePlayerStore } from "../stores/playerStore";
+import { useDiscoverStore } from "../stores/discoverStore";
+import { recordTrackPlay } from "../lib/commands";
+import { useLibraryStore } from "../stores/libraryStore";
+import { WaveformBar } from "./WaveformBar";
+import { SpectrogramBar } from "./SpectrogramBar";
+import { ImmersivePlayer } from "./ImmersivePlayer";
 
 function formatTime(seconds: number): string {
   if (!isFinite(seconds) || seconds < 0) return "0:00";
@@ -78,7 +84,7 @@ function Slider({
 
 export function AudioPlayer() {
   const audioRef = useRef<HTMLAudioElement>(null);
-  const [showArt, setShowArt] = useState(false);
+  const [showImmersive, setShowImmersive] = useState(false);
   const currentTrack = usePlayerStore((s) => s.currentTrack);
   const isPlaying = usePlayerStore((s) => s.isPlaying);
   const volume = usePlayerStore((s) => s.volume);
@@ -89,14 +95,19 @@ export function AudioPlayer() {
   const togglePlayPause = usePlayerStore((s) => s.togglePlayPause);
   const playNext = usePlayerStore((s) => s.playNext);
   const playPrev = usePlayerStore((s) => s.playPrev);
+  const shuffle = usePlayerStore((s) => s.shuffle);
+  const toggleShuffle = usePlayerStore((s) => s.toggleShuffle);
   const stop = usePlayerStore((s) => s.stop);
   const setVolume = usePlayerStore((s) => s.setVolume);
 
-  // Load new track
+  // Load new track. We use a custom Tauri URI scheme that serves files with
+  // permissive CORS so MediaElementSource (spectrogram) works; crossOrigin
+  // must be set BEFORE assigning src for the request to be CORS-enabled.
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio || !currentTrack) return;
-    audio.src = convertFileSrc(currentTrack.filePath);
+    audio.crossOrigin = "anonymous";
+    audio.src = convertFileSrc(currentTrack.filePath, "wjaudio");
     audio.volume = usePlayerStore.getState().volume;
     audio.load();
     audio.play().catch(() => {});
@@ -130,6 +141,27 @@ export function AudioPlayer() {
   }, [setDuration]);
 
   const onEnded = useCallback(() => {
+    const discover = useDiscoverStore.getState();
+    const currentDiscover = discover.queue[discover.currentIndex];
+    const playing = usePlayerStore.getState().currentTrack;
+
+    // Natural end → record a play if this is a library track. Library tracks
+    // use the file path as their id; download-only tracks use a UUID.
+    if (playing) {
+      const isLibraryTrack = useLibraryStore
+        .getState()
+        .tracks.some((t) => t.path === playing.filePath);
+      if (isLibraryTrack) {
+        recordTrackPlay(playing.filePath)
+          .then(() => useLibraryStore.getState().refresh())
+          .catch((e) => console.error("record_track_play failed:", e));
+      }
+    }
+
+    if (currentDiscover && playing && currentDiscover.id === playing.id) {
+      discover.skipCurrent();
+      return;
+    }
     playNext();
   }, [playNext]);
 
@@ -145,22 +177,13 @@ export function AudioPlayer() {
 
   return (
     <>
-      {/* Expanded album art overlay */}
-      {showArt && currentTrack.coverArtBase64 && (
-        <div
-          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/85"
-          onClick={() => setShowArt(false)}
-        >
-          <img
-            src={`data:image/jpeg;base64,${currentTrack.coverArtBase64}`}
-            alt=""
-            className="max-h-[70vh] max-w-[70vw] rounded-lg shadow-2xl"
-            onClick={(e) => e.stopPropagation()}
-          />
-        </div>
-      )}
+      {/* Immersive (full-screen now playing) mode */}
+      {showImmersive && <ImmersivePlayer onClose={() => setShowImmersive(false)} />}
 
-      <div className="fixed bottom-0 left-0 right-0 z-50 flex h-16 items-center gap-3 border-t border-[#222] bg-[#111] px-4">
+      <div className="fixed bottom-0 left-0 right-0 z-50">
+        <SpectrogramBar />
+        <WaveformBar />
+      <div className="flex h-16 items-center gap-3 border-t border-[#222] bg-[#111] px-4">
         <audio
           ref={audioRef}
           onTimeUpdate={onTimeUpdate}
@@ -171,7 +194,7 @@ export function AudioPlayer() {
         {/* Album art — clickable to expand */}
         <button
           className="h-10 w-10 shrink-0 overflow-hidden rounded bg-[#222]"
-          onClick={() => currentTrack.coverArtBase64 && setShowArt(true)}
+          onClick={() => setShowImmersive(true)}
         >
           {currentTrack.coverArtBase64 ? (
             <img
@@ -187,7 +210,7 @@ export function AudioPlayer() {
         </button>
 
         {/* Track info */}
-        <div className="min-w-0 w-36 shrink-0">
+        <div className="min-w-0 w-64 shrink-0">
           <p className="truncate text-sm font-medium text-white">{currentTrack.title}</p>
           {currentTrack.artist && (
             <p className="truncate text-xs text-neutral-400">{currentTrack.artist}</p>
@@ -225,6 +248,17 @@ export function AudioPlayer() {
           {formatTime(duration)}
         </span>
 
+        {/* Shuffle */}
+        <button
+          onClick={toggleShuffle}
+          className={`rounded p-1.5 transition-colors ${
+            shuffle ? "text-violet-400 hover:text-violet-300" : "text-neutral-400 hover:text-white"
+          }`}
+          title={shuffle ? "Shuffle on" : "Shuffle off"}
+        >
+          <Shuffle size={16} />
+        </button>
+
         {/* Volume */}
         <div className="flex items-center gap-1">
           {volume === 0 ? (
@@ -241,10 +275,20 @@ export function AudioPlayer() {
           />
         </div>
 
+        {/* Expand */}
+        <button
+          onClick={() => setShowImmersive(true)}
+          className="rounded p-1 text-neutral-400 hover:text-white"
+          title="Open immersive view"
+        >
+          <Maximize2 size={14} />
+        </button>
+
         {/* Close */}
         <button onClick={stop} className="ml-1 rounded p-1 text-neutral-600 hover:text-white">
           <X size={14} />
         </button>
+        </div>
       </div>
     </>
   );

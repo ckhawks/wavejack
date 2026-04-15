@@ -11,7 +11,7 @@ use futures_util::StreamExt;
 use id3::TagLike;
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncReadExt, BufReader};
 use tokio::process::Command;
 
 /// The filename of the yt-dlp binary — on Windows it needs .exe
@@ -151,6 +151,107 @@ pub struct DownloadStatusEvent {
     pub cover_art_base64: Option<String>,
 }
 
+/// Parse one line of yt-dlp stdout. Updates title/file_path in place and
+/// emits progress events on the given AppHandle.
+fn process_ytdlp_line(
+    line: &str,
+    id: &str,
+    app: &AppHandle,
+    title: &mut Option<String>,
+    file_path: &mut Option<String>,
+) {
+    // "[download] Destination: /path/to/Title.mp4"
+    if line.contains("[download] Destination:") {
+        if let Some(dest) = line.split("Destination:").nth(1) {
+            let filename = dest.trim();
+            *file_path = Some(filename.to_string());
+            if let Some(name) = std::path::Path::new(filename).file_stem() {
+                *title = Some(name.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    // "[download] /path/to/file has already been downloaded"
+    if line.contains("has already been downloaded") {
+        if let Some(rest) = line.strip_prefix("[download]") {
+            let rest = rest.trim();
+            if let Some(path_str) = rest.strip_suffix("has already been downloaded") {
+                let path_str = path_str.trim();
+                if !path_str.is_empty() {
+                    *file_path = Some(path_str.to_string());
+                    if let Some(name) = std::path::Path::new(path_str).file_stem() {
+                        *title = Some(name.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // "[Merger] Merging formats into \"...\""
+    if line.contains("[Merger] Merging formats into") {
+        if let Some(path) = line.split('"').nth(1) {
+            *file_path = Some(path.to_string());
+        }
+    }
+
+    // "[ExtractAudio] Destination: ..."
+    if line.contains("[ExtractAudio] Destination:") {
+        if let Some(dest) = line.split("Destination:").nth(1) {
+            *file_path = Some(dest.trim().to_string());
+        }
+    }
+
+    // Playlist item counter
+    if line.contains("[download] Downloading item") {
+        let _ = app.emit("download-status", DownloadStatusEvent {
+            id: id.to_string(),
+            status: "downloading".into(),
+            progress: 0.0,
+            message: line.trim().to_string(),
+            backend: "ytdlp".into(),
+            title: title.clone(),
+            file_path: None,
+            cover_art_base64: None,
+        });
+        return;
+    }
+
+    // Progress template: "progress:  45.2%:  1.5MiB/s"
+    if line.starts_with("progress:") || line.contains("progress:") {
+        let parts: Vec<&str> = line.split(':').collect();
+        if parts.len() >= 2 {
+            let percent_str = parts[1].trim().trim_end_matches('%').trim();
+            if let Ok(percent) = percent_str.parse::<f64>() {
+                let speed = if parts.len() >= 3 { parts[2].trim() } else { "" };
+                let _ = app.emit("download-status", DownloadStatusEvent {
+                    id: id.to_string(),
+                    status: "downloading".into(),
+                    progress: percent,
+                    message: format!("Downloading... {}% {}", percent as u32, speed),
+                    backend: "ytdlp".into(),
+                    title: title.clone(),
+                    file_path: None,
+                    cover_art_base64: None,
+                });
+            }
+        }
+    }
+
+    // Conversion/merging phase
+    if line.contains("[Merger]") || line.contains("[ExtractAudio]") || line.contains("[ffmpeg]") {
+        let _ = app.emit("download-status", DownloadStatusEvent {
+            id: id.to_string(),
+            status: "converting".into(),
+            progress: 99.0,
+            message: "Converting...".into(),
+            backend: "ytdlp".into(),
+            title: title.clone(),
+            file_path: None,
+            cover_art_base64: None,
+        });
+    }
+}
+
 /// Actually run yt-dlp to download a URL.
 /// This spawns yt-dlp as a child process and parses its stdout for progress info.
 ///
@@ -171,6 +272,12 @@ pub async fn download_with_ytdlp(
 ) -> Result<DownloadResult, AppError> {
     // Build the yt-dlp command with the right arguments for the requested format
     let mut cmd = Command::new(ytdlp_path);
+
+    // Force UTF-8 output so non-ASCII titles/paths don't produce invalid bytes.
+    cmd.env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1")
+        .arg("--encoding")
+        .arg("utf-8");
 
     // Tell yt-dlp to output progress in a machine-readable format.
     // The template produces lines like: "progress:45.2:Downloading video"
@@ -198,12 +305,12 @@ pub async fn download_with_ytdlp(
                 .arg("--audio-quality").arg("0"); // 0 = best quality
         }
         _ => {
-            // Download best video+audio combo as mp4
+            // Only select H.264+AAC streams — guarantees Premiere/editor compatibility.
+            // YouTube always has H.264; final fallback grabs best and yt-dlp will
+            // remux into mp4 container.
             cmd.arg("-f")
-                .arg("bv*+ba/b")
+                .arg("bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*[vcodec^=avc1]+ba/bv*+ba/b")
                 .arg("--merge-output-format")
-                .arg("mp4")
-                .arg("--remux-video")
                 .arg("mp4");
         }
     }
@@ -226,117 +333,45 @@ pub async fn download_with_ytdlp(
 
     let stderr = child.stderr.take();
 
-    let reader = BufReader::new(stdout);
-    let mut lines = reader.lines();
+    // Read stdout as raw bytes and split on newlines, lossy-decoding each line.
+    // This avoids errors when yt-dlp or a child (ffmpeg) emits bytes that
+    // aren't valid UTF-8 — common on Windows with non-ASCII video titles.
+    let mut reader = BufReader::new(stdout);
+    let mut pending: Vec<u8> = Vec::new();
+    let mut read_buf = [0u8; 4096];
 
     let id = download_id.to_string();
     let app_clone = app.clone();
-
-    // Read stdout line by line and parse progress
-    // Also capture title and file path from yt-dlp's output
     let mut title: Option<String> = None;
     let mut file_path: Option<String> = None;
 
-    while let Some(line) = lines.next_line().await.map_err(|e| {
-        AppError::YtDlpFailed(format!("Error reading yt-dlp output: {}", e))
-    })? {
-        // yt-dlp prints the video title in lines like "[download] Destination: /path/to/Title.mp4"
-        if line.contains("[download] Destination:") {
-            // Extract the filename and try to get the title from it
-            if let Some(dest) = line.split("Destination:").nth(1) {
-                let filename = dest.trim();
-                // Save the full file path so we can open it later
-                file_path = Some(filename.to_string());
-                // Get just the filename without path and extension
-                if let Some(name) = std::path::Path::new(filename).file_stem() {
-                    title = Some(name.to_string_lossy().to_string());
+    loop {
+        let n = reader.read(&mut read_buf).await.map_err(|e| {
+            AppError::YtDlpFailed(format!("Error reading yt-dlp output: {}", e))
+        })?;
+
+        if n == 0 {
+            // EOF — flush any trailing partial line then stop
+            if !pending.is_empty() {
+                let line = String::from_utf8_lossy(&pending).to_string();
+                pending.clear();
+                if !line.is_empty() {
+                    process_ytdlp_line(&line, &id, &app_clone, &mut title, &mut file_path);
                 }
             }
+            break;
         }
 
-        // Catch "[download] /path/to/file has already been downloaded" (file already exists)
-        if line.contains("has already been downloaded") {
-            // Format: "[download] /path/to/file.ext has already been downloaded"
-            if let Some(rest) = line.strip_prefix("[download]") {
-                let rest = rest.trim();
-                if let Some(path_str) = rest.strip_suffix("has already been downloaded") {
-                    let path_str = path_str.trim();
-                    if !path_str.is_empty() {
-                        file_path = Some(path_str.to_string());
-                        if let Some(name) = std::path::Path::new(path_str).file_stem() {
-                            title = Some(name.to_string_lossy().to_string());
-                        }
-                    }
-                }
+        pending.extend_from_slice(&read_buf[..n]);
+
+        while let Some(pos) = pending.iter().position(|&b| b == b'\n' || b == b'\r') {
+            let mut line_bytes: Vec<u8> = pending.drain(..=pos).collect();
+            line_bytes.pop(); // strip the \n or \r
+            if line_bytes.is_empty() {
+                continue;
             }
-        }
-
-        // Also catch "[Merger] Merging formats into ..." which gives the final path
-        if line.contains("[Merger] Merging formats into") {
-            if let Some(path) = line.split('"').nth(1) {
-                file_path = Some(path.to_string());
-            }
-        }
-
-        // Catch "[ExtractAudio] Destination: ..." for mp3 conversions
-        if line.contains("[ExtractAudio] Destination:") {
-            if let Some(dest) = line.split("Destination:").nth(1) {
-                file_path = Some(dest.trim().to_string());
-            }
-        }
-
-        // Also try to extract title from "[info]" or metadata lines
-        if line.contains("[download] Downloading item") {
-            // This is a playlist — extract the item count
-            // Format: "[download] Downloading item X of Y"
-            let _ = app_clone.emit("download-status", DownloadStatusEvent {
-                id: id.clone(),
-                status: "downloading".into(),
-                progress: 0.0,
-                message: line.trim().to_string(),
-                backend: "ytdlp".into(),
-                title: title.clone(),
-                file_path: None,
-                cover_art_base64: None,
-            });
-            continue;
-        }
-
-        // Parse our custom progress template output
-        // Format: "progress:  45.2%:  1.5MiB/s"
-        if line.starts_with("progress:") || line.contains("progress:") {
-            let parts: Vec<&str> = line.split(':').collect();
-            if parts.len() >= 2 {
-                // Parse the percentage value, stripping whitespace and %
-                let percent_str = parts[1].trim().trim_end_matches('%').trim();
-                if let Ok(percent) = percent_str.parse::<f64>() {
-                    let speed = if parts.len() >= 3 { parts[2].trim() } else { "" };
-                    let _ = app_clone.emit("download-status", DownloadStatusEvent {
-                        id: id.clone(),
-                        status: "downloading".into(),
-                        progress: percent,
-                        message: format!("Downloading... {}% {}", percent as u32, speed),
-                        backend: "ytdlp".into(),
-                        title: title.clone(),
-                        file_path: None,
-                        cover_art_base64: None,
-                    });
-                }
-            }
-        }
-
-        // Detect conversion/merging phase
-        if line.contains("[Merger]") || line.contains("[ExtractAudio]") || line.contains("[ffmpeg]") {
-            let _ = app_clone.emit("download-status", DownloadStatusEvent {
-                id: id.clone(),
-                status: "converting".into(),
-                progress: 99.0,
-                message: "Converting...".into(),
-                backend: "ytdlp".into(),
-                title: title.clone(),
-                file_path: None,
-                cover_art_base64: None,
-            });
+            let line = String::from_utf8_lossy(&line_bytes).to_string();
+            process_ytdlp_line(&line, &id, &app_clone, &mut title, &mut file_path);
         }
     }
 
@@ -348,16 +383,11 @@ pub async fn download_with_ytdlp(
     if !status.success() {
         // Read stderr for the error message
         let mut error_msg = format!("yt-dlp exited with code: {}", status);
-        if let Some(stderr) = stderr {
-            let stderr_reader = BufReader::new(stderr);
-            let mut stderr_lines = stderr_reader.lines();
-            let mut stderr_output = String::new();
-            while let Some(line) = stderr_lines.next_line().await.unwrap_or(None) {
-                stderr_output.push_str(&line);
-                stderr_output.push('\n');
-            }
-            if !stderr_output.is_empty() {
-                error_msg = stderr_output;
+        if let Some(mut stderr) = stderr {
+            let mut bytes: Vec<u8> = Vec::new();
+            let _ = stderr.read_to_end(&mut bytes).await;
+            if !bytes.is_empty() {
+                error_msg = String::from_utf8_lossy(&bytes).to_string();
             }
         }
         return Err(AppError::YtDlpFailed(error_msg));

@@ -8,14 +8,14 @@ export default defineConfig(async () => ({
   plugins: [react(), tailwindcss()],
   clearScreen: false,
   server: {
-    port: 1420,
+    port: 5741,
     strictPort: true,
     host: host || false,
     hmr: host
       ? {
           protocol: "ws",
           host,
-          port: 1421,
+          port: 5742,
         }
       : undefined,
     watch: {

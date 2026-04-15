@@ -25,3 +25,7 @@ Thumbs.db
 
 # Rust
 *.pdb
+
+# Local notes / tooling
+.claude/
+my ideas.txt

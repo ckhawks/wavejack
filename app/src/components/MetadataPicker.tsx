@@ -1,23 +1,23 @@
 import { useState, useEffect } from "react";
 import { Loader, Music } from "lucide-react";
-import { fetchMetadata, applyMetadata } from "../lib/commands";
-import { useDownloadStore } from "../stores/downloadStore";
-import type { MetadataMatch } from "../lib/types";
+import { fetchMetadata } from "../lib/commands";
+import type { MetadataMatch, AppliedMetadata } from "../lib/types";
 
 interface Props {
-  id: string;
-  filePath: string;
   currentTitle?: string;
   currentArtist?: string;
+  /** Called with the chosen MusicBrainz match. Should write tags + return the result. */
+  onApply: (match: MetadataMatch) => Promise<AppliedMetadata>;
+  /** Notified after onApply resolves so the caller can update its own store. */
+  onApplied?: (result: AppliedMetadata) => void;
   onClose: () => void;
 }
 
-export function MetadataPicker({ id, filePath, currentTitle, currentArtist, onClose }: Props) {
+export function MetadataPicker({ currentTitle, currentArtist, onApply, onApplied, onClose }: Props) {
   const [loading, setLoading] = useState(true);
   const [applying, setApplying] = useState(false);
   const [matches, setMatches] = useState<MetadataMatch[]>([]);
   const [error, setError] = useState("");
-  const updateDownload = useDownloadStore((s) => s.updateDownload);
 
   useEffect(() => {
     const query = [currentTitle, currentArtist].filter(Boolean).join(" ") || "unknown";
@@ -32,24 +32,12 @@ export function MetadataPicker({ id, filePath, currentTitle, currentArtist, onCl
   async function handleApply(match: MetadataMatch) {
     setApplying(true);
     try {
-      const result = await applyMetadata(
-        id,
-        filePath,
-        match.title,
-        match.artist,
-        match.album,
-        match.release_mbid
-      );
-      updateDownload(id, {
-        title: result.title,
-        artist: result.artist,
-        album: result.album,
-        coverArtBase64: result.cover_art_base64 || undefined,
-        filePath: result.new_file_path,
-      });
+      const result = await onApply(match);
+      onApplied?.(result);
       onClose();
-    } catch (e: any) {
-      setError(String(e?.message || e));
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(msg);
       setApplying(false);
     }
   }

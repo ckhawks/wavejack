@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import { useDownloadStore } from "../stores/downloadStore";
 import { usePlayerStore } from "../stores/playerStore";
-import { openFile, revealFile, updateMp3Metadata } from "../lib/commands";
+import { openFile, revealFile, updateMp3Metadata, applyMetadata } from "../lib/commands";
 import { MetadataPicker } from "./MetadataPicker";
 import type { DownloadItem as DLItem } from "../lib/types";
 
@@ -71,6 +71,20 @@ export function DownloadItem({ item }: Props) {
   const [saving, setSaving] = useState(false);
   const [showMetadata, setShowMetadata] = useState(false);
   const filenameManuallyEdited = useRef(false);
+
+  /** Parse "Artist - Title.mp3" from the filename, handling compound artists. */
+  function parseFromFilename() {
+    const name = editFilename.replace(/\.[^.]+$/, ""); // strip extension
+    const dashIdx = name.indexOf(" - ");
+    if (dashIdx >= 0) {
+      setEditArtist(name.substring(0, dashIdx).trim());
+      setEditTitle(name.substring(dashIdx + 3).trim());
+    } else {
+      // No dash separator — put it all in title
+      setEditTitle(name.trim());
+    }
+    filenameManuallyEdited.current = false;
+  }
 
   function startEditing() {
     setEditTitle(item.title || "");
@@ -309,6 +323,14 @@ export function DownloadItem({ item }: Props) {
           </div>
           <div className="flex gap-2">
             <button
+              onClick={parseFromFilename}
+              className="flex items-center gap-1 rounded-md border border-[#333] px-3 py-1 text-xs font-medium text-neutral-400 transition-all duration-200 hover:border-[#555] hover:text-white"
+              title="Parse artist & title from filename"
+            >
+              <Wand2 size={12} />
+              Parse
+            </button>
+            <button
               onClick={handleSave}
               disabled={saving}
               className="flex items-center gap-1 rounded-md bg-white px-3 py-1 text-xs font-medium text-black transition-all duration-200 hover:bg-neutral-200 disabled:opacity-50"
@@ -330,10 +352,20 @@ export function DownloadItem({ item }: Props) {
       {/* Metadata picker */}
       {showMetadata && (
         <MetadataPicker
-          id={item.id}
-          filePath={item.filePath!}
           currentTitle={item.title}
           currentArtist={item.artist}
+          onApply={(m) =>
+            applyMetadata(item.id, item.filePath!, m.title, m.artist, m.album, m.release_mbid)
+          }
+          onApplied={(result) => {
+            updateDownload(item.id, {
+              title: result.title,
+              artist: result.artist,
+              album: result.album,
+              coverArtBase64: result.cover_art_base64 || undefined,
+              filePath: result.new_file_path,
+            });
+          }}
           onClose={() => setShowMetadata(false)}
         />
       )}

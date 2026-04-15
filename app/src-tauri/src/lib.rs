@@ -8,17 +8,22 @@
 // Tauri automatically handles serialization/deserialization of arguments and return values.
 
 mod cobalt;
+mod cover_art;
 mod database;
+mod discover;
 mod downloader;
 mod error;
+mod library;
 mod metadata;
+mod remote;
+mod waveform;
 mod ytdlp;
 
 use database::{Database, DownloadRecord};
 use error::AppError;
 use id3::TagLike;
 use metadata::RateLimiter;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tauri_plugin_store::StoreExt;
 
 // ========================================================================
@@ -36,14 +41,24 @@ async fn start_download(
     url: String,
     format: String,
     playlist_title: Option<String>,
+    destination: Option<String>,
 ) -> Result<(), AppError> {
-    // Read settings from the persistent store
-    let output_dir = get_store_value(&app, "outputDir")
-        .unwrap_or_else(|| default_output_dir());
+    // Resolve the output directory based on the destination choice.
+    let dest = destination.unwrap_or_else(|| "downloads".to_string());
+    let output_dir = match dest.as_str() {
+        "music" => get_store_value(&app, "musicDir")
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(default_music_dir),
+        _ => get_store_value(&app, "outputDir")
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(default_output_dir),
+    };
     let cobalt_url = get_store_value(&app, "cobaltUrl")
         .unwrap_or_default();
 
     let pl_title = playlist_title.unwrap_or_default();
+    let output_dir_for_scan = output_dir.clone();
+    let dest_clone = dest.clone();
 
     // Spawn the download as a background task.
     // We use tauri::async_runtime::spawn so it runs independently.
@@ -81,6 +96,26 @@ async fn start_download(
                 };
                 if let Err(e) = db.insert_or_update(&record) {
                     eprintln!("Failed to save download record: {}", e);
+                }
+
+                // If this went into the music destination and that folder
+                // is part of the library, refresh its cache so the new
+                // track shows up without a manual rescan.
+                if dest_clone == "music" {
+                    if let Ok(folders) = db.list_library_folders() {
+                        for folder in folders {
+                            if output_dir_for_scan.starts_with(&folder) {
+                                let dir = std::path::PathBuf::from(&folder);
+                                let app_inner = app.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let db = app_inner.state::<Database>();
+                                    library::scan_folder_incremental(&dir, &db);
+                                    let _ = app_inner.emit("library-updated", ());
+                                });
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             Err(ref e) => {
@@ -129,18 +164,32 @@ async fn ensure_ytdlp_ready(app: tauri::AppHandle) -> Result<String, AppError> {
 async fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, AppError> {
     // Build a settings object from stored values (with defaults for missing keys)
     let output_dir = get_store_value(&app, "outputDir")
-        .unwrap_or_else(|| default_output_dir());
+        .unwrap_or_else(default_output_dir);
+    let music_dir = get_store_value(&app, "musicDir")
+        .unwrap_or_else(default_music_dir);
     let cobalt_url = get_store_value(&app, "cobaltUrl")
         .unwrap_or_default();
     let format = get_store_value(&app, "format")
         .unwrap_or_else(|| "mp3".to_string());
     let player_volume = get_store_value(&app, "playerVolume");
-
+    let lastfm_api_key = get_store_value(&app, "lastfmApiKey")
+        .unwrap_or_default();
+    let last_destination = get_store_value(&app, "lastDestination")
+        .unwrap_or_else(|| "downloads".to_string());
+    let library_columns = get_store_value(&app, "libraryColumns").unwrap_or_default();
+    let library_sort = get_store_value(&app, "librarySort").unwrap_or_default();
+    let shuffle = get_store_value(&app, "shuffle").unwrap_or_else(|| "0".to_string());
     Ok(serde_json::json!({
         "outputDir": output_dir,
+        "musicDir": music_dir,
         "cobaltUrl": cobalt_url,
         "format": format,
         "playerVolume": player_volume,
+        "lastfmApiKey": lastfm_api_key,
+        "lastDestination": last_destination,
+        "libraryColumns": library_columns,
+        "librarySort": library_sort,
+        "shuffle": shuffle,
     }))
 }
 
@@ -404,6 +453,381 @@ async fn apply_metadata(
 }
 
 // ========================================================================
+// Audio Extraction Commands
+// ========================================================================
+
+/// Extract audio from a video file (e.g. MP4) and save as MP3.
+/// Uses ffmpeg, which must be available on PATH.
+/// Returns the path to the created MP3 file.
+///
+/// Called from JS: invoke("extract_audio", { id, inputPath })
+#[tauri::command]
+async fn extract_audio(app: tauri::AppHandle, id: String, input_path: String) -> Result<String, AppError> {
+    let input = std::path::PathBuf::from(&input_path);
+    if !input.exists() {
+        return Err(AppError::Io(format!("File not found: {}", input_path)));
+    }
+
+    // Build output path: same directory, same name, .mp3 extension
+    let output = input.with_extension("mp3");
+    let output_str = output.to_string_lossy().to_string();
+
+    // Don't overwrite an existing mp3
+    if output.exists() {
+        return Err(AppError::Io(format!(
+            "MP3 already exists: {}",
+            output_str
+        )));
+    }
+
+    // Find ffmpeg on PATH
+    let ffmpeg_path = which::which("ffmpeg")
+        .map_err(|_| AppError::Io("ffmpeg not found on PATH. Please install ffmpeg.".into()))?;
+
+    let title = input
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    // Probe input duration using ffprobe so we can report real progress
+    let duration_secs = probe_duration(&ffmpeg_path, &input_path).await;
+
+    // Emit initial status
+    let _ = app.emit(
+        "download-status",
+        ytdlp::DownloadStatusEvent {
+            id: id.clone(),
+            status: "converting".into(),
+            progress: 0.0,
+            message: "Extracting audio...".into(),
+            backend: "ffmpeg".into(),
+            title: Some(title.clone()),
+            file_path: None,
+            cover_art_base64: None,
+        },
+    );
+
+    // Run ffmpeg with -progress pipe:1 for real-time progress on stdout.
+    // Progress lines look like: out_time_us=12345678
+    let mut cmd = tokio::process::Command::new(&ffmpeg_path);
+    cmd.args([
+        "-i",
+        &input_path,
+        "-vn",
+        "-acodec",
+        "libmp3lame",
+        "-q:a",
+        "0",
+        "-progress",
+        "pipe:1",
+        "-nostats",
+        &output_str,
+    ]);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| AppError::Io(format!("Failed to run ffmpeg: {}", e)))?;
+
+    // Stream stdout and parse progress
+    if let Some(stdout) = child.stdout.take() {
+        let reader = tokio::io::BufReader::new(stdout);
+        let mut lines = tokio::io::AsyncBufReadExt::lines(reader);
+        let app_ref = app.clone();
+        let id_ref = id.clone();
+        let title_ref = title.clone();
+
+        while let Ok(Some(line)) = lines.next_line().await {
+            // ffmpeg -progress outputs: out_time_us=<microseconds>
+            if let Some(us_str) = line.strip_prefix("out_time_us=") {
+                if let Ok(us) = us_str.trim().parse::<i64>() {
+                    if us > 0 {
+                        let elapsed_secs = us as f64 / 1_000_000.0;
+                        let percent = if let Some(dur) = duration_secs {
+                            ((elapsed_secs / dur) * 100.0).min(99.0)
+                        } else {
+                            // No duration known — show indeterminate-ish progress
+                            50.0
+                        };
+                        let _ = app_ref.emit(
+                            "download-status",
+                            ytdlp::DownloadStatusEvent {
+                                id: id_ref.clone(),
+                                status: "converting".into(),
+                                progress: percent,
+                                message: format!(
+                                    "Extracting audio... {}%",
+                                    percent as u32
+                                ),
+                                backend: "ffmpeg".into(),
+                                title: Some(title_ref.clone()),
+                                file_path: None,
+                                cover_art_base64: None,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| AppError::Io(format!("Failed to wait for ffmpeg: {}", e)))?;
+
+    if !status.success() {
+        let _ = app.emit(
+            "download-status",
+            ytdlp::DownloadStatusEvent {
+                id: id.clone(),
+                status: "error".into(),
+                progress: 0.0,
+                message: "Extraction failed".into(),
+                backend: "ffmpeg".into(),
+                title: None,
+                file_path: None,
+                cover_art_base64: None,
+            },
+        );
+        return Err(AppError::Io("ffmpeg exited with an error".into()));
+    }
+
+    let _ = app.emit(
+        "download-status",
+        ytdlp::DownloadStatusEvent {
+            id: id.clone(),
+            status: "complete".into(),
+            progress: 100.0,
+            message: "Audio extracted!".into(),
+            backend: "ffmpeg".into(),
+            title: Some(title.clone()),
+            file_path: Some(output_str.clone()),
+            cover_art_base64: None,
+        },
+    );
+
+    // Save to download history
+    let db = app.state::<Database>();
+    let record = DownloadRecord {
+        id,
+        url: input_path,
+        format: "mp3".to_string(),
+        status: "complete".to_string(),
+        title,
+        artist: String::new(),
+        album: String::new(),
+        cover_art_path: String::new(),
+        file_path: output_str.clone(),
+        backend: "ffmpeg".to_string(),
+        message: "Audio extracted!".to_string(),
+        playlist_title: String::new(),
+        created_at: database::now_timestamp(),
+        cover_art_base64: String::new(),
+    };
+    if let Err(e) = db.insert_or_update(&record) {
+        eprintln!("Failed to save extraction record: {}", e);
+    }
+
+    Ok(output_str)
+}
+
+// ========================================================================
+// Discover Commands
+// ========================================================================
+
+/// Fetch similar tracks from multiple sources for the given seed tracks.
+///
+/// Called from JS: invoke("discover_similar", { seeds, lastfmApiKey })
+#[tauri::command]
+async fn discover_similar(
+    seeds: Vec<discover::SeedTrack>,
+    lastfm_api_key: String,
+) -> Result<Vec<discover::SimilarTrack>, AppError> {
+    if seeds.is_empty() || seeds.len() > 5 {
+        return Err(AppError::LastFmFailed(
+            "Provide 1-5 seed tracks".into(),
+        ));
+    }
+
+    let ytdlp_path = ytdlp::find_ytdlp();
+
+    let opts = discover::DiscoverOptions {
+        lastfm_api_key,
+        ytdlp_path,
+    };
+
+    discover::fetch_similar_for_seeds(&opts, &seeds, 30).await
+}
+
+/// Download a preview of a discovered track via yt-dlp search.
+/// Downloads to the app's discover_previews directory.
+///
+/// Called from JS: invoke("discover_preview", { id, title, artist })
+#[tauri::command]
+async fn discover_preview(
+    app: tauri::AppHandle,
+    id: String,
+    title: String,
+    artist: String,
+) -> Result<(), AppError> {
+    let preview_dir = discover::preview_dir(&app)?;
+    let output_dir = preview_dir.to_string_lossy().to_string();
+
+    // Build a YouTube search query
+    let search_query = format!("ytsearch1:{} - {}", artist, title);
+
+    tauri::async_runtime::spawn(async move {
+        // Ensure yt-dlp is available
+        let ytdlp_path = match ytdlp::ensure_ytdlp(&app).await {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = app.emit(
+                    "discover-status",
+                    ytdlp::DownloadStatusEvent {
+                        id: id.clone(),
+                        status: "error".into(),
+                        progress: 0.0,
+                        message: format!("yt-dlp not available: {}", e),
+                        backend: "ytdlp".into(),
+                        title: Some(title),
+                        file_path: None,
+                        cover_art_base64: None,
+                    },
+                );
+                return;
+            }
+        };
+
+        match ytdlp::download_with_ytdlp(
+            &ytdlp_path,
+            &search_query,
+            "mp3",
+            &output_dir,
+            &id,
+            &app,
+        )
+        .await
+        {
+            Ok(result) => {
+                // Re-emit as discover-status so the discover UI picks it up
+                let _ = app.emit(
+                    "discover-status",
+                    ytdlp::DownloadStatusEvent {
+                        id: id.clone(),
+                        status: "complete".into(),
+                        progress: 100.0,
+                        message: "Ready to preview".into(),
+                        backend: "ytdlp".into(),
+                        title: result.title.or(Some(title)),
+                        file_path: result.file_path,
+                        cover_art_base64: result.cover_art_base64,
+                    },
+                );
+            }
+            Err(e) => {
+                let _ = app.emit(
+                    "discover-status",
+                    ytdlp::DownloadStatusEvent {
+                        id: id.clone(),
+                        status: "error".into(),
+                        progress: 0.0,
+                        message: format!("Download failed: {}", e),
+                        backend: "ytdlp".into(),
+                        title: Some(title),
+                        file_path: None,
+                        cover_art_base64: None,
+                    },
+                );
+            }
+        }
+    });
+
+    Ok(())
+}
+
+/// Move a preview file to the user's output directory (keep it).
+/// Returns the new file path.
+///
+/// Called from JS: invoke("discover_keep", { id, sourcePath })
+#[tauri::command]
+async fn discover_keep(
+    app: tauri::AppHandle,
+    id: String,
+    source_path: String,
+) -> Result<String, AppError> {
+    let source = std::path::PathBuf::from(&source_path);
+    if !source.exists() {
+        return Err(AppError::Io(format!("Preview file not found: {}", source_path)));
+    }
+
+    let output_dir = get_store_value(&app, "outputDir")
+        .unwrap_or_else(|| default_output_dir());
+
+    let filename = source
+        .file_name()
+        .ok_or_else(|| AppError::Io("Invalid file path".into()))?;
+    let dest = std::path::PathBuf::from(&output_dir).join(filename);
+    let dest_str = dest.to_string_lossy().to_string();
+
+    tokio::fs::rename(&source, &dest)
+        .await
+        .map_err(|e| AppError::Io(format!("Failed to move file: {}", e)))?;
+
+    // Save to download history so it shows up in the Downloads tab
+    let title = source
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let db = app.state::<Database>();
+    let record = DownloadRecord {
+        id,
+        url: String::new(),
+        format: "mp3".to_string(),
+        status: "complete".to_string(),
+        title,
+        artist: String::new(),
+        album: String::new(),
+        cover_art_path: String::new(),
+        file_path: dest_str.clone(),
+        backend: "discover".to_string(),
+        message: "Kept from Discover".to_string(),
+        playlist_title: String::new(),
+        created_at: database::now_timestamp(),
+        cover_art_base64: String::new(),
+    };
+    if let Err(e) = db.insert_or_update(&record) {
+        eprintln!("Failed to save discover keep record: {}", e);
+    }
+
+    Ok(dest_str)
+}
+
+/// Delete a single preview file.
+///
+/// Called from JS: invoke("discover_trash", { filePath })
+#[tauri::command]
+async fn discover_trash(file_path: String) -> Result<(), AppError> {
+    let path = std::path::PathBuf::from(&file_path);
+    if path.exists() {
+        tokio::fs::remove_file(&path)
+            .await
+            .map_err(|e| AppError::Io(format!("Failed to delete preview: {}", e)))?;
+    }
+    Ok(())
+}
+
+/// Delete all preview files.
+///
+/// Called from JS: invoke("discover_cleanup")
+#[tauri::command]
+async fn discover_cleanup(app: tauri::AppHandle) -> Result<(), AppError> {
+    discover::cleanup_previews(&app)
+}
+
+// ========================================================================
 // Playlist Commands
 // ========================================================================
 
@@ -415,6 +839,273 @@ async fn extract_playlist(
 ) -> Result<ytdlp::PlaylistInfo, AppError> {
     let ytdlp_path = ytdlp::ensure_ytdlp(&app).await?;
     ytdlp::extract_playlist(&ytdlp_path, &url).await
+}
+
+// ========================================================================
+// Library Commands
+// ========================================================================
+
+/// List library folders the user has added.
+#[tauri::command]
+async fn get_library_folders(app: tauri::AppHandle) -> Result<Vec<String>, AppError> {
+    let db = app.state::<Database>();
+    db.list_library_folders().map_err(|e| AppError::Io(e.to_string()))
+}
+
+/// Add a folder to the library (does not scan).
+#[tauri::command]
+async fn add_library_folder(app: tauri::AppHandle, path: String) -> Result<(), AppError> {
+    let db = app.state::<Database>();
+    db.add_library_folder(&path).map_err(|e| AppError::Io(e.to_string()))
+}
+
+/// Remove a folder + all its cached tracks.
+#[tauri::command]
+async fn remove_library_folder(app: tauri::AppHandle, path: String) -> Result<(), AppError> {
+    let db = app.state::<Database>();
+    db.remove_library_folder(&path).map_err(|e| AppError::Io(e.to_string()))
+}
+
+/// Load all cached library tracks (fast — no disk walk).
+#[tauri::command]
+async fn get_library_tracks(app: tauri::AppHandle) -> Result<Vec<library::LibraryTrack>, AppError> {
+    let db = app.state::<Database>();
+    db.get_all_library_tracks().map_err(|e| AppError::Io(e.to_string()))
+}
+
+/// Apply MusicBrainz metadata to a library track. Writes ID3 tags, downloads
+/// cover art, renames the file, and updates the library row in place.
+#[tauri::command]
+async fn apply_library_metadata(
+    app: tauri::AppHandle,
+    path: String,
+    title: String,
+    artist: String,
+    album: String,
+    release_mbid: String,
+) -> Result<metadata::AppliedMetadata, AppError> {
+    let rate_limiter = app.state::<RateLimiter>();
+    let result = metadata::apply_metadata_to_file(
+        &path,
+        &title,
+        &artist,
+        &album,
+        &release_mbid,
+        &rate_limiter,
+    )
+    .await?;
+
+    // Persist into library_tracks: keep first_scanned_at, refresh everything else.
+    let cover_bytes = result.cover_art_base64.as_ref().and_then(|b64| {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.decode(b64).ok()
+    });
+
+    let db = app.state::<Database>();
+    db.update_library_track_after_edit(
+        &path,
+        &result.new_file_path,
+        &result.title,
+        &result.artist,
+        &result.album,
+        cover_bytes.as_deref(),
+    )
+    .map_err(|e| AppError::Io(e.to_string()))?;
+
+    Ok(result)
+}
+
+/// Manually edit a library track's tags (no MusicBrainz). Mirrors update_mp3_metadata
+/// but targets a library row by path. Returns the (possibly renamed) new path.
+#[tauri::command]
+async fn update_library_track(
+    app: tauri::AppHandle,
+    path: String,
+    title: String,
+    artist: String,
+    album: String,
+    new_filename: String,
+) -> Result<String, AppError> {
+    let file_path = std::path::PathBuf::from(&path);
+    if !file_path.exists() {
+        return Err(AppError::Io(format!("File not found: {}", path)));
+    }
+
+    let mut tag = id3::Tag::read_from_path(&file_path).unwrap_or_else(|_| id3::Tag::new());
+    if !title.is_empty() { tag.set_title(&title); }
+    if !artist.is_empty() { tag.set_artist(&artist); }
+    if !album.is_empty() { tag.set_album(&album); }
+    tag.write_to_path(&file_path, id3::Version::Id3v24)
+        .map_err(|e| AppError::Io(format!("Failed to write ID3 tags: {}", e)))?;
+
+    let current_filename = file_path
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    // Auto-rename to "{Artist} - {Title}.{ext}" using the original extension.
+    // The frontend ignores `new_filename` (it's a read-only display); we keep
+    // the param in the signature for back-compat but only honor it when the
+    // user explicitly differs from the auto-name.
+    let _ = new_filename; // intentionally unused
+    let ext = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_string();
+    let target_filename = if !artist.is_empty() && !title.is_empty() {
+        let stem = format!("{} - {}", sanitize_filename(&artist), sanitize_filename(&title));
+        if ext.is_empty() { stem } else { format!("{}.{}", stem, ext) }
+    } else {
+        current_filename.clone()
+    };
+
+    let final_path = if target_filename != current_filename {
+        let new_path = file_path.with_file_name(&target_filename);
+        tokio::fs::rename(&file_path, &new_path)
+            .await
+            .map_err(|e| AppError::Io(format!("Failed to rename file: {}", e)))?;
+        new_path.to_string_lossy().to_string()
+    } else {
+        path.clone()
+    };
+
+    // Re-read cover art (may have been changed externally) for the cache.
+    let cover_bytes = id3::Tag::read_from_path(&final_path)
+        .ok()
+        .and_then(|t| t.pictures().next().map(|p| p.data.clone()));
+
+    let db = app.state::<Database>();
+    db.update_library_track_after_edit(
+        &path,
+        &final_path,
+        &title,
+        &artist,
+        &album,
+        cover_bytes.as_deref(),
+    )
+    .map_err(|e| AppError::Io(e.to_string()))?;
+
+    Ok(final_path)
+}
+
+/// Increment the play counter and timestamp for a library track. Called from
+/// the frontend when an audio element fires its natural `ended` event.
+#[tauri::command]
+async fn record_track_play(app: tauri::AppHandle, path: String) -> Result<(), AppError> {
+    let db = app.state::<Database>();
+    db.record_library_play(&path).map_err(|e| AppError::Io(e.to_string()))
+}
+
+/// Get a cached waveform for the given file path, computing + caching it
+/// the first time it's requested. Returns 500 bytes of 0..=255 amplitude.
+#[tauri::command]
+async fn get_or_compute_waveform(
+    app: tauri::AppHandle,
+    path: String,
+) -> Result<Vec<u8>, AppError> {
+    {
+        let db = app.state::<Database>();
+        if let Some(cached) = db
+            .get_library_waveform(&path)
+            .map_err(|e| AppError::Io(e.to_string()))?
+        {
+            if cached.len() == waveform::BUCKETS {
+                return Ok(cached);
+            }
+        }
+    }
+
+    let computed = waveform::compute(std::path::Path::new(&path)).await?;
+    let db = app.state::<Database>();
+    db.set_library_waveform(&path, &computed)
+        .map_err(|e| AppError::Io(e.to_string()))?;
+    Ok(computed)
+}
+
+/// Try to find cover art for a library track. Pass `allow_youtube_search=false`
+/// for the silent bulk pass (only trustworthy sources). Returns `None` if
+/// nothing was found. Does NOT embed — call `embed_cover_art` to commit.
+#[tauri::command]
+async fn find_cover_candidate(
+    app: tauri::AppHandle,
+    path: String,
+    title: String,
+    artist: String,
+    allow_youtube_search: bool,
+) -> Result<Option<cover_art::CoverCandidate>, AppError> {
+    let ytdlp_path = ytdlp::find_ytdlp();
+    let db = app.state::<Database>();
+    let candidate = cover_art::find_candidate(
+        &path,
+        &title,
+        &artist,
+        allow_youtube_search,
+        &db,
+        ytdlp_path.as_deref(),
+    )
+    .await;
+    Ok(candidate)
+}
+
+/// Embed the given JPEG (base64) into the file's APIC frame and refresh the
+/// library cache row.
+#[tauri::command]
+async fn embed_cover_art(
+    app: tauri::AppHandle,
+    path: String,
+    image_base64: String,
+) -> Result<(), AppError> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&image_base64)
+        .map_err(|e| AppError::Io(format!("Invalid base64: {}", e)))?;
+    let db = app.state::<Database>();
+    cover_art::embed_cover_into_file(&path, &bytes, &db)
+}
+
+/// Incremental scan of one folder: diff against cache, upsert changes, delete missing.
+/// Returns counts of added/updated/removed/unchanged tracks.
+#[tauri::command]
+async fn scan_library_incremental(
+    app: tauri::AppHandle,
+    path: String,
+) -> Result<library::ScanResult, AppError> {
+    let dir = std::path::PathBuf::from(&path);
+    if !dir.is_dir() {
+        return Err(AppError::Io(format!("Not a directory: {}", path)));
+    }
+    let app_clone = app.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let db = app_clone.state::<Database>();
+        library::scan_folder_incremental(&dir, &db)
+    })
+    .await
+    .map_err(|e| AppError::Io(format!("Scan failed: {}", e)))?;
+    Ok(result)
+}
+
+/// Get the remote-control token + port for external controllers (e.g. Stream Deck).
+#[tauri::command]
+async fn get_remote_info(app: tauri::AppHandle) -> Result<serde_json::Value, AppError> {
+    let token = get_store_value(&app, "remoteToken").unwrap_or_default();
+    Ok(serde_json::json!({
+        "token": token,
+        "port": remote::REMOTE_PORT,
+    }))
+}
+
+/// Read cover art from a single audio file, returned as base64.
+#[tauri::command]
+async fn get_track_cover_art(path: String) -> Result<String, AppError> {
+    let file_path = std::path::PathBuf::from(&path);
+    if let Ok(tag) = id3::Tag::read_from_path(&file_path) {
+        if let Some(pic) = tag.pictures().next() {
+            use base64::Engine;
+            return Ok(base64::engine::general_purpose::STANDARD.encode(&pic.data));
+        }
+    }
+    Ok(String::new())
 }
 
 // ========================================================================
@@ -437,6 +1128,39 @@ fn default_output_dir() -> String {
         .unwrap_or_else(|| ".".to_string())
 }
 
+/// Default music library directory (~/Music or home).
+fn default_music_dir() -> String {
+    dirs::audio_dir()
+        .or_else(dirs::home_dir)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| ".".to_string())
+}
+
+/// Probe a media file's duration in seconds using ffprobe (sibling of ffmpeg).
+/// Returns None if ffprobe isn't found or parsing fails — callers should handle gracefully.
+async fn probe_duration(ffmpeg_path: &std::path::Path, input: &str) -> Option<f64> {
+    // ffprobe lives next to ffmpeg; try sibling first, then PATH
+    let ffprobe = ffmpeg_path
+        .parent()
+        .map(|dir| dir.join("ffprobe"))
+        .filter(|p| p.exists())
+        .or_else(|| which::which("ffprobe").ok())?;
+
+    let output = tokio::process::Command::new(ffprobe)
+        .args([
+            "-v", "quiet",
+            "-show_entries", "format=duration",
+            "-of", "csv=p=0",
+            input,
+        ])
+        .output()
+        .await
+        .ok()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.trim().parse::<f64>().ok()
+}
+
 /// Replace characters that are invalid in filenames with underscores.
 fn sanitize_filename(s: &str) -> String {
     s.chars()
@@ -453,6 +1177,116 @@ fn sanitize_filename(s: &str) -> String {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Custom URI scheme for serving audio files with permissive CORS so
+        // Web Audio's MediaElementSource (used by the spectrogram) can read
+        // their data. The default `asset:` protocol is treated as cross-origin
+        // and silently zeroes analyser output.
+        .register_uri_scheme_protocol("wjaudio", |_app, request| {
+            use std::io::{Read, Seek, SeekFrom};
+            use tauri::http::{header, Response, StatusCode};
+
+            // wjaudio://localhost/<percent-encoded-absolute-path>
+            let uri = request.uri().to_string();
+            let after_host = uri
+                .splitn(2, "://")
+                .nth(1)
+                .and_then(|rest| rest.splitn(2, '/').nth(1))
+                .unwrap_or("");
+            let decoded = urlencoding::decode(after_host)
+                .map(|s| s.into_owned())
+                .unwrap_or_default();
+
+            let mime = match std::path::Path::new(&decoded)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "mp3" => "audio/mpeg",
+                "flac" => "audio/flac",
+                "ogg" | "opus" => "audio/ogg",
+                "m4a" | "aac" => "audio/mp4",
+                "wav" => "audio/wav",
+                "webm" => "audio/webm",
+                _ => "application/octet-stream",
+            };
+
+            // Parse a single-range "Range: bytes=START-END" header (the only
+            // form Chromium uses for media seeks). Multi-range is rare here
+            // and we ignore it (return the whole file).
+            let range_header = request
+                .headers()
+                .get(header::RANGE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.strip_prefix("bytes="))
+                .and_then(|s| {
+                    let mut parts = s.splitn(2, '-');
+                    let start = parts.next()?.parse::<u64>().ok()?;
+                    let end = parts.next().and_then(|e| e.parse::<u64>().ok());
+                    Some((start, end))
+                });
+
+            let mut file = match std::fs::File::open(&decoded) {
+                Ok(f) => f,
+                Err(e) => {
+                    return Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(format!("File not found: {} ({})", decoded, e).into_bytes())
+                        .unwrap();
+                }
+            };
+            let total_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+
+            let common = |b: tauri::http::response::Builder| {
+                b.header(header::CONTENT_TYPE, mime)
+                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                    .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET")
+                    .header(header::ACCEPT_RANGES, "bytes")
+                    .header(header::CACHE_CONTROL, "no-cache")
+            };
+
+            if let Some((start, end_opt)) = range_header {
+                let end = end_opt.unwrap_or(total_len.saturating_sub(1)).min(total_len.saturating_sub(1));
+                if start > end || start >= total_len {
+                    return common(Response::builder())
+                        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                        .header(header::CONTENT_RANGE, format!("bytes */{}", total_len))
+                        .body(Vec::new())
+                        .unwrap();
+                }
+                let length = end - start + 1;
+                let mut buf = vec![0u8; length as usize];
+                if file.seek(SeekFrom::Start(start)).is_err()
+                    || file.read_exact(&mut buf).is_err()
+                {
+                    return common(Response::builder())
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(b"read failed".to_vec())
+                        .unwrap();
+                }
+                return common(Response::builder())
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(header::CONTENT_RANGE, format!("bytes {}-{}/{}", start, end, total_len))
+                    .header(header::CONTENT_LENGTH, length.to_string())
+                    .body(buf)
+                    .unwrap();
+            }
+
+            // No Range header — return the whole file.
+            let mut bytes = Vec::with_capacity(total_len as usize);
+            if file.read_to_end(&mut bytes).is_err() {
+                return common(Response::builder())
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(b"read failed".to_vec())
+                    .unwrap();
+            }
+            common(Response::builder())
+                .status(StatusCode::OK)
+                .header(header::CONTENT_LENGTH, bytes.len().to_string())
+                .body(bytes)
+                .unwrap()
+        })
         // Register plugins:
         // - shell: for opening URLs in the system browser
         // - dialog: for the folder picker in settings
@@ -470,6 +1304,32 @@ pub fn run() {
                 .expect("Failed to initialize download history database");
             app.manage(db);
             app.manage(RateLimiter::new());
+
+            // Load or generate the remote-control token, then launch the HTTP server.
+            let token = {
+                let store = app
+                    .store("settings.json")
+                    .expect("Failed to open settings store");
+                let existing = store
+                    .get("remoteToken")
+                    .and_then(|v| v.as_str().map(|s| s.to_string()));
+                match existing {
+                    Some(t) if !t.is_empty() => t,
+                    _ => {
+                        use rand::Rng;
+                        let t: String = rand::rng()
+                            .sample_iter(&rand::distr::Alphanumeric)
+                            .take(32)
+                            .map(char::from)
+                            .collect();
+                        store.set("remoteToken", serde_json::Value::String(t.clone()));
+                        let _ = store.save();
+                        t
+                    }
+                }
+            };
+            remote::spawn(app.handle().clone(), token);
+
             Ok(())
         })
         // Register our command handlers — these become available to JS via invoke()
@@ -486,7 +1346,26 @@ pub fn run() {
             clear_download_history,
             fetch_metadata,
             apply_metadata,
+            extract_audio,
+            discover_similar,
+            discover_preview,
+            discover_keep,
+            discover_trash,
+            discover_cleanup,
             extract_playlist,
+            get_library_folders,
+            add_library_folder,
+            remove_library_folder,
+            get_library_tracks,
+            scan_library_incremental,
+            apply_library_metadata,
+            update_library_track,
+            find_cover_candidate,
+            embed_cover_art,
+            get_or_compute_waveform,
+            record_track_play,
+            get_track_cover_art,
+            get_remote_info,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

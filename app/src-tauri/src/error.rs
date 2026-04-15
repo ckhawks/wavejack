@@ -33,6 +33,10 @@ pub enum AppError {
     #[error("Invalid URL: {0}")]
     InvalidUrl(String),
 
+    /// Last.fm API request failed
+    #[error("Last.fm error: {0}")]
+    LastFmFailed(String),
+
     /// Generic I/O error (file write failed, etc.)
     #[error("IO error: {0}")]
     Io(String),

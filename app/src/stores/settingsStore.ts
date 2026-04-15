@@ -12,8 +12,13 @@ interface SettingsStore {
 export const useSettingsStore = create<SettingsStore>((set, get) => ({
   settings: {
     outputDir: "",
+    musicDir: "",
     cobaltUrl: "",
     format: "mp3",
+    lastfmApiKey: "",
+    lastDestination: "downloads",
+    libraryColumns: "",
+    librarySort: "",
   },
   loaded: false,
 

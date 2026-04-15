@@ -28,3 +28,7 @@ id3 = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
 urlencoding = "2"
 base64 = "0.22"
+rand = "0.9"
+axum = "0.7"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+lofty = "0.22"

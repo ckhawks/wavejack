@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { X, Download, CheckSquare, Square } from "lucide-react";
 import { useDownloadStore } from "../stores/downloadStore";
+import { useSettingsStore } from "../stores/settingsStore";
 import { startDownload } from "../lib/commands";
 import type { PlaylistInfo } from "../lib/types";
 
@@ -23,6 +24,7 @@ export function PlaylistPreview({ playlist, format, onClose }: Props) {
   );
   const [downloading, setDownloading] = useState(false);
   const addDownload = useDownloadStore((s) => s.addDownload);
+  const destination = useSettingsStore((s) => s.settings.lastDestination);
 
   const allSelected = selected.size === playlist.entries.length;
 
@@ -65,7 +67,7 @@ export function PlaylistPreview({ playlist, format, onClose }: Props) {
       });
 
       try {
-        await startDownload(id, entry.url, format, playlist.title);
+        await startDownload(id, entry.url, format, playlist.title, destination);
       } catch (e) {
         console.error("Failed to start download:", e);
       }

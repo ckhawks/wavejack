@@ -6,7 +6,7 @@ export interface DownloadItem {
   status: "pending" | "downloading" | "converting" | "complete" | "error" | "file_missing";
   progress: number;
   message: string;
-  backend: "ytdlp" | "cobalt" | "none" | "";
+  backend: "ytdlp" | "cobalt" | "ffmpeg" | "none" | "";
   title?: string;
   artist?: string;
   album?: string;
@@ -18,8 +18,15 @@ export interface DownloadItem {
 /** App settings persisted via Tauri plugin-store */
 export interface AppSettings {
   outputDir: string;
+  musicDir: string;
   cobaltUrl: string;
   format: "mp4" | "mp3";
+  lastfmApiKey: string;
+  lastDestination: "downloads" | "music";
+  /** JSON-encoded record of which library columns are visible. */
+  libraryColumns: string;
+  /** JSON-encoded { field, dir } sort state for the library table. */
+  librarySort: string;
 }
 
 /** Shape of the download-status event from Rust */
@@ -82,6 +89,34 @@ export interface PlaylistEntry {
   title: string;
   duration: number | null;
   uploader: string | null;
+}
+
+/** A seed track for the Discover feature */
+export interface SeedTrack {
+  title: string;
+  artist: string;
+}
+
+/** A similar track returned by Last.fm or SoundCloud */
+export interface SimilarTrack {
+  name: string;
+  artist: string;
+  match_score: number;
+  source: "lastfm" | "soundcloud" | "youtube";
+}
+
+/** A track in the Discover queue */
+export interface DiscoverItem {
+  id: string;
+  title: string;
+  artist: string;
+  matchScore: number;
+  source: "lastfm" | "soundcloud" | "youtube";
+  status: "pending" | "downloading" | "ready" | "error";
+  progress: number;
+  message: string;
+  filePath?: string;
+  coverArtBase64?: string;
 }
 
 /** Playlist info extracted via yt-dlp */

@@ -17,7 +17,20 @@ interface PlayerStore {
   volumeLoaded: boolean;
   currentTime: number;
   duration: number;
+  /** Optional ordered playback queue. When set, playNext/playPrev walk this
+   * list before falling back to download adjacency. Callers (e.g. LibraryView)
+   * pass it to control the listening order. */
+  queue: PlayerTrack[];
+  /** Stack of previously played tracks. Pushed each time playNext advances. */
+  history: PlayerTrack[];
+  /** Stack of tracks "rewound from" — populated when playPrev pops history,
+   * consumed by playNext so back→forward retraces the same path before
+   * resuming queue/shuffle progression. */
+  forward: PlayerTrack[];
+  shuffle: boolean;
   playTrack: (track: PlayerTrack) => void;
+  setQueue: (tracks: PlayerTrack[]) => void;
+  toggleShuffle: () => void;
   togglePlayPause: () => void;
   setPlaying: (playing: boolean) => void;
   setVolume: (volume: number) => void;
@@ -43,8 +56,22 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
   volumeLoaded: false,
   currentTime: 0,
   duration: 0,
+  queue: [],
+  history: [],
+  forward: [],
+  shuffle: false,
 
-  playTrack: (track) => set({ currentTrack: track, isPlaying: true, currentTime: 0, duration: 0 }),
+  // Manually selecting a track wipes the forward stack — you've branched.
+  playTrack: (track) =>
+    set({ currentTrack: track, isPlaying: true, currentTime: 0, duration: 0, forward: [] }),
+
+  setQueue: (tracks) => set({ queue: tracks }),
+
+  toggleShuffle: () => {
+    const next = !get().shuffle;
+    set({ shuffle: next });
+    setSetting("shuffle", next ? "1" : "0").catch(() => {});
+  },
 
   togglePlayPause: () => set((s) => ({ isPlaying: !s.isPlaying })),
 
@@ -70,13 +97,65 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
         const v = parseFloat(saved);
         if (isFinite(v)) set({ volume: v });
       }
+      const sh = (settings as any).shuffle;
+      if (sh != null) set({ shuffle: sh === "1" || sh === "true" });
     } catch {}
     set({ volumeLoaded: true });
   },
 
   playNext: () => {
-    const { currentTrack } = get();
+    const { currentTrack, queue, shuffle, history, forward } = get();
     if (!currentTrack) return;
+
+    // If we've recently rewound, retrace forward instead of picking anew.
+    if (forward.length > 0) {
+      const next = forward[forward.length - 1];
+      set({
+        currentTrack: next,
+        isPlaying: true,
+        currentTime: 0,
+        duration: 0,
+        history: [...history, currentTrack],
+        forward: forward.slice(0, -1),
+      });
+      return;
+    }
+
+    // Try the explicit queue first
+    if (queue.length > 0) {
+      const idx = queue.findIndex((t) => t.id === currentTrack.id);
+      if (idx >= 0) {
+        if (shuffle && queue.length > 1) {
+          let pick = idx;
+          while (pick === idx) {
+            pick = Math.floor(Math.random() * queue.length);
+          }
+          set({
+            currentTrack: queue[pick],
+            isPlaying: true,
+            currentTime: 0,
+            duration: 0,
+            history: [...history, currentTrack],
+          });
+          return;
+        }
+        if (idx < queue.length - 1) {
+          set({
+            currentTrack: queue[idx + 1],
+            isPlaying: true,
+            currentTime: 0,
+            duration: 0,
+            history: [...history, currentTrack],
+          });
+          return;
+        }
+        // End of queue
+        set({ isPlaying: false });
+        return;
+      }
+    }
+
+    // Fallback: walk the download queue
     const ids = getAdjacentMp3s();
     const idx = ids.indexOf(currentTrack.id);
     if (idx < 0 || idx >= ids.length - 1) {
@@ -102,8 +181,50 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
   },
 
   playPrev: () => {
-    const { currentTrack } = get();
+    const { currentTrack, queue, history, forward, currentTime } = get();
     if (!currentTrack) return;
+
+    // Mid-song "back" restarts the current track; near the start it goes to
+    // the previous track. ~3s threshold matches Spotify / Apple Music.
+    const RESTART_THRESHOLD_SECS = 3;
+    if (currentTime > RESTART_THRESHOLD_SECS) {
+      const audio = document.querySelector("audio");
+      if (audio) audio.currentTime = 0;
+      set({ currentTime: 0, isPlaying: true });
+      return;
+    }
+
+    // Prefer the history stack so shuffle "back" actually returns to the
+    // previously played track. The current goes onto the forward stack so
+    // pressing next will retrace.
+    if (history.length > 0) {
+      const prev = history[history.length - 1];
+      set({
+        currentTrack: prev,
+        isPlaying: true,
+        currentTime: 0,
+        duration: 0,
+        history: history.slice(0, -1),
+        forward: [...forward, currentTrack],
+      });
+      return;
+    }
+
+    if (queue.length > 0) {
+      const idx = queue.findIndex((t) => t.id === currentTrack.id);
+      if (idx > 0) {
+        set({
+          currentTrack: queue[idx - 1],
+          isPlaying: true,
+          currentTime: 0,
+          duration: 0,
+          forward: [...forward, currentTrack],
+        });
+        return;
+      }
+      if (idx === 0) return;
+    }
+
     const ids = getAdjacentMp3s();
     const idx = ids.indexOf(currentTrack.id);
     if (idx <= 0) return;

@@ -1,8 +1,8 @@
 import { useState, useEffect } from "react";
-import { X, FolderOpen, CheckCircle, AlertCircle, Loader } from "lucide-react";
+import { X, FolderOpen, CheckCircle, AlertCircle, Loader, Copy } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useSettingsStore } from "../stores/settingsStore";
-import { ensureYtdlpReady } from "../lib/commands";
+import { ensureYtdlpReady, getRemoteInfo } from "../lib/commands";
 
 interface Props {
   onClose: () => void;
@@ -11,23 +11,50 @@ interface Props {
 export function Settings({ onClose }: Props) {
   const { settings, loaded, updateSetting } = useSettingsStore();
   const [cobaltUrl, setCobaltUrl] = useState("");
+  const [lastfmKey, setLastfmKey] = useState("");
   const [ytdlpStatus, setYtdlpStatus] = useState<
     "unknown" | "checking" | "ready" | "downloading" | "error"
   >("unknown");
   const [ytdlpPath, setYtdlpPath] = useState("");
+  const [remoteToken, setRemoteToken] = useState("");
+  const [remotePort, setRemotePort] = useState<number | null>(null);
+  const [copied, setCopied] = useState(false);
 
   // Sync local cobalt URL state when settings load
   useEffect(() => {
     if (loaded) {
       setCobaltUrl(settings.cobaltUrl);
+      setLastfmKey(settings.lastfmApiKey);
     }
-  }, [loaded, settings.cobaltUrl]);
+  }, [loaded, settings.cobaltUrl, settings.lastfmApiKey]);
+
+  useEffect(() => {
+    getRemoteInfo()
+      .then((info) => {
+        setRemoteToken(info.token);
+        setRemotePort(info.port);
+      })
+      .catch((e) => console.error("Failed to load remote info:", e));
+  }, []);
+
+  const copyToken = async () => {
+    await navigator.clipboard.writeText(remoteToken);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
 
   // Pick output directory using system folder picker
   const pickOutputDir = async () => {
     const selected = await open({ directory: true, multiple: false });
     if (selected) {
       await updateSetting("outputDir", selected as string);
+    }
+  };
+
+  const pickMusicDir = async () => {
+    const selected = await open({ directory: true, multiple: false });
+    if (selected) {
+      await updateSetting("musicDir", selected as string);
     }
   };
 
@@ -65,17 +92,36 @@ export function Settings({ onClose }: Props) {
 
         {/* Body */}
         <div className="space-y-6 p-6">
-          {/* Output directory */}
+          {/* Downloads directory */}
           <div>
             <label className="mb-2 block text-sm font-medium text-neutral-400">
-              Output Directory
+              Downloads Folder
             </label>
             <div className="flex items-center gap-3">
               <div className="min-w-0 flex-1 truncate rounded-lg border border-[#333] bg-black px-4 py-2.5 text-sm text-white">
-                {settings.outputDir || "Not set (using Downloads)"}
+                {settings.outputDir || "Not set (using system Downloads)"}
               </div>
               <button
                 onClick={pickOutputDir}
+                className="flex items-center gap-2 rounded-lg border border-[#333] px-4 py-2.5 text-sm text-neutral-400 transition-all duration-200 hover:border-[#555] hover:text-white"
+              >
+                <FolderOpen size={16} />
+                Browse
+              </button>
+            </div>
+          </div>
+
+          {/* Music Library directory */}
+          <div>
+            <label className="mb-2 block text-sm font-medium text-neutral-400">
+              Music Library Folder
+            </label>
+            <div className="flex items-center gap-3">
+              <div className="min-w-0 flex-1 truncate rounded-lg border border-[#333] bg-black px-4 py-2.5 text-sm text-white">
+                {settings.musicDir || "Not set (using system Music)"}
+              </div>
+              <button
+                onClick={pickMusicDir}
                 className="flex items-center gap-2 rounded-lg border border-[#333] px-4 py-2.5 text-sm text-neutral-400 transition-all duration-200 hover:border-[#555] hover:text-white"
               >
                 <FolderOpen size={16} />
@@ -99,6 +145,53 @@ export function Settings({ onClose }: Props) {
             />
             <p className="mt-1.5 text-xs text-neutral-600">
               Self-hosted cobalt instance. Used as fallback when yt-dlp fails.
+            </p>
+          </div>
+
+          {/* Last.fm API key */}
+          <div>
+            <label className="mb-2 block text-sm font-medium text-neutral-400">
+              Last.fm API Key (for Discover)
+            </label>
+            <input
+              type="text"
+              value={lastfmKey}
+              onChange={(e) => setLastfmKey(e.target.value)}
+              onBlur={() => updateSetting("lastfmApiKey", lastfmKey)}
+              placeholder="Your Last.fm API key"
+              className="w-full rounded-lg border border-[#333] bg-black px-4 py-2.5 text-sm text-white placeholder-neutral-600 outline-none transition-all duration-200 focus:border-[#555]"
+            />
+            <p className="mt-1.5 text-xs text-neutral-600">
+              Free API key from last.fm/api/account/create. Powers the Discover tab.
+            </p>
+          </div>
+
+          {/* Remote control (Stream Deck) */}
+          <div>
+            <label className="mb-2 block text-sm font-medium text-neutral-400">
+              Remote Control Token
+            </label>
+            <div className="flex items-center gap-3">
+              <div className="min-w-0 flex-1 truncate rounded-lg border border-[#333] bg-black px-4 py-2.5 font-mono text-xs text-white">
+                {remoteToken || "Loading..."}
+              </div>
+              <button
+                onClick={copyToken}
+                disabled={!remoteToken}
+                className="flex items-center gap-2 rounded-lg border border-[#333] px-4 py-2.5 text-sm text-neutral-400 transition-all duration-200 hover:border-[#555] hover:text-white disabled:opacity-40"
+              >
+                <Copy size={16} />
+                {copied ? "Copied" : "Copy"}
+              </button>
+            </div>
+            <p className="mt-1.5 text-xs text-neutral-600">
+              Send <span className="font-mono">POST http://127.0.0.1:{remotePort ?? "7406"}/...</span>{" "}
+              with header <span className="font-mono">X-Wavejack-Token</span>.
+              Endpoints: <span className="font-mono">/discover/approve</span>,{" "}
+              <span className="font-mono">/discover/skip</span>,{" "}
+              <span className="font-mono">/player/volume/up</span>,{" "}
+              <span className="font-mono">/player/volume/down</span>,{" "}
+              <span className="font-mono">/player/play-pause</span>.
             </p>
           </div>
 

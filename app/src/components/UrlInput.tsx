@@ -1,8 +1,9 @@
 import { useState } from "react";
-import { Download, Loader, Music, Video } from "lucide-react";
+import { Download, Loader, Music, Video, FileAudio, FolderDown, Library } from "lucide-react";
+import { open } from "@tauri-apps/plugin-dialog";
 import { useDownloadStore } from "../stores/downloadStore";
 import { useSettingsStore } from "../stores/settingsStore";
-import { startDownload, extractPlaylist } from "../lib/commands";
+import { startDownload, extractPlaylist, extractAudio } from "../lib/commands";
 import { PlaylistPreview } from "./PlaylistPreview";
 import type { PlaylistInfo } from "../lib/types";
 
@@ -20,10 +21,13 @@ export function UrlInput() {
   const [extracting, setExtracting] = useState(false);
   const [playlist, setPlaylist] = useState<PlaylistInfo | null>(null);
   const format = useSettingsStore((s) => s.settings.format);
+  const destination = useSettingsStore((s) => s.settings.lastDestination);
   const updateSetting = useSettingsStore((s) => s.updateSetting);
   const addDownload = useDownloadStore((s) => s.addDownload);
 
   const setFormat = (f: "mp4" | "mp3") => updateSetting("format", f);
+  const setDestination = (d: "downloads" | "music") =>
+    updateSetting("lastDestination", d);
 
   const handleDownload = async () => {
     const trimmed = url.trim();
@@ -60,9 +64,44 @@ export function UrlInput() {
       backend: "",
     });
     setUrl("");
-    startDownload(id, trimmedUrl, format).catch((e) =>
+    startDownload(id, trimmedUrl, format, undefined, destination).catch((e) =>
       console.error("Failed to start download:", e)
     );
+  };
+
+  const [extractingAudio, setExtractingAudio] = useState(false);
+
+  const handleExtractAudio = async () => {
+    const selected = await open({
+      multiple: false,
+      filters: [
+        {
+          name: "Video",
+          extensions: ["mp4", "mkv", "webm", "avi", "mov", "flv", "wmv"],
+        },
+      ],
+    });
+    if (!selected) return;
+
+    setExtractingAudio(true);
+    const id = crypto.randomUUID();
+    addDownload({
+      id,
+      url: selected,
+      format: "mp3",
+      status: "converting",
+      progress: 0,
+      message: "Extracting audio...",
+      backend: "ffmpeg",
+    });
+
+    try {
+      await extractAudio(id, selected);
+    } catch (e) {
+      console.error("Failed to extract audio:", e);
+    } finally {
+      setExtractingAudio(false);
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -113,6 +152,38 @@ export function UrlInput() {
           </button>
         </div>
 
+        {/* Destination toggle */}
+        <div className="relative flex overflow-hidden rounded-lg border border-[#333] bg-[#111]">
+          <button
+            onClick={() => setDestination("downloads")}
+            className={`relative z-10 px-3 py-3 text-sm font-semibold transition-all duration-200 ${
+              destination === "downloads"
+                ? "bg-[#222] text-white"
+                : "text-neutral-600 hover:text-neutral-400"
+            }`}
+            title="Save to Downloads folder"
+          >
+            <span className="flex items-center gap-1.5">
+              <FolderDown size={14} />
+              Downloads
+            </span>
+          </button>
+          <button
+            onClick={() => setDestination("music")}
+            className={`relative z-10 px-3 py-3 text-sm font-semibold transition-all duration-200 ${
+              destination === "music"
+                ? "bg-[#222] text-white"
+                : "text-neutral-600 hover:text-neutral-400"
+            }`}
+            title="Save to Music Library"
+          >
+            <span className="flex items-center gap-1.5">
+              <Library size={14} />
+              Music
+            </span>
+          </button>
+        </div>
+
         {/* Download button */}
         <button
           onClick={handleDownload}
@@ -129,6 +200,20 @@ export function UrlInput() {
               <Download size={16} />
               Download
             </>
+          )}
+        </button>
+
+        {/* Extract MP3 from file button */}
+        <button
+          onClick={handleExtractAudio}
+          disabled={extractingAudio}
+          className="flex items-center gap-2 rounded-lg border border-[#333] bg-[#111] px-4 py-3 text-sm font-medium text-neutral-400 transition-all duration-200 hover:border-[#555] hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
+          title="Extract MP3 audio from a video file"
+        >
+          {extractingAudio ? (
+            <Loader size={16} className="animate-spin" />
+          ) : (
+            <FileAudio size={16} />
           )}
         </button>
       </div>
