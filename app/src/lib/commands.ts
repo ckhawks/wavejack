@@ -3,9 +3,12 @@ import type {
   AppSettings,
   AppliedMetadata,
   DownloadRecord,
+  FeedItem,
   MetadataMatch,
+  Playlist,
   PlaylistInfo,
   SearchResult,
+  Subscription,
 } from "./types";
 
 /** Start downloading a URL with the given format */
@@ -162,6 +165,8 @@ export interface LibraryTrack {
   play_count: number;
   /** Unix seconds of the most recent natural finish, 0 if never. */
   last_played_at: number;
+  /** Top tags from Last.fm (populated from track_tags table). */
+  tags: string[];
 }
 
 export async function recordTrackPlay(path: string): Promise<void> {
@@ -253,4 +258,78 @@ export interface RemoteInfo {
 
 export async function getRemoteInfo(): Promise<RemoteInfo> {
   return invoke("get_remote_info");
+}
+
+// ======================== Playlists ========================
+
+export async function createPlaylist(name: string): Promise<Playlist> {
+  return invoke("create_playlist", { name });
+}
+
+export async function renamePlaylist(id: string, name: string): Promise<void> {
+  return invoke("rename_playlist", { id, name });
+}
+
+export async function deletePlaylist(id: string): Promise<void> {
+  return invoke("delete_playlist", { id });
+}
+
+export async function listPlaylists(): Promise<Playlist[]> {
+  return invoke("list_playlists");
+}
+
+export async function getPlaylistTracks(playlistId: string): Promise<LibraryTrack[]> {
+  return invoke("get_playlist_tracks", { playlistId });
+}
+
+export async function addToPlaylist(playlistId: string, paths: string[]): Promise<void> {
+  return invoke("add_to_playlist", { playlistId, paths });
+}
+
+export async function removeFromPlaylist(playlistId: string, trackPath: string): Promise<void> {
+  return invoke("remove_from_playlist", { playlistId, trackPath });
+}
+
+export async function reorderPlaylist(playlistId: string, paths: string[]): Promise<void> {
+  return invoke("reorder_playlist", { playlistId, paths });
+}
+
+// ======================== Tags ========================
+
+export async function fetchTrackTags(path: string, title: string, artist: string): Promise<Array<[string, number]>> {
+  return invoke("fetch_track_tags", { path, title, artist });
+}
+
+export async function bulkFetchTags(): Promise<void> {
+  return invoke("bulk_fetch_tags");
+}
+
+export async function getAllTags(): Promise<Array<[number, string, number]>> {
+  return invoke("get_all_tags");
+}
+
+export async function getTracksForTag(tagName: string): Promise<string[]> {
+  return invoke("get_tracks_for_tag", { tagName });
+}
+
+// ======================== Feed / Subscriptions ========================
+
+export async function addSubscription(url: string): Promise<Subscription> {
+  return invoke("add_subscription", { url });
+}
+
+export async function removeSubscription(id: string): Promise<void> {
+  return invoke("remove_subscription", { id });
+}
+
+export async function listSubscriptions(): Promise<Subscription[]> {
+  return invoke("list_subscriptions");
+}
+
+export async function refreshFeed(): Promise<void> {
+  return invoke("refresh_feed");
+}
+
+export async function getFeed(): Promise<FeedItem[]> {
+  return invoke("get_feed");
 }

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, useEffect, useCallback, useRef } from "react";
 import {
   FolderPlus,
   RefreshCw,
@@ -19,14 +19,20 @@ import {
   SplitSquareHorizontal,
   Dices,
   Compass,
+  ListMusic,
 } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
+import { listen } from "@tauri-apps/api/event";
 import { useLibraryStore } from "../stores/libraryStore";
 import { usePlayerStore } from "../stores/playerStore";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useDiscoverStore } from "../stores/discoverStore";
+import { usePlaylistStore } from "../stores/playlistStore";
 import { useNavStore } from "../stores/navStore";
 import { MetadataPicker } from "./MetadataPicker";
+import { PlaylistSidebar } from "./library/PlaylistSidebar";
+import { TagFilterBar } from "./library/TagFilterBar";
+import { AddToPlaylistMenu } from "./library/AddToPlaylistMenu";
 import {
   applyLibraryMetadata,
   updateLibraryTrack,
@@ -38,7 +44,7 @@ import {
 
 type SortField = "title" | "artist" | "album" | "duration" | "bitrate" | "added" | "plays" | "lastPlayed" | "random";
 type SortDir = "asc" | "desc";
-type ColumnKey = "artist" | "album" | "duration" | "bitrate" | "added" | "plays" | "lastPlayed";
+type ColumnKey = "artist" | "album" | "duration" | "bitrate" | "added" | "plays" | "lastPlayed" | "tags";
 
 const DEFAULT_COLUMNS: Record<ColumnKey, boolean> = {
   artist: false,
@@ -48,6 +54,7 @@ const DEFAULT_COLUMNS: Record<ColumnKey, boolean> = {
   added: true,
   plays: false,
   lastPlayed: false,
+  tags: true,
 };
 const DEFAULT_SORT: { field: SortField; dir: SortDir } = { field: "artist", dir: "asc" };
 
@@ -59,6 +66,7 @@ const COLUMN_LABELS: Record<ColumnKey, string> = {
   added: "Added",
   plays: "Play count",
   lastPlayed: "Last played",
+  tags: "Tags",
 };
 
 function relativeTime(unixSecs: number): string {
@@ -127,6 +135,94 @@ export function LibraryView() {
   const settings = useSettingsStore((s) => s.settings);
   const updateSetting = useSettingsStore((s) => s.updateSetting);
 
+  const [showPlaylists, setShowPlaylists] = useState(true);
+  const activePlaylistId = usePlaylistStore((s) => s.activePlaylistId);
+  const activePlaylistTracks = usePlaylistStore((s) => s.activePlaylistTracks);
+  const tagFilter = useLibraryStore((s) => s.tagFilter);
+  const setTagFilter = useLibraryStore((s) => s.setTagFilter);
+  const loadTags = useLibraryStore((s) => s.loadTags);
+
+  // Init playlists + tags on mount
+  useEffect(() => {
+    usePlaylistStore.getState().init();
+    loadTags();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Listen for tag-fetch-progress events
+  useEffect(() => {
+    const unlisten = listen<{ done: number; total: number; finished?: boolean }>(
+      "tag-fetch-progress",
+      (e) => {
+        const { done, total, finished } = e.payload;
+        if (finished) {
+          useLibraryStore.setState({ tagFetchProgress: null });
+          // Reload tracks + tags to reflect new data
+          useLibraryStore.getState().refresh();
+          loadTags();
+        } else {
+          useLibraryStore.setState({ tagFetchProgress: { done, total } });
+        }
+      },
+    );
+    return () => { unlisten.then((fn) => fn()); };
+  }, [loadTags]);
+
+  // Multi-select state
+  const [selectedPaths, setSelectedPaths] = useState<Set<string>>(new Set());
+  const lastClickedPath = useRef<string | null>(null);
+  const displayedRef = useRef<typeof tracks>([]);
+
+  const handleRowClick = useCallback((path: string, e: React.MouseEvent) => {
+    // Don't select if clicking a button/input inside the row
+    if ((e.target as HTMLElement).closest("button, input, a")) return;
+
+    const tracks = displayedRef.current;
+    const shiftKey = e.shiftKey;
+    const ctrlKey = e.ctrlKey || e.metaKey;
+
+    setSelectedPaths((prev) => {
+      const next = new Set(prev);
+      if (shiftKey && lastClickedPath.current) {
+        // Shift-click: select range between last clicked and current
+        let startIdx = -1;
+        let endIdx = -1;
+        for (let i = 0; i < tracks.length; i++) {
+          if (tracks[i].path === lastClickedPath.current) startIdx = i;
+          if (tracks[i].path === path) endIdx = i;
+        }
+        if (startIdx >= 0 && endIdx >= 0) {
+          const lo = Math.min(startIdx, endIdx);
+          const hi = Math.max(startIdx, endIdx);
+          for (let i = lo; i <= hi; i++) {
+            next.add(tracks[i].path);
+          }
+        }
+      } else if (ctrlKey) {
+        // Ctrl/Cmd-click: toggle single
+        if (next.has(path)) next.delete(path);
+        else next.add(path);
+      } else {
+        // Plain click: select only this, or deselect if already sole selection
+        if (next.size === 1 && next.has(path)) {
+          next.clear();
+        } else {
+          next.clear();
+          next.add(path);
+        }
+      }
+      return next;
+    });
+    // Only update anchor on non-shift clicks
+    if (!e.shiftKey) {
+      lastClickedPath.current = path;
+    }
+  }, []);
+
+  const clearSelection = useCallback(() => {
+    setSelectedPaths(new Set());
+    lastClickedPath.current = null;
+  }, []);
+
   const [showFolders, setShowFolders] = useState(folders.length === 0);
   const [showColumnMenu, setShowColumnMenu] = useState(false);
   const [needsFixOnly, setNeedsFixOnly] = useState(false);
@@ -192,7 +288,7 @@ export function LibraryView() {
     void updateSetting("librarySort", JSON.stringify(next));
   };
 
-  const filtered = filteredTracks();
+  const filtered = activePlaylistId ? activePlaylistTracks : filteredTracks();
 
   const displayed = useMemo(() => {
     const base = needsFixOnly ? filtered.filter(needsMetadataFix) : filtered;
@@ -239,6 +335,18 @@ export function LibraryView() {
     });
     return arr;
   }, [filtered, sort, needsFixOnly]);
+  displayedRef.current = displayed;
+
+  // Clear selection when the underlying data changes (sort, filter, search)
+  // Track by a stable key rather than the array reference itself.
+  const displayedKey = `${sort.field}:${sort.dir}:${searchQuery}:${tagFilter}:${needsFixOnly}:${activePlaylistId}:${displayed.length}`;
+  const prevDisplayedKey = useRef(displayedKey);
+  useEffect(() => {
+    if (prevDisplayedKey.current !== displayedKey) {
+      prevDisplayedKey.current = displayedKey;
+      clearSelection();
+    }
+  }, [displayedKey, clearSelection]);
 
   const fixCount = useMemo(() => filtered.filter(needsMetadataFix).length, [filtered]);
 
@@ -459,7 +567,11 @@ export function LibraryView() {
   };
 
   return (
-    <div className="flex flex-1 flex-col gap-4 overflow-hidden">
+    <div className="flex flex-1 overflow-hidden">
+      {/* Playlist sidebar */}
+      {showPlaylists && <PlaylistSidebar />}
+
+      <div className="flex flex-1 flex-col gap-4 overflow-hidden pt-6">
       {/* Header (padded so it doesn't kiss the window edges) */}
       <div className="flex items-center gap-2 px-6">
         <div className="flex flex-1 items-center gap-2 rounded bg-[#111] px-3 py-2 ring-1 ring-[#333] focus-within:ring-[#555]">
@@ -572,6 +684,15 @@ export function LibraryView() {
           )}
         </div>
         <button
+          onClick={() => setShowPlaylists((v) => !v)}
+          className={`flex items-center gap-1.5 rounded px-3 py-2 text-xs ${
+            showPlaylists ? "bg-violet-600/20 text-violet-300 ring-1 ring-violet-500/40" : "bg-[#222] text-neutral-300 hover:bg-[#333]"
+          }`}
+        >
+          <ListMusic size={14} />
+          Playlists
+        </button>
+        <button
           onClick={() => setShowFolders(!showFolders)}
           className="rounded bg-[#222] px-3 py-2 text-xs text-neutral-300 hover:bg-[#333]"
         >
@@ -597,10 +718,43 @@ export function LibraryView() {
         </div>
       )}
 
+      {/* Tag filter bar — always show so Fetch Tags button is accessible */}
+      {tracks.length > 0 && <TagFilterBar />}
+
+      {/* Bulk selection bar */}
+      {selectedPaths.size > 0 && (
+        <div className="flex items-center gap-3 bg-violet-600/10 px-6 py-2 ring-1 ring-inset ring-violet-500/20">
+          <span className="text-xs font-medium text-violet-300">
+            {selectedPaths.size} selected
+          </span>
+          <button
+            onClick={clearSelection}
+            className="text-xs text-neutral-500 hover:text-white"
+          >
+            Clear
+          </button>
+          <div className="ml-auto flex items-center gap-2">
+            {usePlaylistStore.getState().playlists.map((p) => (
+              <button
+                key={p.id}
+                onClick={async () => {
+                  await usePlaylistStore.getState().addTracks(p.id, [...selectedPaths]);
+                  clearSelection();
+                }}
+                className="flex items-center gap-1 rounded bg-[#222] px-2.5 py-1 text-[11px] text-neutral-300 transition-colors hover:bg-[#333] hover:text-white"
+              >
+                <ListMusic size={10} />
+                {p.name}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Stats */}
       <div className="px-6 text-xs text-neutral-500">
         {scanning ? "Scanning..." : `${tracks.length} tracks`}
-        {(searchQuery || needsFixOnly) && ` (${displayed.length} shown)`}
+        {(searchQuery || needsFixOnly || tagFilter || activePlaylistId) && ` (${displayed.length} shown)`}
       </div>
 
       {/* Cover art approval queue */}
@@ -794,16 +948,29 @@ export function LibraryView() {
                 {columns.added && <SortHeader field="added" label="Added" className="w-24 pr-3" />}
                 {columns.plays && <SortHeader field="plays" label="Plays" className="w-16 pr-3" />}
                 {columns.lastPlayed && <SortHeader field="lastPlayed" label="Last Played" className="w-24 pr-3" />}
-                <th className="w-24 py-2" />
+                {columns.tags && (
+                  <th className="py-2 pr-3">
+                    <span className="text-[10px] uppercase tracking-wider text-neutral-600">Tags</span>
+                  </th>
+                )}
+                <th className="w-28 py-2" />
               </tr>
             </thead>
             <tbody className="[&_td]:border-b [&_td]:border-[#111]">
               {displayed.map((track) => {
                 const isActive = currentTrackId === track.path;
+                const isSelected = selectedPaths.has(track.path);
                 return (
                   <tr
                     key={track.path}
-                    className={`group text-xs hover:bg-[#111] ${isActive ? "bg-[#111]" : ""}`}
+                    onClick={(e) => handleRowClick(track.path, e)}
+                    onMouseDown={(e) => { if (e.shiftKey) e.preventDefault(); }}
+                    onDragStart={(e) => e.preventDefault()}
+                    className={`group cursor-default select-none text-xs hover:bg-[#111] ${
+                      isSelected
+                        ? "bg-violet-600/10 ring-1 ring-inset ring-violet-500/20"
+                        : isActive ? "bg-[#111]" : ""
+                    }`}
                   >
                     <td className="py-2 pl-6 pr-2">
                       <div className="relative h-10 w-10">
@@ -874,6 +1041,25 @@ export function LibraryView() {
                         {track.last_played_at > 0 ? relativeTime(track.last_played_at) : "—"}
                       </td>
                     )}
+                    {columns.tags && (
+                      <td className="py-2 pr-3">
+                        <div className="flex flex-wrap gap-1">
+                          {track.tags.slice(0, 3).map((tag) => (
+                            <button
+                              key={tag}
+                              onClick={() => setTagFilter(tag)}
+                              className={`rounded-full px-2 py-0.5 text-[10px] transition-colors ${
+                                tagFilter === tag
+                                  ? "bg-violet-600/20 text-violet-300 ring-1 ring-violet-500/40"
+                                  : "bg-[#1a1a1a] text-neutral-500 hover:bg-violet-600/10 hover:text-violet-300"
+                              }`}
+                            >
+                              {tag}
+                            </button>
+                          ))}
+                        </div>
+                      </td>
+                    )}
                     <td className="py-2 pr-3">
                       <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100">
                         {!track.cover_art_base64 && (
@@ -913,6 +1099,7 @@ export function LibraryView() {
                             <Compass size={12} />
                           </button>
                         )}
+                        <AddToPlaylistMenu trackPath={track.path} />
                       </div>
                     </td>
                   </tr>
@@ -921,6 +1108,7 @@ export function LibraryView() {
             </tbody>
           </table>
         )}
+      </div>
       </div>
     </div>
   );

@@ -34,6 +34,9 @@ pub struct LibraryTrack {
     /// Unix seconds of the most recent natural finish, or 0 if never.
     #[serde(default)]
     pub last_played_at: i64,
+    /// Top tags from Last.fm, populated by bulk load from track_tags table.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -189,6 +192,7 @@ fn read_track_metadata(path: &Path) -> Option<(LibraryTrack, Option<Vec<u8>>)> {
                     bitrate_kbps,
                     play_count: 0,
                     last_played_at: 0,
+                    tags: Vec::new(),
                 },
                 cover_bytes,
             ));
@@ -208,6 +212,7 @@ fn read_track_metadata(path: &Path) -> Option<(LibraryTrack, Option<Vec<u8>>)> {
             bitrate_kbps: 0,
             play_count: 0,
             last_played_at: 0,
+            tags: Vec::new(),
         },
         None,
     ))

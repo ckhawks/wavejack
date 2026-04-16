@@ -16,6 +16,7 @@ mod error;
 mod library;
 mod metadata;
 mod remote;
+mod tags;
 mod waveform;
 mod ytdlp;
 
@@ -1267,6 +1268,365 @@ async fn get_track_cover_art(path: String) -> Result<String, AppError> {
 }
 
 // ========================================================================
+// Playlist CRUD Commands
+// ========================================================================
+
+#[tauri::command]
+async fn create_playlist(app: tauri::AppHandle, name: String) -> Result<database::PlaylistRow, AppError> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let db = app.state::<Database>();
+    db.create_playlist(&id, &name)?;
+    let playlists = db.list_playlists()?;
+    playlists.into_iter().find(|p| p.id == id)
+        .ok_or_else(|| AppError::Io("Failed to create playlist".into()))
+}
+
+#[tauri::command]
+async fn rename_playlist(app: tauri::AppHandle, id: String, name: String) -> Result<(), AppError> {
+    let db = app.state::<Database>();
+    db.rename_playlist(&id, &name)?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn delete_playlist(app: tauri::AppHandle, id: String) -> Result<(), AppError> {
+    let db = app.state::<Database>();
+    db.delete_playlist(&id)?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn list_playlists(app: tauri::AppHandle) -> Result<Vec<database::PlaylistRow>, AppError> {
+    let db = app.state::<Database>();
+    Ok(db.list_playlists()?)
+}
+
+#[tauri::command]
+async fn get_playlist_tracks(app: tauri::AppHandle, playlist_id: String) -> Result<Vec<library::LibraryTrack>, AppError> {
+    let db = app.state::<Database>();
+    let paths = db.get_playlist_track_paths(&playlist_id)?;
+    let all_tracks = db.get_all_library_tracks()?;
+    // Build a lookup and return tracks in playlist order
+    let track_map: std::collections::HashMap<&str, &library::LibraryTrack> = all_tracks.iter()
+        .map(|t| (t.path.as_str(), t))
+        .collect();
+    let result: Vec<library::LibraryTrack> = paths.iter()
+        .filter_map(|p| track_map.get(p.as_str()).map(|t| (*t).clone()))
+        .collect();
+    Ok(result)
+}
+
+#[tauri::command]
+async fn add_to_playlist(app: tauri::AppHandle, playlist_id: String, paths: Vec<String>) -> Result<(), AppError> {
+    let db = app.state::<Database>();
+    db.add_tracks_to_playlist(&playlist_id, &paths)?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn remove_from_playlist(app: tauri::AppHandle, playlist_id: String, track_path: String) -> Result<(), AppError> {
+    let db = app.state::<Database>();
+    db.remove_track_from_playlist(&playlist_id, &track_path)?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn reorder_playlist(app: tauri::AppHandle, playlist_id: String, paths: Vec<String>) -> Result<(), AppError> {
+    let db = app.state::<Database>();
+    db.reorder_playlist_tracks(&playlist_id, &paths)?;
+    Ok(())
+}
+
+// ========================================================================
+// Tag Commands
+// ========================================================================
+
+#[tauri::command]
+async fn fetch_track_tags(
+    app: tauri::AppHandle,
+    path: String,
+    title: String,
+    artist: String,
+) -> Result<Vec<(String, i32)>, AppError> {
+    let api_key = get_store_value(&app, "lastfmApiKey").unwrap_or_default();
+    if api_key.is_empty() {
+        return Err(AppError::LastFmFailed("Last.fm API key not configured".into()));
+    }
+    let rate_limiter = app.state::<tags::TagRateLimiter>();
+    let result = tags::fetch_tags_for_track(&api_key, &artist, &title, &rate_limiter).await?;
+    let db = app.state::<Database>();
+    db.set_track_tags(&path, &result)?;
+    Ok(result)
+}
+
+#[tauri::command]
+async fn bulk_fetch_tags(app: tauri::AppHandle) -> Result<(), AppError> {
+    let api_key = get_store_value(&app, "lastfmApiKey").unwrap_or_default();
+    if api_key.is_empty() {
+        return Err(AppError::LastFmFailed("Last.fm API key not configured".into()));
+    }
+
+    tauri::async_runtime::spawn(async move {
+        let db = app.state::<Database>();
+        let rate_limiter = app.state::<tags::TagRateLimiter>();
+
+        // Count total tracks needing fetch for progress
+        let total = db.tracks_needing_tag_fetch(999999)
+            .map(|v| v.len())
+            .unwrap_or(0);
+
+        let mut done = 0u32;
+        loop {
+            let batch = match db.tracks_needing_tag_fetch(20) {
+                Ok(b) if b.is_empty() => break,
+                Ok(b) => b,
+                Err(_) => break,
+            };
+
+            for (path, title, artist) in &batch {
+                match tags::fetch_tags_for_track(&api_key, artist, title, &rate_limiter).await {
+                    Ok(tags) => {
+                        let _ = db.set_track_tags(path, &tags);
+                    }
+                    Err(_) => {
+                        // Mark as fetched even on failure to avoid retrying forever
+                        let _ = db.set_track_tags(path, &[]);
+                    }
+                }
+                done += 1;
+                let _ = app.emit("tag-fetch-progress", serde_json::json!({
+                    "done": done,
+                    "total": total,
+                }));
+            }
+        }
+
+        let _ = app.emit("tag-fetch-progress", serde_json::json!({
+            "done": done,
+            "total": done,
+            "finished": true,
+        }));
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_all_tags(app: tauri::AppHandle) -> Result<Vec<(i64, String, i64)>, AppError> {
+    let db = app.state::<Database>();
+    Ok(db.get_all_tags()?)
+}
+
+#[tauri::command]
+async fn get_tracks_for_tag(app: tauri::AppHandle, tag_name: String) -> Result<Vec<String>, AppError> {
+    let db = app.state::<Database>();
+    let conn = db.get_all_tags()?; // reuse to find tag id
+    let tag_id = conn.iter().find(|(_, name, _)| name == &tag_name).map(|(id, _, _)| *id);
+    match tag_id {
+        Some(_) => {
+            // Use a direct query approach
+            let all_track_tags = db.get_all_track_tags()?;
+            let paths: Vec<String> = all_track_tags.into_iter()
+                .filter(|(_, tags)| tags.contains(&tag_name))
+                .map(|(path, _)| path)
+                .collect();
+            Ok(paths)
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
+// ========================================================================
+// Feed / Subscription Commands
+// ========================================================================
+
+/// Resolve a YouTube channel URL/handle and subscribe. Fetches initial uploads.
+#[tauri::command]
+async fn add_subscription(app: tauri::AppHandle, url: String) -> Result<database::Subscription, AppError> {
+    let ytdlp_path = ytdlp::ensure_ytdlp(&app).await?;
+
+    // Resolve channel info: fetch 1 video to get channel metadata
+    let output = tokio::process::Command::new(&ytdlp_path)
+        .args(["--flat-playlist", "-J", "--no-warnings", "--playlist-end", "1", &url])
+        .output()
+        .await
+        .map_err(|e| AppError::YtDlpFailed(format!("Failed to resolve channel: {}", e)))?;
+
+    if !output.status.success() {
+        return Err(AppError::YtDlpFailed("Could not resolve channel URL".into()));
+    }
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| AppError::YtDlpFailed(format!("Invalid JSON: {}", e)))?;
+
+    let channel_id = json["channel_id"]
+        .as_str()
+        .or_else(|| json["id"].as_str())
+        .ok_or_else(|| AppError::YtDlpFailed("No channel ID found".into()))?
+        .to_string();
+
+    let channel_name = json["channel"]
+        .as_str()
+        .or_else(|| json["uploader"].as_str())
+        .or_else(|| json["title"].as_str())
+        .unwrap_or("Unknown Channel")
+        .to_string();
+
+    let channel_url = json["channel_url"]
+        .as_str()
+        .or_else(|| json["uploader_url"].as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| url.clone());
+
+    let thumbnail = json["thumbnails"]
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|t| t["url"].as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let db = app.state::<Database>();
+    db.add_subscription(&channel_id, &channel_name, &channel_url, &thumbnail)?;
+
+    // Fetch initial batch of uploads in background
+    let app2 = app.clone();
+    let cid = channel_id.clone();
+    let curl = channel_url.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = fetch_channel_uploads(&app2, &ytdlp_path, &cid, &curl, 15).await;
+    });
+
+    Ok(database::Subscription {
+        id: channel_id,
+        name: channel_name,
+        url: channel_url,
+        thumbnail,
+        added_at: database::now_unix(),
+    })
+}
+
+#[tauri::command]
+async fn remove_subscription(app: tauri::AppHandle, id: String) -> Result<(), AppError> {
+    let db = app.state::<Database>();
+    db.remove_subscription(&id)?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn list_subscriptions(app: tauri::AppHandle) -> Result<Vec<database::Subscription>, AppError> {
+    let db = app.state::<Database>();
+    Ok(db.list_subscriptions()?)
+}
+
+#[tauri::command]
+async fn refresh_feed(app: tauri::AppHandle) -> Result<(), AppError> {
+    let ytdlp_path = ytdlp::ensure_ytdlp(&app).await?;
+    let db = app.state::<Database>();
+    let subs = db.list_subscriptions()?;
+
+    let total = subs.len();
+    let app2 = app.clone();
+
+    tauri::async_runtime::spawn(async move {
+        for (i, sub) in subs.iter().enumerate() {
+            let _ = fetch_channel_uploads(&app2, &ytdlp_path, &sub.id, &sub.url, 15).await;
+            let _ = app2.emit("feed-refresh-progress", serde_json::json!({
+                "done": i + 1,
+                "total": total,
+            }));
+        }
+        let _ = app2.emit("feed-refresh-progress", serde_json::json!({
+            "done": total,
+            "total": total,
+            "finished": true,
+        }));
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_feed(app: tauri::AppHandle) -> Result<Vec<database::FeedItem>, AppError> {
+    let db = app.state::<Database>();
+    Ok(db.get_feed_items(200)?)
+}
+
+/// Fetch latest uploads from a single channel and store them.
+async fn fetch_channel_uploads(
+    app: &tauri::AppHandle,
+    ytdlp_path: &std::path::Path,
+    channel_id: &str,
+    channel_url: &str,
+    limit: u32,
+) -> Result<(), AppError> {
+    let videos_url = if channel_url.ends_with("/videos") {
+        channel_url.to_string()
+    } else {
+        format!("{}/videos", channel_url.trim_end_matches('/'))
+    };
+
+    // Use -j (full metadata per video) instead of --flat-playlist so we get
+    // upload_date for proper chronological sorting.
+    let output = tokio::process::Command::new(ytdlp_path)
+        .args([
+            "--no-download", "-j", "--no-warnings",
+            "--playlist-end", &limit.to_string(),
+            &videos_url,
+        ])
+        .output()
+        .await
+        .map_err(|e| AppError::YtDlpFailed(format!("Failed to fetch uploads: {}", e)))?;
+
+    if !output.status.success() {
+        return Err(AppError::YtDlpFailed("Failed to fetch channel uploads".into()));
+    }
+
+    // -j outputs one JSON object per line
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let items: Vec<database::FeedItem> = stdout
+        .lines()
+        .filter_map(|line| {
+            let entry: serde_json::Value = serde_json::from_str(line).ok()?;
+            let video_id = entry["id"].as_str()?.to_string();
+            let title = entry["title"].as_str()?.to_string();
+            let uploader = entry["uploader"]
+                .as_str()
+                .or_else(|| entry["channel"].as_str())
+                .unwrap_or("Unknown")
+                .to_string();
+            let duration = entry["duration"].as_f64().unwrap_or(0.0) as u32;
+            let thumbnail = entry["thumbnails"]
+                .as_array()
+                .and_then(|arr| arr.last())
+                .and_then(|t| t["url"].as_str())
+                .or_else(|| entry["thumbnail"].as_str())
+                .unwrap_or("")
+                .to_string();
+            let upload_date = entry["upload_date"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let url = format!("https://www.youtube.com/watch?v={}", video_id);
+
+            Some(database::FeedItem {
+                video_id,
+                channel_id: channel_id.to_string(),
+                title,
+                uploader,
+                duration,
+                thumbnail,
+                upload_date,
+                url,
+            })
+        })
+        .collect();
+
+    let db = app.state::<Database>();
+    db.upsert_feed_items(&items)?;
+    Ok(())
+}
+
+// ========================================================================
 // Helper functions
 // ========================================================================
 
@@ -1462,6 +1822,7 @@ pub fn run() {
                 .expect("Failed to initialize download history database");
             app.manage(db);
             app.manage(RateLimiter::new());
+            app.manage(tags::TagRateLimiter::new());
 
             // Load or generate the remote-control token, then launch the HTTP server.
             let token = {
@@ -1526,6 +1887,23 @@ pub fn run() {
             record_track_play,
             get_track_cover_art,
             get_remote_info,
+            create_playlist,
+            rename_playlist,
+            delete_playlist,
+            list_playlists,
+            get_playlist_tracks,
+            add_to_playlist,
+            remove_from_playlist,
+            reorder_playlist,
+            fetch_track_tags,
+            bulk_fetch_tags,
+            get_all_tags,
+            get_tracks_for_tag,
+            add_subscription,
+            remove_subscription,
+            list_subscriptions,
+            refresh_feed,
+            get_feed,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

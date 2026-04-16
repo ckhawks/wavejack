@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Settings as SettingsIcon, Minus, Square, X, Download, Radio, Library, Compass } from "lucide-react";
+import { Settings as SettingsIcon, Minus, Square, X, Download, Radio, Library, Compass, Rss } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { UrlInput } from "./UrlInput";
 import { DownloadQueue } from "./DownloadQueue";
@@ -13,6 +13,7 @@ import { RoomBrowser } from "./rooms/RoomBrowser";
 import { RoomView } from "./rooms/RoomView";
 import { LibraryView } from "./LibraryView";
 import { DiscoverView } from "./discover/DiscoverView";
+import { FeedView } from "./FeedView";
 
 function WindowControls() {
   const appWindow = getCurrentWindow();
@@ -41,7 +42,7 @@ function WindowControls() {
   );
 }
 
-const VALID_TABS: Tab[] = ["downloads", "library", "discover", "rooms"];
+const VALID_TABS: Tab[] = ["downloads", "library", "discover", "feed", "rooms"];
 
 export function Layout() {
   const [showSettings, setShowSettings] = useState(false);
@@ -75,6 +76,7 @@ export function Layout() {
     { id: "downloads", label: "Downloads", icon: Download },
     { id: "library", label: "Library", icon: Library },
     { id: "discover", label: "Discover", icon: Compass },
+    { id: "feed", label: "Feed", icon: Rss },
     { id: "rooms", label: "Rooms", icon: Radio },
   ];
 
@@ -130,12 +132,16 @@ export function Layout() {
             <DownloadQueue />
           </main>
         ) : activeTab === "library" ? (
-          <main className={`flex flex-1 flex-col overflow-hidden pt-6 ${hasPlayer ? "pb-36" : ""}`}>
+          <main className={`flex flex-1 flex-col overflow-hidden ${hasPlayer ? "pb-36" : ""}`}>
             <LibraryView />
           </main>
         ) : activeTab === "discover" ? (
           <main className={`flex flex-1 flex-col overflow-hidden p-6 ${hasPlayer ? "pb-36" : ""}`}>
             <DiscoverView />
+          </main>
+        ) : activeTab === "feed" ? (
+          <main className={`flex flex-1 flex-col overflow-hidden p-6 ${hasPlayer ? "pb-36" : ""}`}>
+            <FeedView />
           </main>
         ) : currentRoomId ? (
           <RoomView />

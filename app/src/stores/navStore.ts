@@ -1,6 +1,6 @@
 import { create } from "zustand";
 
-export type Tab = "downloads" | "library" | "discover" | "rooms";
+export type Tab = "downloads" | "library" | "discover" | "rooms" | "feed";
 
 interface NavStore {
   activeTab: Tab;

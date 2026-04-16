@@ -2,24 +2,28 @@
 
 ## Planned features
 
-### Playlists
-First-class user playlists, persisted in SQLite alongside `library_tracks`.
-- Schema: `playlists(id, name, created_at, updated_at, cover_art BLOB?)` +
-  `playlist_tracks(playlist_id, track_path, position)`.
-- CRUD: create, rename, delete; drag-to-reorder within a playlist; add/remove
-  tracks from the library tab via right-click or a "+" button per row.
-- Sidebar / second-tab navigation listing playlists; clicking opens a view
-  similar to `LibraryView` but limited to the playlist contents and using the
-  saved order (no sort by default — playlists have intentional ordering).
-- "Play playlist" pushes its tracks into `playerStore.queue` so autoplay /
-  shuffle / back-forward all work the same.
-- Bonus: smart playlists (filter expressions over the library — "all tracks
+- ~~remember what page the user was last on and go to that whenever they open program~~ ✅
+- deduplication (based on sound profile)
+
+### Playlists (partially done)
+
+Schema, backend commands, sidebar, and multi-select add-to-playlist are built.
+Still TODO:
+
+- Drag-to-reorder tracks within a playlist (backend `reorder_playlist` exists,
+  no drag UI yet).
+- "Play All" button when viewing a playlist — push playlist tracks into
+  `playerStore.queue`.
+- Remove-from-playlist button on rows when viewing a playlist.
+- Smart playlists (saved filter expressions over the library — "all tracks
   played > 5 times in the last month").
 
 ### Move-file with DB integrity
+
 Today moving an audio file outside the app silently breaks library rows and
 download history (path becomes invalid, cover BLOB orphaned, play counts
 stranded). Need an in-app "Move to..." action and a path-update path.
+
 - Right-click → "Move to folder..." opens the folder picker, performs the
   filesystem move, then atomically updates `library_tracks.path`,
   `library_tracks.folder`, and any matching `downloads.file_path` rows. Keeps
@@ -30,19 +34,18 @@ stranded). Need an in-app "Move to..." action and a path-update path.
   fingerprint appears in another scanned folder, treat it as a move and
   preserve the row instead of delete+reinsert.
 
-### Search-and-download from the Downloads tab
-Right now you have to paste a URL. Add a search bar that hits YouTube +
-SoundCloud and lists results inline.
-- Reuse the SoundCloud `client_id` resolver and YouTube `yt-dlp -J ytsearch5:`
-  pattern from `discover.rs`.
-- Each result row: thumbnail, title, channel/artist, duration, source badge,
-  "Download" button + format/destination toggles already in the URL bar.
-- Cap results to 5–10 per source, dedupe by title-similarity.
-- Optional: cache recent searches so common queries are instant on repeat.
+### ~~Search-and-download from the Downloads tab~~ ✅
+
+Built: search YouTube + SoundCloud inline, preview with auto-play, save or
+direct download. Still TODO:
+
+- Cache recent searches so common queries are instant on repeat.
 
 ### Rooms (plug.dj-style live listening)
+
 The skeleton in `api/` and `app/src/components/rooms/` exists but is unfinished.
 Pick up where it left off:
+
 - Server-side transcode (ffmpeg via the `transcode.ts` already started) → WebM
   Opus for relay; never serve raw user uploads.
 - DJ queue: who's up next, rotation logic, vote-to-skip threshold.
@@ -54,9 +57,22 @@ Pick up where it left off:
 - "DJ from library": instead of uploading, DJ picks a track from their local
   library and the app uploads it to the room transparently.
 
+### Stream to LiveKit
+
+Broadcast the currently playing audio to a LiveKit room so others can listen
+along in real time. Reference implementation: `C:/Projects/puck-festival/livekit-publisher`.
+
+- Capture audio from the player (Web Audio API `MediaStreamDestination` or
+  post Rust-engine: pipe decoded PCM into a LiveKit audio track).
+- "Go Live" toggle in the player bar — publishes to a LiveKit room.
+- Listeners join via a URL/room code and hear what you're hearing.
+- Track metadata + cover art sent as data messages so listeners see what's
+  playing.
+
 ## Known issues / cleanup
 
 ### Native audio engine (architectural refactor)
+
 Replace the HTML `<audio>` element with a Rust playback pipeline. This is the
 correct foundation for a desktop music app and unlocks several features that
 are awkward or impossible with the browser audio element.
@@ -74,6 +90,7 @@ are awkward or impossible with the browser audio element.
 - **Cost**: ~500–1000 lines of Rust, ~1–2 days focused work.
 
 ### Stale rows after external file changes
+
 - Manual `pencil` edits already detect "file not found" and surface a hint to
   rescan. Generalize: a periodic background "verify" pass that flags missing
   files and offers a one-click cleanup.
@@ -82,18 +99,19 @@ are awkward or impossible with the browser audio element.
   goes stale; need a "reattach folder" UI.
 
 ### Cover-art approval modal
+
 Currently shows one candidate at a time. Improve: show all gathered candidates
 side-by-side so the user can pick the best, not just accept/reject sequentially.
 
 ### `discover_keep` doesn't honor destination
+
 Discover keeps go to `outputDir` only — should respect the new
 `Downloads / Music` destination toggle the same way `start_download` does.
 
 ## Possible expansions (ideas, not committed)
 
-- **System media keys + SMTC integration**: play/pause/skip from the keyboard
-  media keys and Windows' floating media controls. Easier post Rust-engine
-  refactor.
+- ~~**System media keys + SMTC integration**~~: ✅ MediaSession API wired up —
+  play/pause/skip/seek from media keys, Stream Deck, Windows overlay.
 - **Mini-mode window**: collapse to a small always-on-top window showing just
   album art + controls.
 - **Crossfade / gapless**: requires the Rust audio engine.
@@ -109,8 +127,8 @@ Discover keeps go to `outputDir` only — should respect the new
   toggle-shuffle, toggle-immersive-mode, set-volume-absolute, like-current.
 - **"Like" / favorite**: a simple boolean flag per track. Quick filter button
   in library; could also auto-seed Discover.
-- **Genre/mood tags**: derive from MusicBrainz on auto-tag, store as a
-  comma-separated column or join table; filter library by tag.
+- ~~**Genre/mood tags**~~: ✅ Last.fm tags with many-to-many schema, alias
+  normalization (UKG=UK Garage etc), bulk fetch, tag column + filter in library.
 - **BPM + key detection**: per-track tempo and musical key, computed once on
   library scan and stored as columns on `library_tracks`.
   - **BPM**: `aubio` via FFI is the canonical option (rock-solid). Pure-Rust
@@ -136,6 +154,11 @@ Discover keeps go to `outputDir` only — should respect the new
   window to import / download.
 - **Export / import settings + library state**: a single JSON/zip bundle for
   backup and cross-machine sync.
+- **Right-click context menu**: replace hover-only action buttons with a proper
+  context menu (add to playlist, edit, auto-tag, discover similar, find art).
+- **Embedding-based similarity clustering**: compute audio feature vectors per
+  track (CLAP / Essentia), k-means cluster into auto-generated "vibe" groups.
+  Visual map or auto-generated mood playlists.
 - **Audio device picker** (post Rust-engine refactor): route output to
   speakers vs headphones from a player-bar dropdown.
 - **Spotify / Apple Music import**: paste a playlist URL, app fetches the

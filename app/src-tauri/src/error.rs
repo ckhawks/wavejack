@@ -64,3 +64,10 @@ impl From<reqwest::Error> for AppError {
         AppError::Io(e.to_string())
     }
 }
+
+// Convert rusqlite errors into our AppError.
+impl From<rusqlite::Error> for AppError {
+    fn from(e: rusqlite::Error) -> Self {
+        AppError::Io(e.to_string())
+    }
+}

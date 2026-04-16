@@ -6,7 +6,10 @@ import {
   getLibraryTracks,
   removeLibraryFolder,
   scanLibraryIncremental,
+  getAllTags,
+  bulkFetchTags,
 } from "../lib/commands";
+import type { TagInfo } from "../lib/types";
 
 interface LibraryStore {
   folders: string[];
@@ -14,6 +17,9 @@ interface LibraryStore {
   scanning: boolean;
   loaded: boolean;
   searchQuery: string;
+  tagFilter: string | null;
+  allTags: TagInfo[];
+  tagFetchProgress: { done: number; total: number } | null;
 
   /** Load folders + cached tracks from SQLite, then kick off a background incremental scan. */
   init: () => Promise<void>;
@@ -22,6 +28,9 @@ interface LibraryStore {
   rescan: () => Promise<void>;
   refresh: () => Promise<void>;
   setSearchQuery: (query: string) => void;
+  setTagFilter: (tag: string | null) => void;
+  loadTags: () => Promise<void>;
+  startBulkFetchTags: () => Promise<void>;
   filteredTracks: () => LibraryTrack[];
 }
 
@@ -40,6 +49,9 @@ export const useLibraryStore = create<LibraryStore>((set, get) => ({
   scanning: false,
   loaded: false,
   searchQuery: "",
+  tagFilter: null,
+  allTags: [],
+  tagFetchProgress: null,
 
   init: async () => {
     if (get().loaded) return;
@@ -113,17 +125,49 @@ export const useLibraryStore = create<LibraryStore>((set, get) => ({
 
   setSearchQuery: (query) => set({ searchQuery: query }),
 
-  filteredTracks: () => {
-    const { tracks, searchQuery } = get();
-    if (!searchQuery.trim()) return tracks;
+  setTagFilter: (tag) => set({ tagFilter: tag }),
 
-    const q = searchQuery.toLowerCase();
-    return tracks.filter(
-      (t) =>
-        t.title.toLowerCase().includes(q) ||
-        t.artist.toLowerCase().includes(q) ||
-        t.album.toLowerCase().includes(q) ||
-        t.filename.toLowerCase().includes(q),
-    );
+  loadTags: async () => {
+    try {
+      const raw = await getAllTags();
+      const allTags: TagInfo[] = raw.map(([id, name, track_count]) => ({
+        id, name, track_count,
+      }));
+      set({ allTags });
+    } catch (e) {
+      console.error("Failed to load tags:", e);
+    }
+  },
+
+  startBulkFetchTags: async () => {
+    set({ tagFetchProgress: { done: 0, total: 0 } });
+    try {
+      await bulkFetchTags();
+    } catch (e) {
+      console.error("Failed to start bulk tag fetch:", e);
+      set({ tagFetchProgress: null });
+    }
+  },
+
+  filteredTracks: () => {
+    const { tracks, searchQuery, tagFilter } = get();
+    let result = tracks;
+
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase();
+      result = result.filter(
+        (t) =>
+          t.title.toLowerCase().includes(q) ||
+          t.artist.toLowerCase().includes(q) ||
+          t.album.toLowerCase().includes(q) ||
+          t.filename.toLowerCase().includes(q),
+      );
+    }
+
+    if (tagFilter) {
+      result = result.filter((t) => t.tags.includes(tagFilter));
+    }
+
+    return result;
   },
 }));

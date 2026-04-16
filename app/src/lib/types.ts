@@ -121,6 +121,22 @@ export interface DiscoverItem {
   coverArtBase64?: string;
 }
 
+/** A playlist stored in the database */
+export interface Playlist {
+  id: string;
+  name: string;
+  created_at: number;
+  updated_at: number;
+  track_count: number;
+}
+
+/** A tag with its usage count */
+export interface TagInfo {
+  id: number;
+  name: string;
+  track_count: number;
+}
+
 /** A search result from YouTube or SoundCloud */
 export interface SearchResult {
   id: string;
@@ -129,6 +145,27 @@ export interface SearchResult {
   duration_secs: number;
   thumbnail_url: string;
   source: "youtube" | "soundcloud";
+  url: string;
+}
+
+/** A YouTube channel subscription */
+export interface Subscription {
+  id: string;
+  name: string;
+  url: string;
+  thumbnail: string;
+  added_at: number;
+}
+
+/** A video from a subscribed channel's feed */
+export interface FeedItem {
+  video_id: string;
+  channel_id: string;
+  title: string;
+  uploader: string;
+  duration: number;
+  thumbnail: string;
+  upload_date: string;
   url: string;
 }
 

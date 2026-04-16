@@ -1,6 +1,7 @@
 use base64::Engine;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,6 +25,39 @@ pub struct DownloadRecord {
     /// Not stored in DB — populated at read time from embedded ID3 tags.
     #[serde(default)]
     pub cover_art_base64: String,
+}
+
+/// A playlist row with its track count.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaylistRow {
+    pub id: String,
+    pub name: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub track_count: u32,
+}
+
+/// A YouTube channel subscription.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Subscription {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    pub thumbnail: String,
+    pub added_at: i64,
+}
+
+/// A single video from a subscribed channel's feed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeedItem {
+    pub video_id: String,
+    pub channel_id: String,
+    pub title: String,
+    pub uploader: String,
+    pub duration: u32,
+    pub thumbnail: String,
+    pub upload_date: String,
+    pub url: String,
 }
 
 /// Thread-safe wrapper around a SQLite connection.
@@ -111,6 +145,72 @@ impl Database {
         ).ok();
         conn.execute(
             "ALTER TABLE library_tracks ADD COLUMN last_played_at INTEGER NOT NULL DEFAULT 0",
+            [],
+        ).ok();
+
+        // Playlists
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS playlists (
+                id         TEXT PRIMARY KEY,
+                name       TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS playlist_tracks (
+                playlist_id TEXT NOT NULL,
+                track_path  TEXT NOT NULL,
+                position    INTEGER NOT NULL,
+                added_at    INTEGER NOT NULL,
+                PRIMARY KEY (playlist_id, track_path)
+            );
+            CREATE INDEX IF NOT EXISTS idx_playlist_tracks_playlist
+                ON playlist_tracks(playlist_id, position);",
+        )?;
+
+        // Tags (many-to-many with Last.fm weight)
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS tags (
+                id   INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE
+            );
+            CREATE INDEX IF NOT EXISTS idx_tags_name ON tags(name);
+            CREATE TABLE IF NOT EXISTS track_tags (
+                track_path TEXT NOT NULL,
+                tag_id     INTEGER NOT NULL,
+                weight     INTEGER NOT NULL DEFAULT 100,
+                PRIMARY KEY (track_path, tag_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_track_tags_tag ON track_tags(tag_id);
+            CREATE INDEX IF NOT EXISTS idx_track_tags_track ON track_tags(track_path);",
+        )?;
+
+        // YouTube channel subscriptions + feed
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS subscriptions (
+                id        TEXT PRIMARY KEY,
+                name      TEXT NOT NULL,
+                url       TEXT NOT NULL,
+                thumbnail TEXT NOT NULL DEFAULT '',
+                added_at  INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS feed_items (
+                video_id    TEXT PRIMARY KEY,
+                channel_id  TEXT NOT NULL,
+                title       TEXT NOT NULL,
+                uploader    TEXT NOT NULL,
+                duration    INTEGER NOT NULL DEFAULT 0,
+                thumbnail   TEXT NOT NULL DEFAULT '',
+                upload_date TEXT NOT NULL DEFAULT '',
+                fetched_at  INTEGER NOT NULL,
+                url         TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_feed_items_channel ON feed_items(channel_id);
+            CREATE INDEX IF NOT EXISTS idx_feed_items_date ON feed_items(upload_date DESC);",
+        )?;
+
+        // Migration: track whether Last.fm tags have been fetched for a track.
+        conn.execute(
+            "ALTER TABLE library_tracks ADD COLUMN tags_fetched_at INTEGER NOT NULL DEFAULT 0",
             [],
         ).ok();
 
@@ -335,6 +435,17 @@ impl Database {
                 params![new_path, new_filename, title, artist, album, mtime, size, old_path],
             )?;
         }
+        // Cascade path change to related tables
+        if old_path != new_path {
+            conn.execute(
+                "UPDATE playlist_tracks SET track_path = ?1 WHERE track_path = ?2",
+                params![new_path, old_path],
+            )?;
+            conn.execute(
+                "UPDATE track_tags SET track_path = ?1 WHERE track_path = ?2",
+                params![new_path, old_path],
+            )?;
+        }
         Ok(())
     }
 
@@ -343,26 +454,52 @@ impl Database {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         for p in paths {
+            tx.execute("DELETE FROM playlist_tracks WHERE track_path = ?1", params![p])?;
+            tx.execute("DELETE FROM track_tags WHERE track_path = ?1", params![p])?;
             tx.execute("DELETE FROM library_tracks WHERE path = ?1", params![p])?;
         }
         tx.commit()
     }
 
-    /// Load all cached library tracks with cover art as base64.
+    /// Load all cached library tracks with cover art as base64 and tags.
     pub fn get_all_library_tracks(&self) -> Result<Vec<crate::library::LibraryTrack>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
+
+        // Bulk load tags first (single query, not N+1)
+        let tag_map = {
+            let mut stmt = conn.prepare(
+                "SELECT tt.track_path, t.name, tt.weight
+                 FROM track_tags tt JOIN tags t ON tt.tag_id = t.id
+                 ORDER BY tt.track_path, tt.weight DESC",
+            )?;
+            let mut map: HashMap<String, Vec<String>> = HashMap::new();
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (path, tag) = row?;
+                let entry = map.entry(path).or_default();
+                if entry.len() < 5 {
+                    entry.push(tag);
+                }
+            }
+            map
+        };
+
         let mut stmt = conn.prepare(
             "SELECT path, filename, title, artist, album, duration_secs, cover_art, first_scanned_at, bitrate_kbps, play_count, last_played_at
              FROM library_tracks
              ORDER BY LOWER(artist), LOWER(album), LOWER(title)",
         )?;
         let rows = stmt.query_map([], |row| {
+            let path: String = row.get(0)?;
             let cover: Option<Vec<u8>> = row.get(6)?;
             let cover_b64 = cover
                 .map(|b| base64::engine::general_purpose::STANDARD.encode(&b))
                 .unwrap_or_default();
             Ok(crate::library::LibraryTrack {
-                path: row.get(0)?,
+                tags: tag_map.get(&path).cloned().unwrap_or_default(),
+                path,
                 filename: row.get(1)?,
                 title: row.get(2)?,
                 artist: row.get(3)?,
@@ -481,6 +618,302 @@ impl Database {
         conn.execute("DELETE FROM downloads", [])?;
         Ok(())
     }
+
+    // ===================== Playlists =====================
+
+    pub fn create_playlist(&self, id: &str, name: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let now = now_unix();
+        conn.execute(
+            "INSERT INTO playlists (id, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
+            params![id, name, now, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn rename_playlist(&self, id: &str, name: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE playlists SET name = ?1, updated_at = ?2 WHERE id = ?3",
+            params![name, now_unix(), id],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_playlist(&self, id: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM playlist_tracks WHERE playlist_id = ?1", params![id])?;
+        conn.execute("DELETE FROM playlists WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn list_playlists(&self) -> Result<Vec<PlaylistRow>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT p.id, p.name, p.created_at, p.updated_at,
+                    (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id) as track_count
+             FROM playlists p ORDER BY p.updated_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PlaylistRow {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                created_at: row.get(2)?,
+                updated_at: row.get(3)?,
+                track_count: row.get::<_, i64>(4)? as u32,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn get_playlist_track_paths(&self, playlist_id: &str) -> Result<Vec<String>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT track_path FROM playlist_tracks WHERE playlist_id = ?1 ORDER BY position",
+        )?;
+        let rows = stmt.query_map(params![playlist_id], |row| row.get::<_, String>(0))?;
+        rows.collect()
+    }
+
+    pub fn add_tracks_to_playlist(&self, playlist_id: &str, paths: &[String]) -> Result<(), rusqlite::Error> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let max_pos: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(position), -1) FROM playlist_tracks WHERE playlist_id = ?1",
+                params![playlist_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1);
+        let now = now_unix();
+        for (i, path) in paths.iter().enumerate() {
+            tx.execute(
+                "INSERT OR IGNORE INTO playlist_tracks (playlist_id, track_path, position, added_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![playlist_id, path, max_pos + 1 + i as i64, now],
+            )?;
+        }
+        tx.execute(
+            "UPDATE playlists SET updated_at = ?1 WHERE id = ?2",
+            params![now, playlist_id],
+        )?;
+        tx.commit()
+    }
+
+    pub fn remove_track_from_playlist(&self, playlist_id: &str, track_path: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM playlist_tracks WHERE playlist_id = ?1 AND track_path = ?2",
+            params![playlist_id, track_path],
+        )?;
+        conn.execute(
+            "UPDATE playlists SET updated_at = ?1 WHERE id = ?2",
+            params![now_unix(), playlist_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn reorder_playlist_tracks(&self, playlist_id: &str, paths: &[String]) -> Result<(), rusqlite::Error> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM playlist_tracks WHERE playlist_id = ?1",
+            params![playlist_id],
+        )?;
+        let now = now_unix();
+        for (i, path) in paths.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO playlist_tracks (playlist_id, track_path, position, added_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![playlist_id, path, i as i64, now],
+            )?;
+        }
+        tx.execute(
+            "UPDATE playlists SET updated_at = ?1 WHERE id = ?2",
+            params![now, playlist_id],
+        )?;
+        tx.commit()
+    }
+
+    // ===================== Tags =====================
+
+    /// Insert a tag if it doesn't exist, return its ID.
+    pub fn upsert_tag(&self, name: &str) -> Result<i64, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO tags (name) VALUES (?1)",
+            params![name],
+        )?;
+        conn.query_row(
+            "SELECT id FROM tags WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )
+    }
+
+    /// Replace all tags for a track. `tags` is a list of (normalized_name, weight).
+    pub fn set_track_tags(&self, track_path: &str, tags: &[(String, i32)]) -> Result<(), rusqlite::Error> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM track_tags WHERE track_path = ?1", params![track_path])?;
+        for (name, weight) in tags {
+            tx.execute(
+                "INSERT OR IGNORE INTO tags (name) VALUES (?1)",
+                params![name],
+            )?;
+            let tag_id: i64 = tx.query_row(
+                "SELECT id FROM tags WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO track_tags (track_path, tag_id, weight) VALUES (?1, ?2, ?3)",
+                params![track_path, tag_id, weight],
+            )?;
+        }
+        let now = now_unix();
+        tx.execute(
+            "UPDATE library_tracks SET tags_fetched_at = ?1 WHERE path = ?2",
+            params![now, track_path],
+        )?;
+        tx.commit()
+    }
+
+    /// All tags with their usage count, sorted by count descending.
+    pub fn get_all_tags(&self) -> Result<Vec<(i64, String, i64)>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT t.id, t.name, COUNT(tt.track_path) as cnt
+             FROM tags t JOIN track_tags tt ON t.id = tt.tag_id
+             GROUP BY t.id ORDER BY cnt DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+        })?;
+        rows.collect()
+    }
+
+    /// Bulk load: for every track, return its top 3 tags by weight.
+    /// Returns HashMap<track_path, Vec<tag_name>>.
+    pub fn get_all_track_tags(&self) -> Result<HashMap<String, Vec<String>>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT tt.track_path, t.name, tt.weight
+             FROM track_tags tt JOIN tags t ON tt.tag_id = t.id
+             ORDER BY tt.track_path, tt.weight DESC",
+        )?;
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (path, tag) = row?;
+            let entry = map.entry(path).or_default();
+            if entry.len() < 5 {
+                entry.push(tag);
+            }
+        }
+        Ok(map)
+    }
+
+    /// Return tracks that haven't had tags fetched yet.
+    pub fn tracks_needing_tag_fetch(&self, limit: u32) -> Result<Vec<(String, String, String)>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT path, title, artist FROM library_tracks
+             WHERE tags_fetched_at = 0 AND artist != '' LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })?;
+        rows.collect()
+    }
+
+    // ===================== Feed / Subscriptions =====================
+
+    pub fn add_subscription(&self, id: &str, name: &str, url: &str, thumbnail: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO subscriptions (id, name, url, thumbnail, added_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, name, url, thumbnail, now_unix()],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_subscription(&self, id: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM feed_items WHERE channel_id = ?1", params![id])?;
+        conn.execute("DELETE FROM subscriptions WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn list_subscriptions(&self) -> Result<Vec<Subscription>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, url, thumbnail, added_at FROM subscriptions ORDER BY added_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Subscription {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                url: row.get(2)?,
+                thumbnail: row.get(3)?,
+                added_at: row.get(4)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn upsert_feed_items(&self, items: &[FeedItem]) -> Result<(), rusqlite::Error> {
+        if items.is_empty() { return Ok(()); }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let now = now_unix();
+        for item in items {
+            tx.execute(
+                "INSERT INTO feed_items (video_id, channel_id, title, uploader, duration, thumbnail, upload_date, fetched_at, url)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(video_id) DO UPDATE SET
+                    title = excluded.title,
+                    duration = excluded.duration,
+                    thumbnail = excluded.thumbnail,
+                    upload_date = excluded.upload_date",
+                params![item.video_id, item.channel_id, item.title, item.uploader, item.duration, item.thumbnail, item.upload_date, now, item.url],
+            )?;
+        }
+        tx.commit()
+    }
+
+    pub fn get_feed_items(&self, limit: u32) -> Result<Vec<FeedItem>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT f.video_id, f.channel_id, f.title, COALESCE(s.name, f.uploader) as uploader,
+                    f.duration, f.thumbnail, f.upload_date, f.url
+             FROM feed_items f LEFT JOIN subscriptions s ON f.channel_id = s.id
+             ORDER BY f.upload_date DESC, f.fetched_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            Ok(FeedItem {
+                video_id: row.get(0)?,
+                channel_id: row.get(1)?,
+                title: row.get(2)?,
+                uploader: row.get(3)?,
+                duration: row.get::<_, i64>(4)? as u32,
+                thumbnail: row.get(5)?,
+                upload_date: row.get(6)?,
+                url: row.get(7)?,
+            })
+        })?;
+        rows.collect()
+    }
+}
+
+/// Current unix timestamp as i64.
+pub fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Current unix timestamp as a string.
