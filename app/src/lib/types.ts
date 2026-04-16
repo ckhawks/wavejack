@@ -27,6 +27,8 @@ export interface AppSettings {
   libraryColumns: string;
   /** JSON-encoded { field, dir } sort state for the library table. */
   librarySort: string;
+  /** Last active tab so we can restore on relaunch. */
+  lastTab: string;
 }
 
 /** Shape of the download-status event from Rust */
@@ -117,6 +119,17 @@ export interface DiscoverItem {
   message: string;
   filePath?: string;
   coverArtBase64?: string;
+}
+
+/** A search result from YouTube or SoundCloud */
+export interface SearchResult {
+  id: string;
+  title: string;
+  artist: string;
+  duration_secs: number;
+  thumbnail_url: string;
+  source: "youtube" | "soundcloud";
+  url: string;
 }
 
 /** Playlist info extracted via yt-dlp */

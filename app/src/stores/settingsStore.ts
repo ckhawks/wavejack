@@ -19,6 +19,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     lastDestination: "downloads",
     libraryColumns: "",
     librarySort: "",
+    lastTab: "downloads",
   },
   loaded: false,
 

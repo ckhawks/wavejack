@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Settings as SettingsIcon, Minus, Square, X, Download, Radio, Library, Compass } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { UrlInput } from "./UrlInput";
@@ -7,6 +7,8 @@ import { Settings } from "./Settings";
 import { AudioPlayer } from "./AudioPlayer";
 import { usePlayerStore } from "../stores/playerStore";
 import { useRoomStore } from "../stores/roomStore";
+import { useSettingsStore } from "../stores/settingsStore";
+import { useNavStore, type Tab } from "../stores/navStore";
 import { RoomBrowser } from "./rooms/RoomBrowser";
 import { RoomView } from "./rooms/RoomView";
 import { LibraryView } from "./LibraryView";
@@ -39,13 +41,35 @@ function WindowControls() {
   );
 }
 
-type Tab = "downloads" | "library" | "discover" | "rooms";
+const VALID_TABS: Tab[] = ["downloads", "library", "discover", "rooms"];
 
 export function Layout() {
   const [showSettings, setShowSettings] = useState(false);
-  const [activeTab, setActiveTab] = useState<Tab>("downloads");
+  const activeTab = useNavStore((s) => s.activeTab);
+  const setActiveTab = useNavStore((s) => s.setActiveTab);
   const hasPlayer = usePlayerStore((s) => s.currentTrack !== null);
   const currentRoomId = useRoomStore((s) => s.currentRoomId);
+  const settings = useSettingsStore((s) => s.settings);
+  const loaded = useSettingsStore((s) => s.loaded);
+  const updateSetting = useSettingsStore((s) => s.updateSetting);
+
+  // Restore last tab on startup
+  useEffect(() => {
+    if (!loaded) return;
+    const saved = settings.lastTab;
+    if (saved && VALID_TABS.includes(saved as Tab)) {
+      setActiveTab(saved as Tab);
+    }
+  }, [loaded]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Persist tab changes (covers both switchTab and external setActiveTab calls)
+  useEffect(() => {
+    if (loaded) updateSetting("lastTab", activeTab);
+  }, [activeTab]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const switchTab = (tab: Tab) => {
+    setActiveTab(tab);
+  };
 
   const tabs: Array<{ id: Tab; label: string; icon: typeof Download }> = [
     { id: "downloads", label: "Downloads", icon: Download },
@@ -74,7 +98,7 @@ export function Layout() {
             {tabs.map(({ id, label, icon: Icon }) => (
               <button
                 key={id}
-                onClick={() => setActiveTab(id)}
+                onClick={() => switchTab(id)}
                 className={`flex items-center gap-1 rounded px-2 py-1 text-xs transition-colors ${
                   activeTab === id
                     ? "bg-[#222] text-white"

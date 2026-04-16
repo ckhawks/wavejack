@@ -130,6 +130,63 @@ export function AudioPlayer() {
     if (audio) audio.volume = volume;
   }, [volume]);
 
+  // Register with OS media transport controls (MediaSession API) so hardware
+  // media keys, Stream Deck buttons, and Windows media overlays work.
+  useEffect(() => {
+    if (!("mediaSession" in navigator) || !currentTrack) return;
+    const artwork: MediaImage[] = [];
+    if (currentTrack.coverArtBase64) {
+      artwork.push({
+        src: `data:image/jpeg;base64,${currentTrack.coverArtBase64}`,
+        sizes: "512x512",
+        type: "image/jpeg",
+      });
+    }
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: currentTrack.title,
+      artist: currentTrack.artist ?? "",
+      artwork,
+    });
+  }, [currentTrack?.id, currentTrack?.title, currentTrack?.artist, currentTrack?.coverArtBase64]);
+
+  useEffect(() => {
+    if (!("mediaSession" in navigator)) return;
+    navigator.mediaSession.setActionHandler("play", () => {
+      if (!usePlayerStore.getState().isPlaying) togglePlayPause();
+    });
+    navigator.mediaSession.setActionHandler("pause", () => {
+      if (usePlayerStore.getState().isPlaying) togglePlayPause();
+    });
+    navigator.mediaSession.setActionHandler("previoustrack", () => playPrev());
+    navigator.mediaSession.setActionHandler("nexttrack", () => playNext());
+    navigator.mediaSession.setActionHandler("seekto", (details) => {
+      const audio = audioRef.current;
+      if (audio && details.seekTime != null) {
+        audio.currentTime = details.seekTime;
+        setCurrentTime(details.seekTime);
+      }
+    });
+    navigator.mediaSession.setActionHandler("stop", () => stop());
+    return () => {
+      navigator.mediaSession.setActionHandler("play", null);
+      navigator.mediaSession.setActionHandler("pause", null);
+      navigator.mediaSession.setActionHandler("previoustrack", null);
+      navigator.mediaSession.setActionHandler("nexttrack", null);
+      navigator.mediaSession.setActionHandler("seekto", null);
+      navigator.mediaSession.setActionHandler("stop", null);
+    };
+  }, [togglePlayPause, playPrev, playNext, setCurrentTime, stop]);
+
+  // Keep OS media session position state in sync for seek bar overlays.
+  useEffect(() => {
+    if (!("mediaSession" in navigator) || !duration) return;
+    navigator.mediaSession.setPositionState({
+      duration,
+      playbackRate: 1,
+      position: Math.min(currentTime, duration),
+    });
+  }, [currentTime, duration]);
+
   const onTimeUpdate = useCallback(() => {
     const audio = audioRef.current;
     if (audio) setCurrentTime(audio.currentTime);

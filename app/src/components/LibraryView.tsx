@@ -18,11 +18,14 @@ import {
   ArrowDown,
   SplitSquareHorizontal,
   Dices,
+  Compass,
 } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useLibraryStore } from "../stores/libraryStore";
 import { usePlayerStore } from "../stores/playerStore";
 import { useSettingsStore } from "../stores/settingsStore";
+import { useDiscoverStore } from "../stores/discoverStore";
+import { useNavStore } from "../stores/navStore";
 import { MetadataPicker } from "./MetadataPicker";
 import {
   applyLibraryMetadata,
@@ -343,6 +346,14 @@ export function LibraryView() {
       filePath: track.path,
       coverArtBase64: track.cover_art_base64 || undefined,
     });
+  };
+
+  const handleDiscoverSimilar = (track: LibraryTrack) => {
+    const store = useDiscoverStore.getState();
+    store.clearSeeds();
+    store.addSeed({ title: track.title, artist: track.artist });
+    store.fetchRecommendations();
+    useNavStore.getState().setActiveTab("discover");
   };
 
   const startManualEdit = (track: LibraryTrack) => {
@@ -893,6 +904,15 @@ export function LibraryView() {
                         >
                           <Pencil size={12} />
                         </button>
+                        {track.artist && (
+                          <button
+                            onClick={() => handleDiscoverSimilar(track)}
+                            className="flex h-6 w-6 items-center justify-center rounded text-neutral-600 transition-colors hover:text-violet-400"
+                            title="Discover similar tracks"
+                          >
+                            <Compass size={12} />
+                          </button>
+                        )}
                       </div>
                     </td>
                   </tr>

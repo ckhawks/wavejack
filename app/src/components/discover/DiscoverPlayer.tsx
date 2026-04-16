@@ -153,13 +153,13 @@ export function DiscoverPlayer() {
           <X size={24} />
         </button>
 
-        {item.status === "error" && (
+        {(item.status === "error" || item.message === "Kept!") && (
           <button
             onClick={skipCurrent}
-            className="flex h-10 w-10 items-center justify-center rounded-full border border-[#333] text-neutral-500 transition-all duration-200 hover:text-white"
+            className="flex h-12 w-12 items-center justify-center rounded-full border border-[#333] bg-[#111] text-neutral-400 transition-all duration-200 hover:border-[#555] hover:text-white"
             title="Next"
           >
-            <SkipForward size={16} />
+            <SkipForward size={20} />
           </button>
         )}
 

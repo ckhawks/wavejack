@@ -10,6 +10,20 @@ use std::sync::OnceLock;
 use tauri::{AppHandle, Manager};
 use tokio::sync::Mutex;
 
+/// A search result from YouTube or SoundCloud.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SearchResult {
+    pub id: String,
+    pub title: String,
+    pub artist: String,
+    pub duration_secs: u32,
+    pub thumbnail_url: String,
+    /// "youtube" or "soundcloud"
+    pub source: String,
+    /// Direct URL suitable for yt-dlp download.
+    pub url: String,
+}
+
 /// Cached SoundCloud client_id resolved at runtime.
 static SC_CLIENT_ID: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
@@ -213,7 +227,7 @@ fn split_artists(artist: &str) -> Vec<String> {
 
 /// Resolve SoundCloud's client_id from their public JS bundles.
 /// Caches the result so we only do this once per app session.
-async fn resolve_sc_client_id() -> Option<String> {
+pub async fn resolve_sc_client_id() -> Option<String> {
     let mut cached = sc_mutex().lock().await;
     if let Some(ref id) = *cached {
         return Some(id.clone());
@@ -328,6 +342,57 @@ async fn sc_related_tracks(
                 artist,
                 match_score: 0.5,
                 source: "soundcloud".into(),
+            })
+        })
+        .collect()
+}
+
+/// Search SoundCloud for tracks by query, returning full result objects.
+pub async fn sc_search_tracks(client_id: &str, query: &str, limit: u32) -> Vec<SearchResult> {
+    let url = format!(
+        "https://api-v2.soundcloud.com/search/tracks?q={}&client_id={}&limit={}",
+        urlencoding::encode(query),
+        client_id,
+        limit,
+    );
+
+    let resp = match reqwest::get(&url).await {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let json: serde_json::Value = match resp.json().await {
+        Ok(j) => j,
+        Err(_) => return Vec::new(),
+    };
+
+    let collection = match json["collection"].as_array() {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+
+    collection
+        .iter()
+        .filter_map(|t| {
+            let title = t["title"].as_str()?.to_string();
+            let artist = t["user"]["username"].as_str()?.to_string();
+            let duration_ms = t["duration"].as_u64().unwrap_or(0);
+            let duration_secs = (duration_ms / 1000) as u32;
+            let thumbnail_url = t["artwork_url"]
+                .as_str()
+                .unwrap_or("")
+                .replace("-large", "-t300x300")
+                .to_string();
+            let permalink = t["permalink_url"].as_str()?.to_string();
+            let id = t["id"].as_u64()?.to_string();
+
+            Some(SearchResult {
+                id,
+                title,
+                artist,
+                duration_secs,
+                thumbnail_url,
+                source: "soundcloud".into(),
+                url: permalink,
             })
         })
         .collect()
@@ -470,6 +535,81 @@ pub async fn fetch_youtube_related(
                 artist,
                 match_score: 0.6,
                 source: "youtube".into(),
+            })
+        })
+        .collect()
+}
+
+/// Search YouTube for tracks matching a query, returning structured results.
+/// Uses `ytsearch{limit}:{query}` which returns one JSON object per line.
+pub async fn yt_search_tracks(
+    ytdlp_path: &std::path::Path,
+    query: &str,
+    limit: u32,
+) -> Vec<SearchResult> {
+    let search_query = format!("ytsearch{}:{}", limit, query);
+
+    let output = match tokio::process::Command::new(ytdlp_path)
+        .args(["--no-download", "-j", "--no-warnings", &search_query])
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("YouTube search: yt-dlp failed: {}", e);
+            return Vec::new();
+        }
+    };
+
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    // yt-dlp outputs one JSON object per line for multi-result searches
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let json: serde_json::Value = serde_json::from_str(line).ok()?;
+            let video_id = json["id"].as_str()?.to_string();
+            let title = json["title"].as_str()?.to_string();
+            let uploader = json["uploader"]
+                .as_str()
+                .or_else(|| json["channel"].as_str())
+                .unwrap_or("Unknown")
+                .to_string();
+            let duration_secs = json["duration"].as_f64().unwrap_or(0.0) as u32;
+            let thumbnail_url = json["thumbnail"]
+                .as_str()
+                .or_else(|| {
+                    json["thumbnails"]
+                        .as_array()
+                        .and_then(|arr| arr.last())
+                        .and_then(|t| t["url"].as_str())
+                })
+                .unwrap_or("")
+                .to_string();
+            let url = format!("https://www.youtube.com/watch?v={}", video_id);
+
+            // Try to split "Artist - Title" from video title
+            let (artist, clean_title) = if title.contains(" - ") {
+                let idx = title.find(" - ").unwrap();
+                (
+                    title[..idx].trim().to_string(),
+                    title[idx + 3..].trim().to_string(),
+                )
+            } else {
+                (uploader.clone(), title.clone())
+            };
+
+            Some(SearchResult {
+                id: video_id,
+                title: clean_title,
+                artist,
+                duration_secs,
+                thumbnail_url,
+                source: "youtube".into(),
+                url,
             })
         })
         .collect()

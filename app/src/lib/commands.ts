@@ -5,6 +5,7 @@ import type {
   DownloadRecord,
   MetadataMatch,
   PlaylistInfo,
+  SearchResult,
 } from "./types";
 
 /** Start downloading a URL with the given format */
@@ -92,6 +93,16 @@ export async function applyMetadata(
 /** Extract audio from a video file (e.g. MP4) and save as MP3. Returns the output path. */
 export async function extractAudio(id: string, inputPath: string): Promise<string> {
   return invoke("extract_audio", { id, inputPath });
+}
+
+/** Search YouTube and SoundCloud for tracks matching a query */
+export async function searchSources(query: string): Promise<SearchResult[]> {
+  return invoke("search_sources", { query });
+}
+
+/** Download a search result to the preview directory for inline playback */
+export async function searchPreview(id: string, url: string, title: string): Promise<void> {
+  return invoke("search_preview", { id, url, title });
 }
 
 /** Fetch similar tracks from Last.fm, SoundCloud, and YouTube */

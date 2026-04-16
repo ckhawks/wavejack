@@ -1,11 +1,19 @@
-import { useState } from "react";
-import { Download, Loader, Music, Video, FileAudio, FolderDown, Library } from "lucide-react";
+import { useState, useCallback, useEffect, useRef } from "react";
+import { Download, Loader, Music, Video, FileAudio, FolderDown, Library, Search } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
+import { listen } from "@tauri-apps/api/event";
 import { useDownloadStore } from "../stores/downloadStore";
 import { useSettingsStore } from "../stores/settingsStore";
-import { startDownload, extractPlaylist, extractAudio } from "../lib/commands";
+import { usePlayerStore } from "../stores/playerStore";
+import { startDownload, extractPlaylist, extractAudio, searchSources, searchPreview, discoverKeep, discoverTrash } from "../lib/commands";
 import { PlaylistPreview } from "./PlaylistPreview";
-import type { PlaylistInfo } from "../lib/types";
+import { SearchResults, type PreviewState } from "./SearchResults";
+import type { PlaylistInfo, SearchResult, DownloadStatusEvent } from "../lib/types";
+
+function isUrl(input: string): boolean {
+  const trimmed = input.trim();
+  return trimmed.startsWith("http://") || trimmed.startsWith("https://");
+}
 
 function isPlaylistUrl(url: string): boolean {
   return (
@@ -20,6 +28,13 @@ export function UrlInput() {
   const [url, setUrl] = useState("");
   const [extracting, setExtracting] = useState(false);
   const [playlist, setPlaylist] = useState<PlaylistInfo | null>(null);
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [hasSearched, setHasSearched] = useState(false);
+  const [previews, setPreviews] = useState<Map<string, PreviewState>>(new Map());
+  const [savedIds, setSavedIds] = useState<Set<string>>(new Set());
+  const previewsRef = useRef(previews);
+  previewsRef.current = previews;
   const format = useSettingsStore((s) => s.settings.format);
   const destination = useSettingsStore((s) => s.settings.lastDestination);
   const updateSetting = useSettingsStore((s) => s.updateSetting);
@@ -29,27 +44,50 @@ export function UrlInput() {
   const setDestination = (d: "downloads" | "music") =>
     updateSetting("lastDestination", d);
 
-  const handleDownload = async () => {
+  const handleSubmit = async () => {
     const trimmed = url.trim();
     if (!trimmed) return;
 
-    // Check if it's a playlist URL
-    if (isPlaylistUrl(trimmed)) {
-      setExtracting(true);
-      try {
-        const info = await extractPlaylist(trimmed);
-        setPlaylist(info);
-        setUrl("");
-      } catch {
-        // Not a playlist or extraction failed — fall through to normal download
-        doSingleDownload(trimmed);
-      } finally {
-        setExtracting(false);
-      }
-      return;
-    }
+    if (isUrl(trimmed)) {
+      // Clear any search results when switching to URL mode
+      setSearchResults([]);
+      setHasSearched(false);
 
-    doSingleDownload(trimmed);
+      // Check if it's a playlist URL
+      if (isPlaylistUrl(trimmed)) {
+        setExtracting(true);
+        try {
+          const info = await extractPlaylist(trimmed);
+          setPlaylist(info);
+          setUrl("");
+        } catch {
+          // Not a playlist or extraction failed — fall through to normal download
+          doSingleDownload(trimmed);
+        } finally {
+          setExtracting(false);
+        }
+        return;
+      }
+
+      doSingleDownload(trimmed);
+    } else {
+      // Search query
+      handleSearch(trimmed);
+    }
+  };
+
+  const handleSearch = async (query: string) => {
+    setSearching(true);
+    setHasSearched(true);
+    try {
+      const results = await searchSources(query);
+      setSearchResults(results);
+    } catch (e) {
+      console.error("Search failed:", e);
+      setSearchResults([]);
+    } finally {
+      setSearching(false);
+    }
   };
 
   const doSingleDownload = (trimmedUrl: string) => {
@@ -68,6 +106,167 @@ export function UrlInput() {
       console.error("Failed to start download:", e)
     );
   };
+
+  // Listen for search preview status events
+  useEffect(() => {
+    const unlisten1 = listen<DownloadStatusEvent>("search-preview-status", (e) => {
+      const { id, status, progress, message, file_path, cover_art_base64 } = e.payload;
+      setPreviews((prev) => {
+        const next = new Map(prev);
+        const existing = next.get(id) ?? { status: "pending", progress: 0, message: "" };
+        if (status === "complete") {
+          next.set(id, { ...existing, status: "ready", progress: 100, message: "Ready", filePath: file_path ?? undefined, coverArtBase64: cover_art_base64 ?? undefined });
+          // Auto-play the preview
+          const results = searchResultsRef.current;
+          const result = results.find((r) => r.id === id);
+          if (result && file_path) {
+            usePlayerStore.getState().playTrack({
+              id: result.id,
+              title: result.title,
+              artist: result.artist,
+              filePath: file_path,
+              coverArtBase64: cover_art_base64 ?? undefined,
+            });
+          }
+        } else if (status === "error") {
+          next.set(id, { ...existing, status: "error", progress: 0, message });
+        } else {
+          next.set(id, { ...existing, status: "downloading", progress, message });
+        }
+        return next;
+      });
+    });
+
+    // Also listen to download-status in case yt-dlp emits there
+    const unlisten2 = listen<DownloadStatusEvent>("download-status", (e) => {
+      const { id } = e.payload;
+      if (!previewsRef.current.has(id)) return;
+      // Forward to same handler logic
+      const { status, progress, message, file_path, cover_art_base64 } = e.payload;
+      setPreviews((prev) => {
+        const next = new Map(prev);
+        const existing = next.get(id) ?? { status: "pending", progress: 0, message: "" };
+        if (status === "complete") {
+          next.set(id, { ...existing, status: "ready", progress: 100, message: "Ready", filePath: file_path ?? undefined, coverArtBase64: cover_art_base64 ?? undefined });
+          const results = searchResultsRef.current;
+          const result = results.find((r) => r.id === id);
+          if (result && file_path) {
+            usePlayerStore.getState().playTrack({
+              id: result.id,
+              title: result.title,
+              artist: result.artist,
+              filePath: file_path,
+              coverArtBase64: cover_art_base64 ?? undefined,
+            });
+          }
+        } else if (status === "error") {
+          next.set(id, { ...existing, status: "error", progress: 0, message });
+        } else {
+          next.set(id, { ...existing, status: "downloading", progress, message });
+        }
+        return next;
+      });
+    });
+
+    return () => {
+      unlisten1.then((fn) => fn());
+      unlisten2.then((fn) => fn());
+    };
+  }, []);
+
+  const searchResultsRef = useRef(searchResults);
+  searchResultsRef.current = searchResults;
+
+  // Play/preview a search result — downloads to temp dir, auto-plays when ready
+  const handlePreview = useCallback((result: SearchResult) => {
+    const existing = previewsRef.current.get(result.id);
+    if (existing?.status === "ready" && existing.filePath) {
+      // Already downloaded — just play it
+      usePlayerStore.getState().playTrack({
+        id: result.id,
+        title: result.title,
+        artist: result.artist,
+        filePath: existing.filePath,
+        coverArtBase64: existing.coverArtBase64,
+      });
+      return;
+    }
+    if (existing?.status === "downloading") return; // Already in progress
+
+    setPreviews((prev) => {
+      const next = new Map(prev);
+      next.set(result.id, { status: "downloading", progress: 0, message: "Starting preview..." });
+      return next;
+    });
+    searchPreview(result.id, result.url, result.title).catch((e) =>
+      console.error("Failed to start preview:", e)
+    );
+  }, []);
+
+  // Save a previewed track to the output directory
+  const handleSave = useCallback(async (result: SearchResult) => {
+    const preview = previewsRef.current.get(result.id);
+    if (!preview?.filePath) return;
+    try {
+      const newPath = await discoverKeep(result.id, preview.filePath);
+      setSavedIds((prev) => new Set(prev).add(result.id));
+      // Update the preview state so the player still works with the new path
+      setPreviews((prev) => {
+        const next = new Map(prev);
+        next.set(result.id, { ...preview, filePath: newPath });
+        return next;
+      });
+      // Update player if this track is currently playing
+      const player = usePlayerStore.getState();
+      if (player.currentTrack?.id === result.id) {
+        player.playTrack({
+          ...player.currentTrack,
+          filePath: newPath,
+        });
+      }
+    } catch (e) {
+      console.error("Failed to save track:", e);
+    }
+  }, []);
+
+  // Download a search result directly to the output dir (skip preview)
+  const handleDirectDownload = useCallback((result: SearchResult) => {
+    const id = crypto.randomUUID();
+    addDownload({
+      id,
+      url: result.url,
+      format,
+      status: "pending",
+      progress: 0,
+      message: "Starting...",
+      backend: "",
+    });
+    setSavedIds((prev) => new Set(prev).add(result.id));
+    startDownload(id, result.url, format, undefined, destination).catch((e) =>
+      console.error("Failed to start download:", e)
+    );
+  }, [addDownload, format, destination]);
+
+  // Clean up unsaved preview files when results change
+  const prevResultsRef = useRef<SearchResult[]>([]);
+  useEffect(() => {
+    const prevIds = new Set(prevResultsRef.current.map((r) => r.id));
+    const currentIds = new Set(searchResults.map((r) => r.id));
+
+    // Trash previews for results that are no longer visible and weren't saved
+    for (const id of prevIds) {
+      if (currentIds.has(id)) continue;
+      if (savedIds.has(id)) continue;
+      const preview = previewsRef.current.get(id);
+      if (preview?.filePath) {
+        discoverTrash(preview.filePath).catch(() => {});
+      }
+    }
+
+    if (searchResults !== prevResultsRef.current) {
+      prevResultsRef.current = searchResults;
+    }
+  }, [searchResults, savedIds]);
 
   const [extractingAudio, setExtractingAudio] = useState(false);
 
@@ -105,8 +304,10 @@ export function UrlInput() {
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter") handleDownload();
+    if (e.key === "Enter") handleSubmit();
   };
+
+  const inputIsUrl = isUrl(url);
 
   return (
     <>
@@ -117,9 +318,9 @@ export function UrlInput() {
           value={url}
           onChange={(e) => setUrl(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder="Paste a YouTube or SoundCloud URL..."
+          placeholder="Search or paste a YouTube/SoundCloud URL..."
           className="flex-1 rounded-lg border border-[#333] bg-[#111] px-4 py-3 text-sm text-white placeholder-neutral-500 outline-none transition-all duration-200 focus:border-[#555]"
-          disabled={extracting}
+          disabled={extracting || searching}
         />
 
         {/* Format toggle */}
@@ -184,21 +385,26 @@ export function UrlInput() {
           </button>
         </div>
 
-        {/* Download button */}
+        {/* Download / Search button */}
         <button
-          onClick={handleDownload}
-          disabled={!url.trim() || extracting}
+          onClick={handleSubmit}
+          disabled={!url.trim() || extracting || searching}
           className="flex items-center gap-2 rounded-lg bg-white px-5 py-3 text-sm font-medium text-black transition-all duration-200 hover:bg-neutral-200 disabled:cursor-not-allowed disabled:opacity-40"
         >
-          {extracting ? (
+          {extracting || searching ? (
             <>
               <Loader size={16} className="animate-spin" />
-              Loading...
+              {searching ? "Searching..." : "Loading..."}
             </>
-          ) : (
+          ) : inputIsUrl || !url.trim() ? (
             <>
               <Download size={16} />
               Download
+            </>
+          ) : (
+            <>
+              <Search size={16} />
+              Search
             </>
           )}
         </button>
@@ -226,6 +432,18 @@ export function UrlInput() {
           onClose={() => setPlaylist(null)}
         />
       )}
+
+      {/* Search results */}
+      <SearchResults
+        results={searchResults}
+        loading={searching}
+        searched={hasSearched}
+        previews={previews}
+        savedIds={savedIds}
+        onPreview={handlePreview}
+        onSave={handleSave}
+        onDirectDownload={handleDirectDownload}
+      />
     </>
   );
 }

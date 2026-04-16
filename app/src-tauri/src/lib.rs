@@ -634,6 +634,164 @@ async fn extract_audio(app: tauri::AppHandle, id: String, input_path: String) ->
 }
 
 // ========================================================================
+// Search Commands
+// ========================================================================
+
+/// Search YouTube and SoundCloud for tracks matching a query.
+/// Returns up to 5 results per source, deduped by title similarity.
+///
+/// Called from JS: invoke("search_sources", { query })
+#[tauri::command]
+async fn search_sources(query: String) -> Result<Vec<discover::SearchResult>, AppError> {
+    let query = query.trim().to_string();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let ytdlp_path = ytdlp::find_ytdlp();
+
+    // Run YouTube and SoundCloud searches in parallel
+    let yt_fut = async {
+        match ytdlp_path {
+            Some(ref path) => discover::yt_search_tracks(path, &query, 5).await,
+            None => Vec::new(),
+        }
+    };
+
+    let sc_fut = async {
+        let client_id = match discover::resolve_sc_client_id().await {
+            Some(id) => id,
+            None => return Vec::new(),
+        };
+        discover::sc_search_tracks(&client_id, &query, 5).await
+    };
+
+    let (yt_results, sc_results) = tokio::join!(yt_fut, sc_fut);
+
+    // Merge results: YouTube first, then SoundCloud
+    let mut all = yt_results;
+    let yt_titles: std::collections::HashSet<String> = all
+        .iter()
+        .map(|r| normalize_for_dedup(&r.title))
+        .collect();
+
+    // Skip SC results whose normalized title is a substring match of a YT result
+    for sc in sc_results {
+        let norm = normalize_for_dedup(&sc.title);
+        let is_dupe = yt_titles.iter().any(|yt| {
+            yt.contains(&norm) || norm.contains(yt.as_str())
+        });
+        if !is_dupe {
+            all.push(sc);
+        }
+    }
+
+    // Cap total results
+    all.truncate(10);
+    Ok(all)
+}
+
+/// Normalize a title for deduplication: lowercase, strip parenthesized/bracketed
+/// suffixes (e.g. "(Official Video)"), and collapse whitespace.
+fn normalize_for_dedup(title: &str) -> String {
+    let lower = title.to_lowercase();
+    // Strip (…) and […] at the end
+    let stripped = lower
+        .trim_end()
+        .trim_end_matches(|c: char| c == ')' || c == ']');
+    let stripped = if let Some(pos) = stripped.rfind(|c: char| c == '(' || c == '[') {
+        &stripped[..pos]
+    } else {
+        stripped
+    };
+    stripped
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Download a search result to the preview directory for inline playback.
+/// Unlike discover_preview, this takes a direct URL instead of searching.
+///
+/// Called from JS: invoke("search_preview", { id, url, title })
+#[tauri::command]
+async fn search_preview(
+    app: tauri::AppHandle,
+    id: String,
+    url: String,
+    title: String,
+) -> Result<(), AppError> {
+    let preview_dir = discover::preview_dir(&app)?;
+    let output_dir = preview_dir.to_string_lossy().to_string();
+
+    tauri::async_runtime::spawn(async move {
+        let ytdlp_path = match ytdlp::ensure_ytdlp(&app).await {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = app.emit(
+                    "search-preview-status",
+                    ytdlp::DownloadStatusEvent {
+                        id: id.clone(),
+                        status: "error".into(),
+                        progress: 0.0,
+                        message: format!("yt-dlp not available: {}", e),
+                        backend: "ytdlp".into(),
+                        title: Some(title),
+                        file_path: None,
+                        cover_art_base64: None,
+                    },
+                );
+                return;
+            }
+        };
+
+        match ytdlp::download_with_ytdlp(
+            &ytdlp_path,
+            &url,
+            "mp3",
+            &output_dir,
+            &id,
+            &app,
+        )
+        .await
+        {
+            Ok(result) => {
+                let _ = app.emit(
+                    "search-preview-status",
+                    ytdlp::DownloadStatusEvent {
+                        id: id.clone(),
+                        status: "complete".into(),
+                        progress: 100.0,
+                        message: "Ready to preview".into(),
+                        backend: "ytdlp".into(),
+                        title: result.title.or(Some(title)),
+                        file_path: result.file_path,
+                        cover_art_base64: result.cover_art_base64,
+                    },
+                );
+            }
+            Err(e) => {
+                let _ = app.emit(
+                    "search-preview-status",
+                    ytdlp::DownloadStatusEvent {
+                        id: id.clone(),
+                        status: "error".into(),
+                        progress: 0.0,
+                        message: format!("Preview failed: {}", e),
+                        backend: "ytdlp".into(),
+                        title: Some(title),
+                        file_path: None,
+                        cover_art_base64: None,
+                    },
+                );
+            }
+        }
+    });
+
+    Ok(())
+}
+
+// ========================================================================
 // Discover Commands
 // ========================================================================
 
@@ -1347,6 +1505,8 @@ pub fn run() {
             fetch_metadata,
             apply_metadata,
             extract_audio,
+            search_sources,
+            search_preview,
             discover_similar,
             discover_preview,
             discover_keep,
