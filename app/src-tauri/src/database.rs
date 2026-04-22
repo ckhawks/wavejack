@@ -133,6 +133,14 @@ impl Database {
              WHERE bitrate_kbps = 0 AND duration_secs > 0",
             [],
         ).ok();
+        // Whether bitrate_kbps came from the file's audio frame headers (0) or
+        // was estimated from size/duration (1). Defaults to 1 for pre-existing
+        // rows since we can't tell which path wrote them — the next scan will
+        // re-read them via lofty and clear the flag.
+        conn.execute(
+            "ALTER TABLE library_tracks ADD COLUMN bitrate_estimated INTEGER NOT NULL DEFAULT 1",
+            [],
+        ).ok();
         // Cached SoundCloud-style waveform: 500 bytes of 0-255 amplitude buckets.
         conn.execute(
             "ALTER TABLE library_tracks ADD COLUMN waveform BLOB",
@@ -244,17 +252,18 @@ impl Database {
         Ok(())
     }
 
-    /// Return (path, mtime, size, duration_secs, bitrate_kbps) for every cached
-    /// track in the given folder. The scanner uses duration/bitrate to detect
-    /// rows that need re-reading even when mtime/size are unchanged
-    /// (e.g. legacy rows missing values now produced by the lofty parser).
+    /// Return (path, mtime, size, duration_secs, bitrate_kbps, bitrate_estimated)
+    /// for every cached track in the given folder. The scanner uses these to
+    /// detect rows that need re-reading even when mtime/size are unchanged
+    /// (e.g. legacy rows missing values now produced by the lofty parser, or
+    /// rows whose bitrate is a size/duration estimate rather than a real read).
     pub fn library_tracks_fingerprint(
         &self,
         folder: &str,
-    ) -> Result<Vec<(String, i64, i64, i64, i64)>, rusqlite::Error> {
+    ) -> Result<Vec<(String, i64, i64, i64, i64, bool)>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT path, mtime, size, duration_secs, bitrate_kbps FROM library_tracks WHERE folder = ?1",
+            "SELECT path, mtime, size, duration_secs, bitrate_kbps, bitrate_estimated FROM library_tracks WHERE folder = ?1",
         )?;
         let rows = stmt.query_map(params![folder], |row| {
             Ok((
@@ -263,6 +272,7 @@ impl Database {
                 row.get::<_, i64>(2)?,
                 row.get::<_, i64>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)? != 0,
             ))
         })?;
         rows.collect()
@@ -283,18 +293,20 @@ impl Database {
             .unwrap_or(0);
         // Bitrate is read directly from the file (lofty); fall back to a
         // size/duration approximation only if the reader didn't supply one.
-        let bitrate_kbps: i64 = if track.bitrate_kbps > 0 {
-            track.bitrate_kbps as i64
+        // The estimated flag tracks which path we took so the UI can mark
+        // fallback values as uncertain.
+        let (bitrate_kbps, bitrate_estimated): (i64, bool) = if track.bitrate_kbps > 0 {
+            (track.bitrate_kbps as i64, false)
         } else if track.duration_secs > 0 {
-            ((size * 8) / (track.duration_secs as i64) / 1000).max(0)
+            (((size * 8) / (track.duration_secs as i64) / 1000).max(0), true)
         } else {
-            0
+            (0, false)
         };
         // Insert if new; otherwise update everything except first_scanned_at.
         conn.execute(
             "INSERT INTO library_tracks
-             (path, folder, filename, title, artist, album, duration_secs, mtime, size, cover_art, first_scanned_at, bitrate_kbps)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             (path, folder, filename, title, artist, album, duration_secs, mtime, size, cover_art, first_scanned_at, bitrate_kbps, bitrate_estimated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(path) DO UPDATE SET
                 folder = excluded.folder,
                 filename = excluded.filename,
@@ -305,7 +317,8 @@ impl Database {
                 mtime = excluded.mtime,
                 size = excluded.size,
                 cover_art = excluded.cover_art,
-                bitrate_kbps = excluded.bitrate_kbps",
+                bitrate_kbps = excluded.bitrate_kbps,
+                bitrate_estimated = excluded.bitrate_estimated",
             params![
                 track.path,
                 folder,
@@ -319,6 +332,7 @@ impl Database {
                 cover_art_bytes,
                 now,
                 bitrate_kbps,
+                bitrate_estimated as i64,
             ],
         )?;
         Ok(())
@@ -487,7 +501,7 @@ impl Database {
         };
 
         let mut stmt = conn.prepare(
-            "SELECT path, filename, title, artist, album, duration_secs, cover_art, first_scanned_at, bitrate_kbps, play_count, last_played_at
+            "SELECT path, filename, title, artist, album, duration_secs, cover_art, first_scanned_at, bitrate_kbps, play_count, last_played_at, bitrate_estimated
              FROM library_tracks
              ORDER BY LOWER(artist), LOWER(album), LOWER(title)",
         )?;
@@ -510,6 +524,7 @@ impl Database {
                 bitrate_kbps: row.get::<_, i64>(8)? as u32,
                 play_count: row.get::<_, i64>(9)? as u32,
                 last_played_at: row.get::<_, i64>(10)?,
+                bitrate_estimated: row.get::<_, i64>(11)? != 0,
             })
         })?;
         rows.collect()

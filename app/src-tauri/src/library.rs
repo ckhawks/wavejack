@@ -27,6 +27,10 @@ pub struct LibraryTrack {
     /// from file size + duration; left at 0 by the metadata reader itself.
     #[serde(default)]
     pub bitrate_kbps: u32,
+    /// True when bitrate_kbps was derived from size/duration rather than read
+    /// from audio frame headers — treat as a rough estimate in the UI.
+    #[serde(default)]
+    pub bitrate_estimated: bool,
     /// How many times this track has finished playing (Last.fm-style: only
     /// natural ends count, not skips).
     #[serde(default)]
@@ -56,10 +60,10 @@ pub fn scan_folder_incremental(folder: &Path, db: &Database) -> ScanResult {
     let cache = db
         .library_tracks_fingerprint(&folder_str)
         .unwrap_or_default();
-    // path -> (mtime, size, duration_secs, bitrate_kbps)
-    let cache_map: HashMap<String, (i64, i64, i64, i64)> = cache
+    // path -> (mtime, size, duration_secs, bitrate_kbps, bitrate_estimated)
+    let cache_map: HashMap<String, (i64, i64, i64, i64, bool)> = cache
         .into_iter()
-        .map(|(p, m, s, d, b)| (p, (m, s, d, b)))
+        .map(|(p, m, s, d, b, e)| (p, (m, s, d, b, e)))
         .collect();
 
     let mut seen_paths: Vec<String> = Vec::with_capacity(cache_map.len());
@@ -83,7 +87,7 @@ pub fn scan_folder_incremental(folder: &Path, db: &Database) -> ScanResult {
 fn walk(
     dir: &Path,
     folder_root: &str,
-    cache: &HashMap<String, (i64, i64, i64, i64)>,
+    cache: &HashMap<String, (i64, i64, i64, i64, bool)>,
     seen: &mut Vec<String>,
     result: &mut ScanResult,
     db: &Database,
@@ -119,9 +123,11 @@ fn walk(
         seen.push(path_str.clone());
 
         match cache.get(&path_str) {
-            // Skip only if mtime+size match AND duration+bitrate are populated.
-            // A 0 in either signals a legacy row predating the lofty parser.
-            Some(&(m, s, d, b)) if m == mtime && s == size && d > 0 && b > 0 => {
+            // Skip only if mtime+size match AND duration+bitrate are populated
+            // AND the bitrate was read by lofty (not a size/duration estimate).
+            // A 0 in either, or an estimated bitrate, signals a row that needs
+            // re-reading through the lofty parser.
+            Some(&(m, s, d, b, est)) if m == mtime && s == size && d > 0 && b > 0 && !est => {
                 result.unchanged += 1;
                 continue;
             }
@@ -190,6 +196,7 @@ fn read_track_metadata(path: &Path) -> Option<(LibraryTrack, Option<Vec<u8>>)> {
                     cover_art_base64: cover_b64,
                     first_scanned_at: 0,
                     bitrate_kbps,
+                    bitrate_estimated: false,
                     play_count: 0,
                     last_played_at: 0,
                     tags: Vec::new(),
@@ -210,6 +217,7 @@ fn read_track_metadata(path: &Path) -> Option<(LibraryTrack, Option<Vec<u8>>)> {
             cover_art_base64: String::new(),
             first_scanned_at: 0,
             bitrate_kbps: 0,
+            bitrate_estimated: false,
             play_count: 0,
             last_played_at: 0,
             tags: Vec::new(),

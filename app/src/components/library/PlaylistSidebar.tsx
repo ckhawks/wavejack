@@ -1,8 +1,12 @@
 import { useState } from "react";
-import { Plus, Trash2, Pencil, Check, X, Music, ListMusic } from "lucide-react";
+import { Plus, Trash2, Pencil, Check, X, Music, ListMusic, PanelLeftClose } from "lucide-react";
 import { usePlaylistStore } from "../../stores/playlistStore";
 
-export function PlaylistSidebar() {
+interface PlaylistSidebarProps {
+  onCollapse: () => void;
+}
+
+export function PlaylistSidebar({ onCollapse }: PlaylistSidebarProps) {
   const playlists = usePlaylistStore((s) => s.playlists);
   const activeId = usePlaylistStore((s) => s.activePlaylistId);
   const setActive = usePlaylistStore((s) => s.setActive);
@@ -32,8 +36,8 @@ export function PlaylistSidebar() {
 
   return (
     <div className="flex w-52 shrink-0 flex-col border-r border-[#222] bg-[#0a0a0a]">
-      <div className="flex items-center justify-between px-3 py-2">
-        <span className="text-[10px] font-medium uppercase tracking-wider text-neutral-600">
+      <div className="flex items-center gap-1 px-3 py-2">
+        <span className="flex-1 text-[10px] font-medium uppercase tracking-wider text-neutral-600">
           Playlists
         </span>
         <button
@@ -42,6 +46,13 @@ export function PlaylistSidebar() {
           title="New playlist"
         >
           <Plus size={12} />
+        </button>
+        <button
+          onClick={onCollapse}
+          className="rounded p-1 text-neutral-600 hover:text-white"
+          title="Hide playlists panel"
+        >
+          <PanelLeftClose size={12} />
         </button>
       </div>
 

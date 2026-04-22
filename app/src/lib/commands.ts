@@ -161,6 +161,9 @@ export interface LibraryTrack {
   first_scanned_at: number;
   /** Approximate average bitrate in kbps; 0 when unknown. */
   bitrate_kbps: number;
+  /** True when bitrate_kbps was derived from size/duration rather than read
+   *  from audio frame headers — the UI should mark it as uncertain. */
+  bitrate_estimated: boolean;
   /** Number of natural finishes (Last.fm-style — skips don't count). */
   play_count: number;
   /** Unix seconds of the most recent natural finish, 0 if never. */

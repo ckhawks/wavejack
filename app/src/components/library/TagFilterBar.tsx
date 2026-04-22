@@ -1,13 +1,11 @@
 import { useState, useRef, useEffect } from "react";
-import { X, Tag, Loader } from "lucide-react";
+import { X, Tag } from "lucide-react";
 import { useLibraryStore } from "../../stores/libraryStore";
 
 export function TagFilterBar() {
   const allTags = useLibraryStore((s) => s.allTags);
   const tagFilter = useLibraryStore((s) => s.tagFilter);
   const setTagFilter = useLibraryStore((s) => s.setTagFilter);
-  const tagFetchProgress = useLibraryStore((s) => s.tagFetchProgress);
-  const startBulkFetchTags = useLibraryStore((s) => s.startBulkFetchTags);
 
   const [showDropdown, setShowDropdown] = useState(false);
   const [search, setSearch] = useState("");
@@ -26,8 +24,6 @@ export function TagFilterBar() {
   const filteredTags = search.trim()
     ? allTags.filter((t) => t.name.toLowerCase().includes(search.toLowerCase()))
     : allTags;
-
-  const isFetching = tagFetchProgress !== null;
 
   return (
     <div className="flex items-center gap-2 px-6">
@@ -66,7 +62,7 @@ export function TagFilterBar() {
             <div className="max-h-48 overflow-y-auto">
               {filteredTags.length === 0 ? (
                 <p className="px-3 py-2 text-xs text-neutral-600">
-                  {allTags.length === 0 ? "No tags yet — click Fetch Tags" : "No matches"}
+                  {allTags.length === 0 ? "No tags yet — run Fetch genre tags from Tools" : "No matches"}
                 </p>
               ) : (
                 filteredTags.slice(0, 30).map((t) => (
@@ -86,26 +82,6 @@ export function TagFilterBar() {
           </div>
         )}
       </div>
-
-      {/* Fetch Tags button */}
-      <button
-        onClick={startBulkFetchTags}
-        disabled={isFetching}
-        className="ml-auto flex items-center gap-1.5 rounded bg-[#222] px-3 py-1 text-[10px] text-neutral-400 hover:bg-[#333] hover:text-white disabled:opacity-40"
-        title="Fetch genre tags from Last.fm for all tracks"
-      >
-        {isFetching ? (
-          <>
-            <Loader size={10} className="animate-spin" />
-            {tagFetchProgress.done}/{tagFetchProgress.total}
-          </>
-        ) : (
-          <>
-            <Tag size={10} />
-            Fetch Tags
-          </>
-        )}
-      </button>
     </div>
   );
 }

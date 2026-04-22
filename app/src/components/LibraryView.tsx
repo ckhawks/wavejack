@@ -6,20 +6,21 @@ import {
   Music,
   Play,
   X,
-  Wand2,
-  Pencil,
   Save,
   Image as ImageIcon,
   Loader,
   Check,
-  Settings as SettingsIcon,
   AlertTriangle,
   ArrowUp,
   ArrowDown,
   SplitSquareHorizontal,
   Dices,
-  Compass,
   ListMusic,
+  Wrench,
+  PanelLeftOpen,
+  Folder,
+  ChevronRight,
+  Tag,
 } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
@@ -33,6 +34,7 @@ import { MetadataPicker } from "./MetadataPicker";
 import { PlaylistSidebar } from "./library/PlaylistSidebar";
 import { TagFilterBar } from "./library/TagFilterBar";
 import { AddToPlaylistMenu } from "./library/AddToPlaylistMenu";
+import { TrackActionsMenu } from "./library/TrackActionsMenu";
 import {
   applyLibraryMetadata,
   updateLibraryTrack,
@@ -141,6 +143,8 @@ export function LibraryView() {
   const tagFilter = useLibraryStore((s) => s.tagFilter);
   const setTagFilter = useLibraryStore((s) => s.setTagFilter);
   const loadTags = useLibraryStore((s) => s.loadTags);
+  const tagFetchProgress = useLibraryStore((s) => s.tagFetchProgress);
+  const startBulkFetchTags = useLibraryStore((s) => s.startBulkFetchTags);
 
   // Init playlists + tags on mount
   useEffect(() => {
@@ -223,8 +227,8 @@ export function LibraryView() {
     lastClickedPath.current = null;
   }, []);
 
-  const [showFolders, setShowFolders] = useState(folders.length === 0);
-  const [showColumnMenu, setShowColumnMenu] = useState(false);
+  const [showFolders, setShowFolders] = useState(false);
+  const [showToolsMenu, setShowToolsMenu] = useState(false);
   const [needsFixOnly, setNeedsFixOnly] = useState(false);
   const [editing, setEditing] = useState<LibraryTrack | null>(null);
   const [manualEdit, setManualEdit] = useState<LibraryTrack | null>(null);
@@ -569,11 +573,20 @@ export function LibraryView() {
   return (
     <div className="flex flex-1 overflow-hidden">
       {/* Playlist sidebar */}
-      {showPlaylists && <PlaylistSidebar />}
+      {showPlaylists && <PlaylistSidebar onCollapse={() => setShowPlaylists(false)} />}
 
       <div className="flex flex-1 flex-col gap-4 overflow-hidden pt-6">
       {/* Header (padded so it doesn't kiss the window edges) */}
       <div className="flex items-center gap-2 px-6">
+        {!showPlaylists && (
+          <button
+            onClick={() => setShowPlaylists(true)}
+            className="flex items-center justify-center rounded bg-[#222] px-2 py-2 text-xs text-neutral-400 hover:bg-[#333] hover:text-white"
+            title="Show playlists"
+          >
+            <PanelLeftOpen size={14} />
+          </button>
+        )}
         <div className="flex flex-1 items-center gap-2 rounded bg-[#111] px-3 py-2 ring-1 ring-[#333] focus-within:ring-[#555]">
           <Search size={14} className="text-neutral-500" />
           <input
@@ -591,86 +604,103 @@ export function LibraryView() {
           <FolderPlus size={14} />
           Add Folder
         </button>
-        <button
-          onClick={rescan}
-          disabled={scanning || folders.length === 0}
-          className="flex items-center gap-1.5 rounded bg-[#222] px-3 py-2 text-xs text-neutral-300 hover:bg-[#333] disabled:opacity-40"
-        >
-          <RefreshCw size={14} className={scanning ? "animate-spin" : ""} />
-        </button>
-        <button
-          onClick={handleBulkFindArt}
-          disabled={!!bulkArt || tracks.length === 0}
-          className="flex items-center gap-1.5 rounded bg-[#222] px-3 py-2 text-xs text-neutral-300 hover:bg-[#333] disabled:opacity-40"
-          title="Find missing album art"
-        >
-          {bulkArt ? (
-            <>
-              <Loader size={14} className="animate-spin" />
-              {bulkArt.done}/{bulkArt.total}
-            </>
-          ) : (
-            <>
-              <ImageIcon size={14} />
-              Find Art
-            </>
-          )}
-        </button>
-        <button
-          onClick={handleBulkParse}
-          disabled={!!bulkParse || tracks.length === 0}
-          className="flex items-center gap-1.5 rounded bg-[#222] px-3 py-2 text-xs text-neutral-300 hover:bg-[#333] disabled:opacity-40"
-          title="Parse 'Artist - Title' from filename for tracks needing fix"
-        >
-          {bulkParse ? (
-            <>
-              <Loader size={14} className="animate-spin" />
-              {bulkParse.done}/{bulkParse.total}
-            </>
-          ) : (
-            <>
-              <SplitSquareHorizontal size={14} />
-              Parse Names
-            </>
-          )}
-        </button>
-        <button
-          onClick={reshuffle}
-          className={`flex items-center gap-1.5 rounded px-3 py-2 text-xs ${
-            sort.field === "random" ? "bg-violet-600/20 text-violet-300 ring-1 ring-violet-500/40" : "bg-[#222] text-neutral-300 hover:bg-[#333]"
-          }`}
-          title={sort.field === "random" ? "Reshuffle" : "Random sort"}
-        >
-          <Dices size={14} />
-          {sort.field === "random" ? "Reshuffle" : "Random"}
-        </button>
-        <button
-          onClick={() => setNeedsFixOnly((v) => !v)}
-          className={`flex items-center gap-1.5 rounded px-3 py-2 text-xs ${
-            needsFixOnly ? "bg-yellow-600/20 text-yellow-400 ring-1 ring-yellow-500/40" : "bg-[#222] text-neutral-300 hover:bg-[#333]"
-          }`}
-          title="Show only tracks with metadata problems"
-        >
-          <AlertTriangle size={14} />
-          Needs Fix ({fixCount})
-        </button>
+        {bulkArt && (
+          <div className="flex items-center gap-1.5 rounded bg-[#222] px-3 py-2 text-xs text-neutral-300" title="Finding album art">
+            <Loader size={14} className="animate-spin" />
+            <ImageIcon size={12} className="text-neutral-500" />
+            {bulkArt.done}/{bulkArt.total}
+          </div>
+        )}
+        {bulkParse && (
+          <div className="flex items-center gap-1.5 rounded bg-[#222] px-3 py-2 text-xs text-neutral-300" title="Parsing names">
+            <Loader size={14} className="animate-spin" />
+            <SplitSquareHorizontal size={12} className="text-neutral-500" />
+            {bulkParse.done}/{bulkParse.total}
+          </div>
+        )}
+        {tagFetchProgress && (
+          <div className="flex items-center gap-1.5 rounded bg-[#222] px-3 py-2 text-xs text-neutral-300" title="Fetching tags">
+            <Loader size={14} className="animate-spin" />
+            <Tag size={12} className="text-neutral-500" />
+            {tagFetchProgress.done}/{tagFetchProgress.total}
+          </div>
+        )}
         <div className="relative">
           <button
-            onClick={() => setShowColumnMenu((v) => !v)}
-            className="rounded bg-[#222] px-3 py-2 text-xs text-neutral-300 hover:bg-[#333]"
-            title="Show/hide columns"
+            onClick={() => setShowToolsMenu((v) => !v)}
+            className={`flex items-center gap-1.5 rounded px-3 py-2 text-xs ${
+              needsFixOnly
+                ? "bg-violet-600/20 text-violet-300 ring-1 ring-violet-500/40"
+                : "bg-[#222] text-neutral-300 hover:bg-[#333]"
+            }`}
+            title="Library tools"
           >
-            <SettingsIcon size={14} />
+            <Wrench size={14} />
+            Tools
           </button>
-          {showColumnMenu && (
+          {showToolsMenu && (
             <div
-              className="absolute right-0 top-full z-30 mt-1 min-w-[160px] rounded border border-[#333] bg-[#0a0a0a] p-2 shadow-xl"
-              onMouseLeave={() => setShowColumnMenu(false)}
+              className="absolute right-0 top-full z-30 mt-1 max-h-[80vh] min-w-[240px] overflow-y-auto rounded border border-[#333] bg-[#0a0a0a] py-1 shadow-xl"
+              onMouseLeave={() => setShowToolsMenu(false)}
             >
+              <div className="px-3 pb-1 pt-2 text-[10px] font-medium uppercase tracking-wider text-neutral-600">
+                Library
+              </div>
+              <button
+                onClick={() => { void rescan(); setShowToolsMenu(false); }}
+                disabled={scanning || folders.length === 0}
+                className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-neutral-300 transition-colors hover:bg-[#1a1a1a] hover:text-white disabled:opacity-40"
+              >
+                <RefreshCw size={12} className={scanning ? "animate-spin" : ""} />
+                Rescan folders
+              </button>
+              <button
+                onClick={() => { void handleBulkFindArt(); setShowToolsMenu(false); }}
+                disabled={!!bulkArt || tracks.length === 0}
+                className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-neutral-300 transition-colors hover:bg-[#1a1a1a] hover:text-white disabled:opacity-40"
+              >
+                <ImageIcon size={12} />
+                Find missing art
+              </button>
+              <button
+                onClick={() => { void handleBulkParse(); setShowToolsMenu(false); }}
+                disabled={!!bulkParse || tracks.length === 0}
+                className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-neutral-300 transition-colors hover:bg-[#1a1a1a] hover:text-white disabled:opacity-40"
+              >
+                <SplitSquareHorizontal size={12} />
+                Parse "Artist - Title" from filenames
+              </button>
+              <button
+                onClick={() => { void startBulkFetchTags(); setShowToolsMenu(false); }}
+                disabled={!!tagFetchProgress || tracks.length === 0}
+                className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-neutral-300 transition-colors hover:bg-[#1a1a1a] hover:text-white disabled:opacity-40"
+                title="Fetch genre tags from Last.fm"
+              >
+                <Tag size={12} />
+                Fetch genre tags (Last.fm)
+              </button>
+
+              <div className="mx-2 my-1 border-t border-[#222]" />
+              <div className="px-3 pb-1 pt-1 text-[10px] font-medium uppercase tracking-wider text-neutral-600">
+                View
+              </div>
+              <button
+                onClick={() => setNeedsFixOnly((v) => !v)}
+                className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-neutral-300 transition-colors hover:bg-[#1a1a1a] hover:text-white"
+              >
+                <AlertTriangle size={12} className={needsFixOnly ? "text-yellow-400" : ""} />
+                <span className="flex-1">Needs fix only ({fixCount})</span>
+                {needsFixOnly && <Check size={12} className="text-yellow-400" />}
+              </button>
+
+              <div className="mx-2 my-1 border-t border-[#222]" />
+              <div className="px-3 pb-1 pt-1 text-[10px] font-medium uppercase tracking-wider text-neutral-600">
+                Columns
+              </div>
               {(Object.keys(COLUMN_LABELS) as ColumnKey[]).map((key) => (
                 <label
                   key={key}
-                  className="flex cursor-pointer items-center gap-2 rounded px-2 py-1 text-xs text-neutral-300 hover:bg-[#1a1a1a]"
+                  className="flex cursor-pointer items-center gap-2 px-3 py-1 text-xs text-neutral-300 hover:bg-[#1a1a1a]"
                 >
                   <input
                     type="checkbox"
@@ -680,45 +710,70 @@ export function LibraryView() {
                   {COLUMN_LABELS[key]}
                 </label>
               ))}
+
+              <div className="mx-2 my-1 border-t border-[#222]" />
+              <button
+                onClick={() => { setShowFolders(true); setShowToolsMenu(false); }}
+                className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-neutral-300 transition-colors hover:bg-[#1a1a1a] hover:text-white"
+              >
+                <Folder size={12} />
+                <span className="flex-1">Manage folders ({folders.length})</span>
+                <ChevronRight size={12} className="text-neutral-600" />
+              </button>
             </div>
           )}
         </div>
-        <button
-          onClick={() => setShowPlaylists((v) => !v)}
-          className={`flex items-center gap-1.5 rounded px-3 py-2 text-xs ${
-            showPlaylists ? "bg-violet-600/20 text-violet-300 ring-1 ring-violet-500/40" : "bg-[#222] text-neutral-300 hover:bg-[#333]"
-          }`}
-        >
-          <ListMusic size={14} />
-          Playlists
-        </button>
-        <button
-          onClick={() => setShowFolders(!showFolders)}
-          className="rounded bg-[#222] px-3 py-2 text-xs text-neutral-300 hover:bg-[#333]"
-        >
-          Folders ({folders.length})
-        </button>
       </div>
 
-      {/* Folder management */}
+      {/* Folder management modal */}
       {showFolders && (
-        <div className="mx-6 flex flex-col gap-1 rounded border border-[#333] bg-[#111] p-3">
-          {folders.length === 0 ? (
-            <p className="text-xs text-neutral-500">No folders added. Click "Add Folder" to scan your music.</p>
-          ) : (
-            folders.map((f) => (
-              <div key={f} className="flex items-center justify-between rounded px-2 py-1 hover:bg-[#1a1a1a]">
-                <span className="truncate text-xs text-neutral-300">{f}</span>
-                <button onClick={() => { void removeFolder(f); }} className="ml-2 text-neutral-600 hover:text-red-400">
-                  <X size={12} />
-                </button>
-              </div>
-            ))
-          )}
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6">
+          <div className="w-full max-w-lg space-y-3 rounded-lg border border-[#333] bg-[#0a0a0a] p-4">
+            <div className="flex items-center justify-between">
+              <p className="text-sm font-medium text-white">Manage folders</p>
+              <button onClick={() => setShowFolders(false)} className="text-neutral-500 hover:text-white">
+                <X size={14} />
+              </button>
+            </div>
+            <div className="flex flex-col gap-1">
+              {folders.length === 0 ? (
+                <p className="rounded border border-dashed border-[#333] px-3 py-4 text-center text-xs text-neutral-500">
+                  No folders added yet. Add one to scan your music.
+                </p>
+              ) : (
+                folders.map((f) => (
+                  <div key={f} className="flex items-center justify-between rounded px-2 py-1 hover:bg-[#1a1a1a]">
+                    <span className="truncate text-xs text-neutral-300" title={f}>{f}</span>
+                    <button
+                      onClick={() => { void removeFolder(f); }}
+                      className="ml-2 text-neutral-600 hover:text-red-400"
+                      title="Remove folder"
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+            <div className="flex justify-end gap-2 pt-1">
+              <button
+                onClick={() => setShowFolders(false)}
+                className="rounded-md px-3 py-1.5 text-xs font-medium text-neutral-400 transition-colors hover:bg-[#222] hover:text-white"
+              >
+                Close
+              </button>
+              <button
+                onClick={handleAddFolder}
+                className="flex items-center gap-1 rounded-md bg-violet-600 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-violet-500"
+              >
+                <FolderPlus size={12} />
+                Add folder
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
-      {/* Tag filter bar — always show so Fetch Tags button is accessible */}
       {tracks.length > 0 && <TagFilterBar />}
 
       {/* Bulk selection bar */}
@@ -939,6 +994,16 @@ export function LibraryView() {
                       Artist
                       {sort.field === "artist" && (sort.dir === "asc" ? <ArrowUp size={10} /> : <ArrowDown size={10} />)}
                     </button>
+                    <button
+                      onClick={reshuffle}
+                      className={`flex items-center gap-1 text-[10px] uppercase tracking-wider transition-colors ${
+                        sort.field === "random" ? "text-violet-300" : "text-neutral-600 hover:text-neutral-400"
+                      }`}
+                      title={sort.field === "random" ? "Reshuffle" : "Random sort"}
+                    >
+                      <Dices size={11} />
+                      {sort.field === "random" ? "Reshuffle" : "Random"}
+                    </button>
                   </div>
                 </th>
                 {columns.artist && <SortHeader field="artist" label="Artist" className="pr-3" />}
@@ -1016,8 +1081,17 @@ export function LibraryView() {
                       </td>
                     )}
                     {columns.bitrate && (
-                      <td className="whitespace-nowrap py-2 pr-3 text-neutral-500">
-                        {track.bitrate_kbps > 0 ? `${track.bitrate_kbps} kbps` : "—"}
+                      <td
+                        className="whitespace-nowrap py-2 pr-3 text-neutral-500"
+                        title={
+                          track.bitrate_kbps > 0 && track.bitrate_estimated
+                            ? "Estimated from file size and duration; not read from audio headers"
+                            : undefined
+                        }
+                      >
+                        {track.bitrate_kbps > 0
+                          ? `${track.bitrate_kbps} kbps${track.bitrate_estimated ? " ?" : ""}`
+                          : "—"}
                       </td>
                     )}
                     {columns.added && (
@@ -1062,44 +1136,15 @@ export function LibraryView() {
                     )}
                     <td className="py-2 pr-3">
                       <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100">
-                        {!track.cover_art_base64 && (
-                          <button
-                            onClick={() => handleFindArt(track)}
-                            disabled={findingArtFor === track.path}
-                            className="flex h-6 w-6 items-center justify-center rounded text-neutral-600 transition-colors hover:text-white disabled:opacity-50"
-                            title="Find album art"
-                          >
-                            {findingArtFor === track.path ? (
-                              <Loader size={12} className="animate-spin" />
-                            ) : (
-                              <ImageIcon size={12} />
-                            )}
-                          </button>
-                        )}
-                        <button
-                          onClick={() => setEditing(track)}
-                          className="flex h-6 w-6 items-center justify-center rounded text-neutral-600 transition-colors hover:text-white"
-                          title="Auto-tag with MusicBrainz"
-                        >
-                          <Wand2 size={12} />
-                        </button>
-                        <button
-                          onClick={() => startManualEdit(track)}
-                          className="flex h-6 w-6 items-center justify-center rounded text-neutral-600 transition-colors hover:text-white"
-                          title="Edit metadata"
-                        >
-                          <Pencil size={12} />
-                        </button>
-                        {track.artist && (
-                          <button
-                            onClick={() => handleDiscoverSimilar(track)}
-                            className="flex h-6 w-6 items-center justify-center rounded text-neutral-600 transition-colors hover:text-violet-400"
-                            title="Discover similar tracks"
-                          >
-                            <Compass size={12} />
-                          </button>
-                        )}
                         <AddToPlaylistMenu trackPath={track.path} />
+                        <TrackActionsMenu
+                          track={track}
+                          isFindingArt={findingArtFor === track.path}
+                          onFindArt={() => handleFindArt(track)}
+                          onAutoTag={() => setEditing(track)}
+                          onEdit={() => startManualEdit(track)}
+                          onDiscoverSimilar={() => handleDiscoverSimilar(track)}
+                        />
                       </div>
                     </td>
                   </tr>
