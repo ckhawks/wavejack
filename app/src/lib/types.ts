@@ -29,6 +29,34 @@ export interface AppSettings {
   librarySort: string;
   /** Last active tab so we can restore on relaunch. */
   lastTab: string;
+  /** Spotify Web API client credentials (user-provided via Spotify Dev Dashboard). */
+  spotifyClientId: string;
+  spotifyClientSecret: string;
+}
+
+/** A single Spotify track as returned by the Web API (fields we care about). */
+export interface SpotifyTrack {
+  id: string;
+  name: string;
+  artists: string[];
+  album: string;
+  isrc: string | null;
+  duration_ms: number;
+}
+
+/** Metadata for a fetched Spotify playlist. */
+export interface SpotifyPlaylist {
+  id: string;
+  name: string;
+  owner: string;
+  playlist_url: string;
+  tracks: SpotifyTrack[];
+}
+
+/** Authenticated Spotify user — returned by login / auth-status. */
+export interface SpotifyUser {
+  id: string;
+  display_name: string;
 }
 
 /** Shape of the download-status event from Rust */

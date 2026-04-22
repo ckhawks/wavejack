@@ -1,8 +1,12 @@
 import { useState, useEffect } from "react";
-import { X, FolderOpen, CheckCircle, AlertCircle, Loader, Copy } from "lucide-react";
+import { X, FolderOpen, CheckCircle, AlertCircle, Loader, Copy, LogIn, LogOut } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useSettingsStore } from "../stores/settingsStore";
-import { ensureYtdlpReady, getRemoteInfo } from "../lib/commands";
+import {
+  ensureYtdlpReady, getRemoteInfo,
+  spotifyLogin, spotifyAuthStatus, spotifyLogout,
+} from "../lib/commands";
+import type { SpotifyUser } from "../lib/types";
 
 interface Props {
   onClose: () => void;
@@ -19,14 +23,43 @@ export function Settings({ onClose }: Props) {
   const [remoteToken, setRemoteToken] = useState("");
   const [remotePort, setRemotePort] = useState<number | null>(null);
   const [copied, setCopied] = useState(false);
+  const [spotifyClientId, setSpotifyClientId] = useState("");
+  const [spotifyClientSecret, setSpotifyClientSecret] = useState("");
+  const [spotifyUser, setSpotifyUser] = useState<SpotifyUser | null>(null);
+  const [spotifyBusy, setSpotifyBusy] = useState(false);
+  const [spotifyError, setSpotifyError] = useState<string | null>(null);
 
   // Sync local cobalt URL state when settings load
   useEffect(() => {
     if (loaded) {
       setCobaltUrl(settings.cobaltUrl);
       setLastfmKey(settings.lastfmApiKey);
+      setSpotifyClientId(settings.spotifyClientId);
+      setSpotifyClientSecret(settings.spotifyClientSecret);
     }
-  }, [loaded, settings.cobaltUrl, settings.lastfmApiKey]);
+  }, [loaded, settings.cobaltUrl, settings.lastfmApiKey, settings.spotifyClientId, settings.spotifyClientSecret]);
+
+  useEffect(() => {
+    spotifyAuthStatus().then(setSpotifyUser).catch(() => {});
+  }, []);
+
+  const doSpotifyLogin = async () => {
+    setSpotifyBusy(true);
+    setSpotifyError(null);
+    try {
+      const user = await spotifyLogin();
+      setSpotifyUser(user);
+    } catch (e) {
+      setSpotifyError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSpotifyBusy(false);
+    }
+  };
+
+  const doSpotifyLogout = async () => {
+    await spotifyLogout();
+    setSpotifyUser(null);
+  };
 
   useEffect(() => {
     getRemoteInfo()
@@ -193,6 +226,79 @@ export function Settings({ onClose }: Props) {
               <span className="font-mono">/player/volume/down</span>,{" "}
               <span className="font-mono">/player/play-pause</span>.
             </p>
+          </div>
+
+          {/* Spotify */}
+          <div>
+            <label className="mb-2 block text-sm font-medium text-neutral-400">
+              Spotify (for importing playlists)
+            </label>
+            <div className="space-y-2">
+              <input
+                type="text"
+                value={spotifyClientId}
+                onChange={(e) => setSpotifyClientId(e.target.value)}
+                onBlur={() => updateSetting("spotifyClientId", spotifyClientId)}
+                placeholder="Client ID"
+                className="w-full rounded-lg border border-[#333] bg-black px-4 py-2.5 text-sm text-white placeholder-neutral-600 outline-none transition-all duration-200 focus:border-[#555]"
+              />
+              <input
+                type="password"
+                value={spotifyClientSecret}
+                onChange={(e) => setSpotifyClientSecret(e.target.value)}
+                onBlur={() => updateSetting("spotifyClientSecret", spotifyClientSecret)}
+                placeholder="Client Secret"
+                className="w-full rounded-lg border border-[#333] bg-black px-4 py-2.5 text-sm text-white placeholder-neutral-600 outline-none transition-all duration-200 focus:border-[#555]"
+              />
+              <div className="flex items-center gap-3">
+                <div className="flex min-w-0 flex-1 items-center gap-2 rounded-lg border border-[#333] bg-black px-4 py-2.5 text-sm">
+                  {spotifyUser ? (
+                    <>
+                      <CheckCircle size={14} className="shrink-0 text-green-400" />
+                      <span className="truncate text-green-400">
+                        Connected as {spotifyUser.display_name || spotifyUser.id}
+                      </span>
+                    </>
+                  ) : spotifyBusy ? (
+                    <>
+                      <Loader size={14} className="shrink-0 animate-spin text-blue-400" />
+                      <span className="text-blue-400">Waiting for browser...</span>
+                    </>
+                  ) : (
+                    <span className="text-neutral-500">Not connected</span>
+                  )}
+                </div>
+                {spotifyUser ? (
+                  <button
+                    onClick={doSpotifyLogout}
+                    className="flex items-center gap-2 rounded-lg border border-[#333] px-4 py-2.5 text-sm text-neutral-400 transition-all duration-200 hover:border-[#555] hover:text-white"
+                  >
+                    <LogOut size={16} />
+                    Disconnect
+                  </button>
+                ) : (
+                  <button
+                    onClick={doSpotifyLogin}
+                    disabled={spotifyBusy || !spotifyClientId || !spotifyClientSecret}
+                    className="flex items-center gap-2 rounded-lg bg-white px-4 py-2.5 text-sm font-medium text-black transition-all duration-200 hover:bg-neutral-200 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    <LogIn size={16} />
+                    Connect
+                  </button>
+                )}
+              </div>
+              {spotifyError && (
+                <div className="flex items-center gap-2 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+                  <AlertCircle size={12} className="shrink-0" />
+                  {spotifyError}
+                </div>
+              )}
+              <p className="text-xs text-neutral-600">
+                Create an app at developer.spotify.com/dashboard and add{" "}
+                <span className="font-mono">http://127.0.0.1:8888/callback</span>{" "}
+                as the redirect URI.
+              </p>
+            </div>
           </div>
 
           {/* yt-dlp status */}

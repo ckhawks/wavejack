@@ -5,10 +5,14 @@ import { listen } from "@tauri-apps/api/event";
 import { useDownloadStore } from "../stores/downloadStore";
 import { useSettingsStore } from "../stores/settingsStore";
 import { usePlayerStore } from "../stores/playerStore";
-import { startDownload, extractPlaylist, extractAudio, searchSources, searchPreview, discoverKeep, discoverTrash } from "../lib/commands";
+import {
+  startDownload, extractPlaylist, extractAudio, searchSources, searchPreview,
+  discoverKeep, discoverTrash, spotifyFetchPlaylist,
+} from "../lib/commands";
 import { PlaylistPreview } from "./PlaylistPreview";
+import { SpotifyPlaylistPreview } from "./SpotifyPlaylistPreview";
 import { SearchResults, type PreviewState } from "./SearchResults";
-import type { PlaylistInfo, SearchResult, DownloadStatusEvent } from "../lib/types";
+import type { PlaylistInfo, SearchResult, DownloadStatusEvent, SpotifyPlaylist } from "../lib/types";
 
 function isUrl(input: string): boolean {
   const trimmed = input.trim();
@@ -24,10 +28,16 @@ function isPlaylistUrl(url: string): boolean {
   );
 }
 
+function isSpotifyPlaylistUrlClient(url: string): boolean {
+  return /(^https?:\/\/open\.spotify\.com\/playlist\/|^spotify:playlist:)/.test(url);
+}
+
 export function UrlInput() {
   const [url, setUrl] = useState("");
   const [extracting, setExtracting] = useState(false);
   const [playlist, setPlaylist] = useState<PlaylistInfo | null>(null);
+  const [spotifyPlaylist, setSpotifyPlaylist] = useState<SpotifyPlaylist | null>(null);
+  const [spotifyError, setSpotifyError] = useState<string | null>(null);
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [searching, setSearching] = useState(false);
   const [hasSearched, setHasSearched] = useState(false);
@@ -52,6 +62,24 @@ export function UrlInput() {
       // Clear any search results when switching to URL mode
       setSearchResults([]);
       setHasSearched(false);
+      setSpotifyError(null);
+
+      // Spotify playlists route through the Web API → Tidal pipeline,
+      // not yt-dlp. Branch first.
+      if (isSpotifyPlaylistUrlClient(trimmed)) {
+        setExtracting(true);
+        try {
+          const pl = await spotifyFetchPlaylist(trimmed);
+          setSpotifyPlaylist(pl);
+          setUrl("");
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          setSpotifyError(msg);
+        } finally {
+          setExtracting(false);
+        }
+        return;
+      }
 
       // Check if it's a playlist URL
       if (isPlaylistUrl(trimmed)) {
@@ -431,6 +459,20 @@ export function UrlInput() {
           format={format}
           onClose={() => setPlaylist(null)}
         />
+      )}
+
+      {/* Spotify playlist preview (routes through Tidal — matching in next step) */}
+      {spotifyPlaylist && (
+        <SpotifyPlaylistPreview
+          playlist={spotifyPlaylist}
+          onClose={() => setSpotifyPlaylist(null)}
+        />
+      )}
+
+      {spotifyError && (
+        <div className="mt-3 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-xs text-red-300">
+          Spotify fetch failed: {spotifyError}
+        </div>
       )}
 
       {/* Search results */}

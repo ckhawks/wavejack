@@ -32,3 +32,6 @@ rand = "0.9"
 axum = "0.7"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 lofty = "0.22"
+sha2 = "0.10"
+webbrowser = "1"
+url = "2"

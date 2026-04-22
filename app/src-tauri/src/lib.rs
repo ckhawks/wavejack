@@ -16,6 +16,7 @@ mod error;
 mod library;
 mod metadata;
 mod remote;
+mod spotify;
 mod tags;
 mod waveform;
 mod ytdlp;
@@ -180,6 +181,8 @@ async fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, AppErr
     let library_columns = get_store_value(&app, "libraryColumns").unwrap_or_default();
     let library_sort = get_store_value(&app, "librarySort").unwrap_or_default();
     let shuffle = get_store_value(&app, "shuffle").unwrap_or_else(|| "0".to_string());
+    let spotify_client_id = get_store_value(&app, "spotifyClientId").unwrap_or_default();
+    let spotify_client_secret = get_store_value(&app, "spotifyClientSecret").unwrap_or_default();
     Ok(serde_json::json!({
         "outputDir": output_dir,
         "musicDir": music_dir,
@@ -191,6 +194,8 @@ async fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, AppErr
         "libraryColumns": library_columns,
         "librarySort": library_sort,
         "shuffle": shuffle,
+        "spotifyClientId": spotify_client_id,
+        "spotifyClientSecret": spotify_client_secret,
     }))
 }
 
@@ -1627,6 +1632,41 @@ async fn fetch_channel_uploads(
 }
 
 // ========================================================================
+// ========================================================================
+// Spotify commands
+// ========================================================================
+
+#[tauri::command]
+async fn spotify_login(app: tauri::AppHandle) -> Result<spotify::SpotifyUser, AppError> {
+    spotify::spotify_login_cmd(app).await
+}
+
+#[tauri::command]
+async fn spotify_auth_status(
+    app: tauri::AppHandle,
+) -> Result<Option<spotify::SpotifyUser>, AppError> {
+    spotify::spotify_auth_status_cmd(app).await
+}
+
+#[tauri::command]
+async fn spotify_logout(app: tauri::AppHandle) -> Result<(), AppError> {
+    spotify::spotify_logout_cmd(app)
+}
+
+#[tauri::command]
+async fn spotify_fetch_playlist(
+    app: tauri::AppHandle,
+    url: String,
+) -> Result<spotify::SpotifyPlaylist, AppError> {
+    spotify::spotify_fetch_playlist_cmd(app, url).await
+}
+
+#[tauri::command]
+fn is_spotify_playlist_url(url: String) -> bool {
+    spotify::is_spotify_playlist_url(&url)
+}
+
+// ========================================================================
 // Helper functions
 // ========================================================================
 
@@ -1904,6 +1944,11 @@ pub fn run() {
             list_subscriptions,
             refresh_feed,
             get_feed,
+            spotify_login,
+            spotify_auth_status,
+            spotify_logout,
+            spotify_fetch_playlist,
+            is_spotify_playlist_url,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

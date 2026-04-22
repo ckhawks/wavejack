@@ -8,6 +8,8 @@ import type {
   Playlist,
   PlaylistInfo,
   SearchResult,
+  SpotifyPlaylist,
+  SpotifyUser,
   Subscription,
 } from "./types";
 
@@ -335,4 +337,31 @@ export async function refreshFeed(): Promise<void> {
 
 export async function getFeed(): Promise<FeedItem[]> {
   return invoke("get_feed");
+}
+
+// ======================== Spotify ========================
+
+/** Run the full PKCE login flow if needed, or return the cached user. Opens a browser. */
+export async function spotifyLogin(): Promise<SpotifyUser> {
+  return invoke("spotify_login");
+}
+
+/** Check cached auth state without launching the browser. Returns null if not authed. */
+export async function spotifyAuthStatus(): Promise<SpotifyUser | null> {
+  return invoke("spotify_auth_status");
+}
+
+/** Clear the cached Spotify token. */
+export async function spotifyLogout(): Promise<void> {
+  return invoke("spotify_logout");
+}
+
+/** Fetch a Spotify playlist's tracks (triggers login if not yet authed). */
+export async function spotifyFetchPlaylist(url: string): Promise<SpotifyPlaylist> {
+  return invoke("spotify_fetch_playlist", { url });
+}
+
+/** Cheap server-side check — used by UrlInput to branch before fetching. */
+export async function isSpotifyPlaylistUrl(url: string): Promise<boolean> {
+  return invoke("is_spotify_playlist_url", { url });
 }

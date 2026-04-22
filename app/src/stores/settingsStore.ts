@@ -20,6 +20,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     libraryColumns: "",
     librarySort: "",
     lastTab: "downloads",
+    spotifyClientId: "",
+    spotifyClientSecret: "",
   },
   loaded: false,
 
