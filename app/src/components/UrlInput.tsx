@@ -7,7 +7,7 @@ import { useSettingsStore } from "../stores/settingsStore";
 import { usePlayerStore } from "../stores/playerStore";
 import {
   startDownload, extractPlaylist, extractAudio, searchSources, searchPreview,
-  discoverKeep, discoverTrash, spotifyFetchPlaylist, formatErr,
+  discoverKeep, discoverTrash, spotifyFetchPlaylist, spotifyFetchTrack, formatErr,
 } from "../lib/commands";
 import { PlaylistPreview } from "./PlaylistPreview";
 import { SpotifyPlaylistPreview } from "./SpotifyPlaylistPreview";
@@ -30,6 +30,10 @@ function isPlaylistUrl(url: string): boolean {
 
 function isSpotifyPlaylistUrlClient(url: string): boolean {
   return /(^https?:\/\/open\.spotify\.com\/playlist\/|^spotify:playlist:)/.test(url);
+}
+
+function isSpotifyTrackUrlClient(url: string): boolean {
+  return /(^https?:\/\/open\.spotify\.com\/track\/|^spotify:track:)/.test(url);
 }
 
 export function UrlInput() {
@@ -64,12 +68,16 @@ export function UrlInput() {
       setHasSearched(false);
       setSpotifyError(null);
 
-      // Spotify playlists route through the Web API → Tidal pipeline,
-      // not yt-dlp. Branch first.
-      if (isSpotifyPlaylistUrlClient(trimmed)) {
+      // Spotify playlists and single tracks both route through the Web API
+      // → Tidal pipeline, not yt-dlp. The backend returns a 1-track synthetic
+      // playlist for track URLs so the preview UI is uniform.
+      if (isSpotifyPlaylistUrlClient(trimmed) || isSpotifyTrackUrlClient(trimmed)) {
+        const isTrack = isSpotifyTrackUrlClient(trimmed);
         setExtracting(true);
         try {
-          const pl = await spotifyFetchPlaylist(trimmed);
+          const pl = isTrack
+            ? await spotifyFetchTrack(trimmed)
+            : await spotifyFetchPlaylist(trimmed);
           setSpotifyPlaylist(pl);
           setUrl("");
         } catch (e) {

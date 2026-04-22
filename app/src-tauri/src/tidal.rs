@@ -661,8 +661,10 @@ pub async fn tidal_match_tracks_cmd(
             "match": &m,
         }));
         out.push(m);
-        // Light rate-limit — tidalapi's reference uses 150ms between hits.
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Rate-limit: ~3.3 tracks/sec. Each track can fire 1–3 Tidal API
+        // calls (openapi, v1 search, v1 detail), so actual request rate is
+        // up to ~10/sec peak — well under anything Tidal rate-limits.
+        tokio::time::sleep(Duration::from_millis(300)).await;
     }
     Ok(out)
 }

@@ -2,17 +2,28 @@
 export interface DownloadItem {
   id: string;
   url: string;
-  format: "mp4" | "mp3";
+  format: "mp4" | "mp3" | "flac";
   status: "pending" | "downloading" | "converting" | "complete" | "error" | "file_missing";
   progress: number;
   message: string;
-  backend: "ytdlp" | "cobalt" | "ffmpeg" | "none" | "";
+  backend: "ytdlp" | "cobalt" | "ffmpeg" | "tidal-dl-ng" | "none" | "";
   title?: string;
   artist?: string;
   album?: string;
   coverArtBase64?: string;
   filePath?: string;
   playlistTitle?: string;
+  /** Actual file extension (e.g. "flac", "m4a") — set by the post-download
+   *  enrichment event. Overrides the pre-set intent in `format` for display. */
+  audioFormat?: string;
+  /** Real bitrate read from the file's frame headers, kbps. 0 = unknown. */
+  bitrateKbps?: number;
+}
+
+export interface DownloadEnrichedEvent {
+  id: string;
+  audio_format: string;
+  bitrate_kbps: number;
 }
 
 /** App settings persisted via Tauri plugin-store */

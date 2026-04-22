@@ -194,9 +194,11 @@ export function DownloadItem({ item }: Props) {
               {item.playlistTitle}
             </span>
           )}
-          {/* Format badge */}
+          {/* Format badge — prefer the post-download ground truth when
+              available so "FLAC" doesn't lie about a track Tidal served as AAC. */}
           <span className="rounded bg-[#222] px-2 py-0.5 text-xs font-medium text-neutral-400">
-            {item.format.toUpperCase()}
+            {(item.audioFormat || item.format).toUpperCase()}
+            {item.bitrateKbps ? ` · ${item.bitrateKbps}k` : ""}
           </span>
           {/* Backend badge */}
           {item.backend && item.backend !== "none" && (

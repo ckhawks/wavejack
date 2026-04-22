@@ -19,6 +19,7 @@ mod remote;
 mod spotify;
 mod tags;
 mod tidal;
+mod tidal_download;
 mod waveform;
 mod ytdlp;
 
@@ -1663,8 +1664,21 @@ async fn spotify_fetch_playlist(
 }
 
 #[tauri::command]
+async fn spotify_fetch_track(
+    app: tauri::AppHandle,
+    url: String,
+) -> Result<spotify::SpotifyPlaylist, AppError> {
+    spotify::spotify_fetch_track_cmd(app, url).await
+}
+
+#[tauri::command]
 fn is_spotify_playlist_url(url: String) -> bool {
     spotify::is_spotify_playlist_url(&url)
+}
+
+#[tauri::command]
+fn is_spotify_track_url(url: String) -> bool {
+    spotify::is_spotify_track_url(&url)
 }
 
 // ========================================================================
@@ -1697,6 +1711,116 @@ async fn tidal_match_tracks(
     tracks: Vec<tidal::MatchInput>,
 ) -> Result<Vec<tidal::TidalMatch>, AppError> {
     tidal::tidal_match_tracks_cmd(app, tracks).await
+}
+
+/// A single Tidal match the frontend wants to download. Carries the display
+/// title/artist for pre-populating the DownloadQueue entry while tidal-dl-ng
+/// works on the file.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct TidalDownloadJob {
+    id: String,
+    tidal_url: String,
+    title: Option<String>,
+}
+
+#[tauri::command]
+async fn tidal_download_matched(
+    app: tauri::AppHandle,
+    jobs: Vec<TidalDownloadJob>,
+    destination: Option<String>,
+    playlist_title: Option<String>,
+) -> Result<(), AppError> {
+    let dest = destination.unwrap_or_else(|| "music".to_string());
+    let output_dir = match dest.as_str() {
+        "music" => get_store_value(&app, "musicDir")
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(default_music_dir),
+        _ => get_store_value(&app, "outputDir")
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(default_output_dir),
+    };
+
+    // Configure tidal-dl-ng once up front so the output dir + metadata/cover
+    // embed settings are right for every track in the batch.
+    let out_path = std::path::PathBuf::from(&output_dir);
+    tidal_download::configure_for_batch(&out_path).await?;
+
+    let pl_title = playlist_title.unwrap_or_default();
+
+    // Run each job sequentially in a background task so the command returns
+    // immediately — the UI tracks progress via "download-status" events.
+    tauri::async_runtime::spawn(async move {
+        for job in jobs {
+            let result = tidal_download::download_one(
+                &app,
+                &job.id,
+                &job.tidal_url,
+                &out_path,
+                job.title.as_deref(),
+            )
+            .await;
+
+            let db = app.state::<Database>();
+            let record = match result {
+                Ok(ref path) => DownloadRecord {
+                    id: job.id.clone(),
+                    url: job.tidal_url.clone(),
+                    format: "flac".into(),
+                    status: "complete".into(),
+                    title: job.title.clone().unwrap_or_default(),
+                    artist: String::new(),
+                    album: String::new(),
+                    cover_art_path: String::new(),
+                    file_path: path.to_string_lossy().to_string(),
+                    backend: "tidal-dl-ng".into(),
+                    message: "Download complete".into(),
+                    playlist_title: pl_title.clone(),
+                    created_at: database::now_timestamp(),
+                    cover_art_base64: String::new(),
+                },
+                Err(ref e) => DownloadRecord {
+                    id: job.id.clone(),
+                    url: job.tidal_url.clone(),
+                    format: "flac".into(),
+                    status: "error".into(),
+                    title: job.title.clone().unwrap_or_default(),
+                    artist: String::new(),
+                    album: String::new(),
+                    cover_art_path: String::new(),
+                    file_path: String::new(),
+                    backend: "tidal-dl-ng".into(),
+                    message: e.to_string(),
+                    playlist_title: pl_title.clone(),
+                    created_at: database::now_timestamp(),
+                    cover_art_base64: String::new(),
+                },
+            };
+            if let Err(e) = db.insert_or_update(&record) {
+                eprintln!("Failed to save tidal download record: {}", e);
+            }
+
+            // If this landed in a library folder, kick a rescan so the track
+            // shows up in the Library tab without manual refresh.
+            if let Ok(path) = result.as_ref() {
+                if let Ok(folders) = db.list_library_folders() {
+                    for folder in folders {
+                        if path.starts_with(&folder) {
+                            let dir = std::path::PathBuf::from(&folder);
+                            let app_inner = app.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let db = app_inner.state::<Database>();
+                                library::scan_folder_incremental(&dir, &db);
+                                let _ = app_inner.emit("library-updated", ());
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(())
 }
 
 // ========================================================================
@@ -1981,12 +2105,15 @@ pub fn run() {
             spotify_auth_status,
             spotify_logout,
             spotify_fetch_playlist,
+            spotify_fetch_track,
             is_spotify_playlist_url,
+            is_spotify_track_url,
             tidal_login_start,
             tidal_login_finish,
             tidal_auth_status,
             tidal_logout,
             tidal_match_tracks,
+            tidal_download_matched,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

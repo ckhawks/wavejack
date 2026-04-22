@@ -58,27 +58,34 @@ export function DownloadQueue() {
     (d) => d.status === "complete" || d.status === "error" || d.status === "file_missing"
   );
 
-  // Group items by playlist
-  const { groups, ungrouped } = (() => {
-    const groupMap = new Map<string, DLItem[]>();
-    const solo: DLItem[] = [];
+  // Walk downloads in insertion (chronological) order, but render each
+  // playlist group as one entry at the position of its first item so
+  // singles and groups interleave by when they were added.
+  type QueueEntry =
+    | { kind: "solo"; item: DLItem }
+    | { kind: "group"; group: PlaylistGroup };
 
+  const entries: QueueEntry[] = (() => {
+    const byTitle = new Map<string, DLItem[]>();
     for (const d of downloads) {
-      if (d.playlistTitle) {
-        const arr = groupMap.get(d.playlistTitle) || [];
-        arr.push(d);
-        groupMap.set(d.playlistTitle, arr);
-      } else {
-        solo.push(d);
+      if (!d.playlistTitle) continue;
+      const arr = byTitle.get(d.playlistTitle) || [];
+      arr.push(d);
+      byTitle.set(d.playlistTitle, arr);
+    }
+
+    const seen = new Set<string>();
+    const out: QueueEntry[] = [];
+    for (const d of downloads) {
+      if (!d.playlistTitle) {
+        out.push({ kind: "solo", item: d });
+        continue;
       }
+      if (seen.has(d.playlistTitle)) continue;
+      seen.add(d.playlistTitle);
+      out.push({ kind: "group", group: { title: d.playlistTitle, items: byTitle.get(d.playlistTitle)! } });
     }
-
-    const groups: PlaylistGroup[] = [];
-    for (const [title, items] of groupMap) {
-      groups.push({ title, items });
-    }
-
-    return { groups, ungrouped: solo };
+    return out;
   })();
 
   return (
@@ -102,25 +109,23 @@ export function DownloadQueue() {
 
       {downloads.length > 0 ? (
         <div className="flex-1 space-y-2 overflow-y-auto">
-          {/* Ungrouped items */}
           <AnimatePresence>
-            {ungrouped.map((item) => (
-              <motion.div
-                key={item.id}
-                initial={{ opacity: 0, y: -10 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, x: -20 }}
-                transition={{ duration: 0.2 }}
-              >
-                <DownloadItem item={item} />
-              </motion.div>
-            ))}
+            {entries.map((entry) =>
+              entry.kind === "solo" ? (
+                <motion.div
+                  key={entry.item.id}
+                  initial={{ opacity: 0, y: -10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, x: -20 }}
+                  transition={{ duration: 0.2 }}
+                >
+                  <DownloadItem item={entry.item} />
+                </motion.div>
+              ) : (
+                <CollapsibleGroup key={entry.group.title} group={entry.group} />
+              )
+            )}
           </AnimatePresence>
-
-          {/* Playlist groups */}
-          {groups.map((group) => (
-            <CollapsibleGroup key={group.title} group={group} />
-          ))}
         </div>
       ) : (
         <div className="flex flex-1 items-center justify-center">

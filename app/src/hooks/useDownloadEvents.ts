@@ -1,7 +1,7 @@
 import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useDownloadStore } from "../stores/downloadStore";
-import type { DownloadItem, DownloadStatusEvent } from "../lib/types";
+import type { DownloadItem, DownloadStatusEvent, DownloadEnrichedEvent } from "../lib/types";
 
 /**
  * Hook that listens to Tauri "download-status" events from the Rust backend
@@ -40,8 +40,20 @@ export function useDownloadEvents() {
       }
     );
 
+    const unlistenEnriched = listen<DownloadEnrichedEvent>(
+      "download-enriched",
+      (event) => {
+        const { id, audio_format, bitrate_kbps } = event.payload;
+        updateDownload(id, {
+          audioFormat: audio_format || undefined,
+          bitrateKbps: bitrate_kbps || undefined,
+        });
+      }
+    );
+
     return () => {
       unlisten.then((fn) => fn());
+      unlistenEnriched.then((fn) => fn());
     };
   }, [updateDownload]);
 }

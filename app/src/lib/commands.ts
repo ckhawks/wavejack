@@ -379,6 +379,12 @@ export async function spotifyFetchPlaylist(url: string): Promise<SpotifyPlaylist
   return invoke("spotify_fetch_playlist", { url });
 }
 
+/** Fetch a single Spotify track as a 1-track synthetic playlist — lets the
+ *  preview UI handle singletons identically to real playlists. */
+export async function spotifyFetchTrack(url: string): Promise<SpotifyPlaylist> {
+  return invoke("spotify_fetch_track", { url });
+}
+
 /** Cheap server-side check — used by UrlInput to branch before fetching. */
 export async function isSpotifyPlaylistUrl(url: string): Promise<boolean> {
   return invoke("is_spotify_playlist_url", { url });
@@ -410,4 +416,20 @@ export async function tidalLogout(): Promise<void> {
  *  fallback). Emits "tidal-match-progress" per track. */
 export async function tidalMatchTracks(tracks: TidalMatchInput[]): Promise<TidalMatch[]> {
   return invoke("tidal_match_tracks", { tracks });
+}
+
+export interface TidalDownloadJob {
+  id: string;
+  tidal_url: string;
+  title?: string;
+}
+
+/** Kick off a batch Tidal download via tidal-dl-ng. Returns immediately;
+ *  progress streams over "download-status" events. */
+export async function tidalDownloadMatched(
+  jobs: TidalDownloadJob[],
+  destination: "downloads" | "music",
+  playlistTitle?: string,
+): Promise<void> {
+  return invoke("tidal_download_matched", { jobs, destination, playlistTitle });
 }

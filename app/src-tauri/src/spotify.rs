@@ -402,6 +402,22 @@ fn parse_playlist_id(raw: &str) -> Option<String> {
     None
 }
 
+/// Same shape as `parse_playlist_id` but for single-track URLs.
+fn parse_track_id(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    for prefix in [
+        "https://open.spotify.com/track/",
+        "http://open.spotify.com/track/",
+        "spotify:track:",
+    ] {
+        if let Some(rest) = raw.strip_prefix(prefix) {
+            let id = rest.split(['?', '/']).next()?.to_string();
+            return (!id.is_empty()).then_some(id);
+        }
+    }
+    None
+}
+
 fn flatten_track(item: &serde_json::Value) -> Option<SpotifyTrack> {
     let t = item.get("track").unwrap_or(item);
     let id = t.get("id")?.as_str()?.to_string();
@@ -428,6 +444,37 @@ fn flatten_track(item: &serde_json::Value) -> Option<SpotifyTrack> {
             .filter(|s| !s.is_empty())
             .map(String::from),
         duration_ms: t.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+    })
+}
+
+/// Fetch a single Spotify track and wrap it in a synthetic 1-track playlist
+/// so the frontend's preview + match + download pipeline can consume it as-is.
+pub async fn fetch_track(app: &AppHandle, raw_url: &str) -> Result<SpotifyPlaylist, AppError> {
+    let id = parse_track_id(raw_url)
+        .ok_or_else(|| AppError::InvalidUrl(format!("Not a Spotify track URL: {}", raw_url)))?;
+
+    let token = ensure_token(app).await?;
+    let data = api_get(&token, &format!("{}/tracks/{}", API_BASE, id)).await?;
+    let track = flatten_track(&data)
+        .ok_or_else(|| AppError::Settings("Spotify /tracks/{id} returned unexpected shape".into()))?;
+
+    let playlist_url = data
+        .get("external_urls")
+        .and_then(|u| u.get("spotify"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(raw_url)
+        .to_string();
+
+    // Reuse the playlist shape so the frontend preview doesn't need a second
+    // codepath, but set `name` + `owner` to the track's own title + artist
+    // so the modal header reads naturally ("Track Title" / "Artist Name")
+    // instead of as a fake playlist.
+    Ok(SpotifyPlaylist {
+        id: format!("track:{}", track.id),
+        name: track.name.clone(),
+        owner: track.artists.join(", "),
+        playlist_url,
+        tracks: vec![track],
     })
 }
 
@@ -543,9 +590,21 @@ pub async fn spotify_fetch_playlist_cmd(
     fetch_playlist(&app, &url).await
 }
 
+pub async fn spotify_fetch_track_cmd(
+    app: AppHandle,
+    url: String,
+) -> Result<SpotifyPlaylist, AppError> {
+    fetch_track(&app, &url).await
+}
+
 /// Detect whether a URL looks like a Spotify playlist — used so the frontend
 /// can branch before invoking the full fetch command.
 pub fn is_spotify_playlist_url(url: &str) -> bool {
     (url.contains("spotify.com/playlist/") || url.starts_with("spotify:playlist:"))
         && parse_playlist_id(url).is_some()
+}
+
+pub fn is_spotify_track_url(url: &str) -> bool {
+    (url.contains("spotify.com/track/") || url.starts_with("spotify:track:"))
+        && parse_track_id(url).is_some()
 }
