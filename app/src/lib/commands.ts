@@ -1,4 +1,18 @@
 import { invoke } from "@tauri-apps/api/core";
+
+/** Tauri commands reject with a serialized AppError — `{kind, message}` — not
+ *  a real `Error`, so `String(e)` / `e.message` both give "[object Object]".
+ *  Use this to surface the actual message in the UI. */
+export function formatErr(e: unknown): string {
+  if (typeof e === "string") return e;
+  if (e instanceof Error) return e.message;
+  if (e && typeof e === "object") {
+    const o = e as { message?: unknown; kind?: unknown };
+    if (typeof o.message === "string" && o.message) return o.message;
+    try { return JSON.stringify(e); } catch { /* fall through */ }
+  }
+  return String(e);
+}
 import type {
   AppSettings,
   AppliedMetadata,
@@ -11,6 +25,10 @@ import type {
   SpotifyPlaylist,
   SpotifyUser,
   Subscription,
+  TidalDeviceAuth,
+  TidalMatch,
+  TidalMatchInput,
+  TidalUser,
 } from "./types";
 
 /** Start downloading a URL with the given format */
@@ -364,4 +382,32 @@ export async function spotifyFetchPlaylist(url: string): Promise<SpotifyPlaylist
 /** Cheap server-side check — used by UrlInput to branch before fetching. */
 export async function isSpotifyPlaylistUrl(url: string): Promise<boolean> {
   return invoke("is_spotify_playlist_url", { url });
+}
+
+// ======================== Tidal ========================
+
+/** Start the device-code OAuth flow. Opens a browser to the approval URL and
+ *  returns the URL/code so the UI can display them. */
+export async function tidalLoginStart(): Promise<TidalDeviceAuth> {
+  return invoke("tidal_login_start");
+}
+
+/** Poll Tidal until the user approves (or 5-min timeout). Must follow
+ *  tidalLoginStart in the same app session. */
+export async function tidalLoginFinish(): Promise<TidalUser> {
+  return invoke("tidal_login_finish");
+}
+
+export async function tidalAuthStatus(): Promise<TidalUser | null> {
+  return invoke("tidal_auth_status");
+}
+
+export async function tidalLogout(): Promise<void> {
+  return invoke("tidal_logout");
+}
+
+/** Resolve a batch of Spotify tracks to Tidal matches (ISRC first, fuzzy
+ *  fallback). Emits "tidal-match-progress" per track. */
+export async function tidalMatchTracks(tracks: TidalMatchInput[]): Promise<TidalMatch[]> {
+  return invoke("tidal_match_tracks", { tracks });
 }

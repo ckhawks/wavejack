@@ -3,10 +3,11 @@ import { X, FolderOpen, CheckCircle, AlertCircle, Loader, Copy, LogIn, LogOut } 
 import { open } from "@tauri-apps/plugin-dialog";
 import { useSettingsStore } from "../stores/settingsStore";
 import {
-  ensureYtdlpReady, getRemoteInfo,
+  ensureYtdlpReady, getRemoteInfo, formatErr,
   spotifyLogin, spotifyAuthStatus, spotifyLogout,
+  tidalLoginStart, tidalLoginFinish, tidalAuthStatus, tidalLogout,
 } from "../lib/commands";
-import type { SpotifyUser } from "../lib/types";
+import type { SpotifyUser, TidalUser, TidalDeviceAuth } from "../lib/types";
 
 interface Props {
   onClose: () => void;
@@ -28,6 +29,10 @@ export function Settings({ onClose }: Props) {
   const [spotifyUser, setSpotifyUser] = useState<SpotifyUser | null>(null);
   const [spotifyBusy, setSpotifyBusy] = useState(false);
   const [spotifyError, setSpotifyError] = useState<string | null>(null);
+  const [tidalUser, setTidalUser] = useState<TidalUser | null>(null);
+  const [tidalBusy, setTidalBusy] = useState(false);
+  const [tidalError, setTidalError] = useState<string | null>(null);
+  const [tidalPending, setTidalPending] = useState<TidalDeviceAuth | null>(null);
 
   // Sync local cobalt URL state when settings load
   useEffect(() => {
@@ -41,7 +46,31 @@ export function Settings({ onClose }: Props) {
 
   useEffect(() => {
     spotifyAuthStatus().then(setSpotifyUser).catch(() => {});
+    tidalAuthStatus().then(setTidalUser).catch(() => {});
   }, []);
+
+  const doTidalLogin = async () => {
+    setTidalBusy(true);
+    setTidalError(null);
+    setTidalPending(null);
+    try {
+      const pending = await tidalLoginStart();
+      setTidalPending(pending);
+      const user = await tidalLoginFinish();
+      setTidalUser(user);
+      setTidalPending(null);
+    } catch (e) {
+      setTidalError(formatErr(e));
+      setTidalPending(null);
+    } finally {
+      setTidalBusy(false);
+    }
+  };
+
+  const doTidalLogout = async () => {
+    await tidalLogout();
+    setTidalUser(null);
+  };
 
   const doSpotifyLogin = async () => {
     setSpotifyBusy(true);
@@ -50,7 +79,7 @@ export function Settings({ onClose }: Props) {
       const user = await spotifyLogin();
       setSpotifyUser(user);
     } catch (e) {
-      setSpotifyError(e instanceof Error ? e.message : String(e));
+      setSpotifyError(formatErr(e));
     } finally {
       setSpotifyBusy(false);
     }
@@ -299,6 +328,80 @@ export function Settings({ onClose }: Props) {
                 as the redirect URI.
               </p>
             </div>
+          </div>
+
+          {/* Tidal */}
+          <div>
+            <label className="mb-2 block text-sm font-medium text-neutral-400">
+              Tidal (for matching + downloading Spotify tracks)
+            </label>
+            <div className="flex items-center gap-3">
+              <div className="flex min-w-0 flex-1 items-center gap-2 rounded-lg border border-[#333] bg-black px-4 py-2.5 text-sm">
+                {tidalUser ? (
+                  <>
+                    <CheckCircle size={14} className="shrink-0 text-green-400" />
+                    <span className="truncate text-green-400">
+                      Connected (user {tidalUser.id} · {tidalUser.country_code})
+                    </span>
+                  </>
+                ) : tidalBusy ? (
+                  <>
+                    <Loader size={14} className="shrink-0 animate-spin text-blue-400" />
+                    <span className="text-blue-400">
+                      {tidalPending ? "Waiting for browser approval..." : "Starting..."}
+                    </span>
+                  </>
+                ) : (
+                  <span className="text-neutral-500">Not connected</span>
+                )}
+              </div>
+              {tidalUser ? (
+                <button
+                  onClick={doTidalLogout}
+                  className="flex items-center gap-2 rounded-lg border border-[#333] px-4 py-2.5 text-sm text-neutral-400 transition-all duration-200 hover:border-[#555] hover:text-white"
+                >
+                  <LogOut size={16} />
+                  Disconnect
+                </button>
+              ) : (
+                <button
+                  onClick={doTidalLogin}
+                  disabled={tidalBusy}
+                  className="flex items-center gap-2 rounded-lg bg-white px-4 py-2.5 text-sm font-medium text-black transition-all duration-200 hover:bg-neutral-200 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <LogIn size={16} />
+                  Connect
+                </button>
+              )}
+            </div>
+            {tidalPending && !tidalUser && (
+              <div className="mt-2 space-y-1 rounded-lg border border-blue-500/30 bg-blue-500/5 px-3 py-2 text-xs text-blue-200">
+                <div>
+                  If the browser didn't open, visit{" "}
+                  <a
+                    href={tidalPending.verification_url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="font-mono underline"
+                  >
+                    {tidalPending.verification_url}
+                  </a>
+                </div>
+                <div>
+                  and enter code <span className="font-mono font-semibold">{tidalPending.user_code}</span>.
+                </div>
+              </div>
+            )}
+            {tidalError && (
+              <div className="mt-2 flex items-center gap-2 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+                <AlertCircle size={12} className="shrink-0" />
+                {tidalError}
+              </div>
+            )}
+            <p className="mt-1.5 text-xs text-neutral-600">
+              Approves Wavejack for catalog search on your Tidal account. The{" "}
+              <span className="font-mono">tidal-dl-ng</span> CLI has its own separate login.
+            </p>
           </div>
 
           {/* yt-dlp status */}

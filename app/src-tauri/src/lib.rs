@@ -18,6 +18,7 @@ mod metadata;
 mod remote;
 mod spotify;
 mod tags;
+mod tidal;
 mod waveform;
 mod ytdlp;
 
@@ -1667,6 +1668,38 @@ fn is_spotify_playlist_url(url: String) -> bool {
 }
 
 // ========================================================================
+// Tidal commands
+// ========================================================================
+
+#[tauri::command]
+async fn tidal_login_start() -> Result<tidal::TidalDeviceAuth, AppError> {
+    tidal::tidal_login_start_cmd().await
+}
+
+#[tauri::command]
+async fn tidal_login_finish(app: tauri::AppHandle) -> Result<tidal::TidalUser, AppError> {
+    tidal::tidal_login_finish_cmd(app).await
+}
+
+#[tauri::command]
+fn tidal_auth_status(app: tauri::AppHandle) -> Option<tidal::TidalUser> {
+    tidal::tidal_auth_status_cmd(app)
+}
+
+#[tauri::command]
+fn tidal_logout(app: tauri::AppHandle) -> Result<(), AppError> {
+    tidal::tidal_logout_cmd(app)
+}
+
+#[tauri::command]
+async fn tidal_match_tracks(
+    app: tauri::AppHandle,
+    tracks: Vec<tidal::MatchInput>,
+) -> Result<Vec<tidal::TidalMatch>, AppError> {
+    tidal::tidal_match_tracks_cmd(app, tracks).await
+}
+
+// ========================================================================
 // Helper functions
 // ========================================================================
 
@@ -1949,6 +1982,11 @@ pub fn run() {
             spotify_logout,
             spotify_fetch_playlist,
             is_spotify_playlist_url,
+            tidal_login_start,
+            tidal_login_finish,
+            tidal_auth_status,
+            tidal_logout,
+            tidal_match_tracks,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -59,6 +59,50 @@ export interface SpotifyUser {
   display_name: string;
 }
 
+/** Pending Tidal device-code flow — the UI shows verification_url + user_code
+ *  while we poll for approval. */
+export interface TidalDeviceAuth {
+  verification_url: string;
+  user_code: string;
+  device_code: string;
+  expires_in: number;
+  interval: number;
+}
+
+export interface TidalUser {
+  id: number;
+  country_code: string;
+}
+
+/** Minimal Spotify track payload the Tidal matcher consumes. */
+export interface TidalMatchInput {
+  spotify_id: string;
+  name: string;
+  artists: string[];
+  isrc: string | null;
+  duration_ms: number;
+}
+
+export type TidalMatchStatus = "found_isrc" | "found_fuzzy" | "not_found" | "error";
+
+export interface TidalMatch {
+  spotify_id: string;
+  status: TidalMatchStatus;
+  tidal_id: number | null;
+  tidal_title: string | null;
+  tidal_artists: string[] | null;
+  tidal_quality: string | null;
+  tidal_url: string | null;
+  reason: string | null;
+}
+
+/** Payload of the "tidal-match-progress" Tauri event. */
+export interface TidalMatchProgress {
+  index: number;
+  total: number;
+  match: TidalMatch;
+}
+
 /** Shape of the download-status event from Rust */
 export interface DownloadStatusEvent {
   id: string;

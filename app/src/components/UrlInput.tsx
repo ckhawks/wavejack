@@ -7,7 +7,7 @@ import { useSettingsStore } from "../stores/settingsStore";
 import { usePlayerStore } from "../stores/playerStore";
 import {
   startDownload, extractPlaylist, extractAudio, searchSources, searchPreview,
-  discoverKeep, discoverTrash, spotifyFetchPlaylist,
+  discoverKeep, discoverTrash, spotifyFetchPlaylist, formatErr,
 } from "../lib/commands";
 import { PlaylistPreview } from "./PlaylistPreview";
 import { SpotifyPlaylistPreview } from "./SpotifyPlaylistPreview";
@@ -73,8 +73,7 @@ export function UrlInput() {
           setSpotifyPlaylist(pl);
           setUrl("");
         } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
-          setSpotifyError(msg);
+          setSpotifyError(formatErr(e));
         } finally {
           setExtracting(false);
         }
