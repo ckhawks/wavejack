@@ -1957,111 +1957,139 @@ pub fn run() {
         // Web Audio's MediaElementSource (used by the spectrogram) can read
         // their data. The default `asset:` protocol is treated as cross-origin
         // and silently zeroes analyser output.
-        .register_uri_scheme_protocol("wjaudio", |_app, request| {
-            use std::io::{Read, Seek, SeekFrom};
-            use tauri::http::{header, Response, StatusCode};
-
+        .register_asynchronous_uri_scheme_protocol("wjaudio", |_app, request, responder| {
             // wjaudio://localhost/<percent-encoded-absolute-path>
+            //
+            // We use the asynchronous protocol variant + spawn_blocking so the
+            // file read happens off the main thread. We also cap open-ended
+            // Range responses to CHUNK_BYTES so Chromium's <audio> element
+            // reaches HAVE_ENOUGH_DATA after the first partial response
+            // instead of waiting for the whole file. Chromium follows up with
+            // subsequent Range requests as playback progresses.
+            const CHUNK_BYTES: u64 = 1024 * 1024; // 1 MiB
+
             let uri = request.uri().to_string();
-            let after_host = uri
-                .splitn(2, "://")
-                .nth(1)
-                .and_then(|rest| rest.splitn(2, '/').nth(1))
-                .unwrap_or("");
-            let decoded = urlencoding::decode(after_host)
-                .map(|s| s.into_owned())
-                .unwrap_or_default();
-
-            let mime = match std::path::Path::new(&decoded)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase()
-                .as_str()
-            {
-                "mp3" => "audio/mpeg",
-                "flac" => "audio/flac",
-                "ogg" | "opus" => "audio/ogg",
-                "m4a" | "aac" => "audio/mp4",
-                "wav" => "audio/wav",
-                "webm" => "audio/webm",
-                _ => "application/octet-stream",
-            };
-
-            // Parse a single-range "Range: bytes=START-END" header (the only
-            // form Chromium uses for media seeks). Multi-range is rare here
-            // and we ignore it (return the whole file).
-            let range_header = request
+            let range_raw = request
                 .headers()
-                .get(header::RANGE)
+                .get(tauri::http::header::RANGE)
                 .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.strip_prefix("bytes="))
-                .and_then(|s| {
-                    let mut parts = s.splitn(2, '-');
-                    let start = parts.next()?.parse::<u64>().ok()?;
-                    let end = parts.next().and_then(|e| e.parse::<u64>().ok());
-                    Some((start, end))
-                });
+                .map(|s| s.to_string());
 
-            let mut file = match std::fs::File::open(&decoded) {
-                Ok(f) => f,
-                Err(e) => {
-                    return Response::builder()
-                        .status(StatusCode::NOT_FOUND)
-                        .body(format!("File not found: {} ({})", decoded, e).into_bytes())
-                        .unwrap();
+            tauri::async_runtime::spawn_blocking(move || {
+                use std::io::{Read, Seek, SeekFrom};
+                use tauri::http::{header, Response, StatusCode};
+
+                let after_host = uri
+                    .splitn(2, "://")
+                    .nth(1)
+                    .and_then(|rest| rest.splitn(2, '/').nth(1))
+                    .unwrap_or("");
+                let decoded = urlencoding::decode(after_host)
+                    .map(|s| s.into_owned())
+                    .unwrap_or_default();
+
+                let mime = match std::path::Path::new(&decoded)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "mp3" => "audio/mpeg",
+                    "flac" => "audio/flac",
+                    "ogg" | "opus" => "audio/ogg",
+                    "m4a" | "aac" => "audio/mp4",
+                    "wav" => "audio/wav",
+                    "webm" => "audio/webm",
+                    _ => "application/octet-stream",
+                };
+
+                // Parse a single "Range: bytes=START-END" header (the only
+                // form Chromium uses for media). `end` may be absent for
+                // open-ended ranges like `bytes=0-`.
+                let range_parsed = range_raw
+                    .as_deref()
+                    .and_then(|s| s.strip_prefix("bytes="))
+                    .and_then(|s| {
+                        let mut parts = s.splitn(2, '-');
+                        let start = parts.next()?.parse::<u64>().ok()?;
+                        let end = parts.next().and_then(|e| e.parse::<u64>().ok());
+                        Some((start, end))
+                    });
+
+                let mut file = match std::fs::File::open(&decoded) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        responder.respond(
+                            Response::builder()
+                                .status(StatusCode::NOT_FOUND)
+                                .body(format!("File not found: {} ({})", decoded, e).into_bytes())
+                                .unwrap(),
+                        );
+                        return;
+                    }
+                };
+                let total_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+
+                let common = |b: tauri::http::response::Builder| {
+                    b.header(header::CONTENT_TYPE, mime)
+                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET")
+                        .header(header::ACCEPT_RANGES, "bytes")
+                        .header(header::CACHE_CONTROL, "no-cache")
+                };
+
+                // Treat "no Range header" as an open-ended request starting
+                // at 0 so we always respond with 206 Partial Content and a
+                // capped chunk — this is what turns the whole-file stall
+                // into a progressive stream.
+                let (start, explicit_end) = range_parsed.unwrap_or((0, None));
+
+                if total_len == 0 || start >= total_len {
+                    responder.respond(
+                        common(Response::builder())
+                            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                            .header(header::CONTENT_RANGE, format!("bytes */{}", total_len))
+                            .body(Vec::new())
+                            .unwrap(),
+                    );
+                    return;
                 }
-            };
-            let total_len = file.metadata().map(|m| m.len()).unwrap_or(0);
 
-            let common = |b: tauri::http::response::Builder| {
-                b.header(header::CONTENT_TYPE, mime)
-                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                    .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET")
-                    .header(header::ACCEPT_RANGES, "bytes")
-                    .header(header::CACHE_CONTROL, "no-cache")
-            };
+                let last_byte = total_len - 1;
+                // Cap open-ended ranges. Honor explicit end values as-is so
+                // seeks for a specific region still return what was asked.
+                let end = match explicit_end {
+                    Some(e) => e.min(last_byte),
+                    None => (start + CHUNK_BYTES - 1).min(last_byte),
+                };
 
-            if let Some((start, end_opt)) = range_header {
-                let end = end_opt.unwrap_or(total_len.saturating_sub(1)).min(total_len.saturating_sub(1));
-                if start > end || start >= total_len {
-                    return common(Response::builder())
-                        .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                        .header(header::CONTENT_RANGE, format!("bytes */{}", total_len))
-                        .body(Vec::new())
-                        .unwrap();
-                }
                 let length = end - start + 1;
                 let mut buf = vec![0u8; length as usize];
                 if file.seek(SeekFrom::Start(start)).is_err()
                     || file.read_exact(&mut buf).is_err()
                 {
-                    return common(Response::builder())
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(b"read failed".to_vec())
-                        .unwrap();
+                    responder.respond(
+                        common(Response::builder())
+                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                            .body(b"read failed".to_vec())
+                            .unwrap(),
+                    );
+                    return;
                 }
-                return common(Response::builder())
-                    .status(StatusCode::PARTIAL_CONTENT)
-                    .header(header::CONTENT_RANGE, format!("bytes {}-{}/{}", start, end, total_len))
-                    .header(header::CONTENT_LENGTH, length.to_string())
-                    .body(buf)
-                    .unwrap();
-            }
 
-            // No Range header — return the whole file.
-            let mut bytes = Vec::with_capacity(total_len as usize);
-            if file.read_to_end(&mut bytes).is_err() {
-                return common(Response::builder())
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(b"read failed".to_vec())
-                    .unwrap();
-            }
-            common(Response::builder())
-                .status(StatusCode::OK)
-                .header(header::CONTENT_LENGTH, bytes.len().to_string())
-                .body(bytes)
-                .unwrap()
+                responder.respond(
+                    common(Response::builder())
+                        .status(StatusCode::PARTIAL_CONTENT)
+                        .header(
+                            header::CONTENT_RANGE,
+                            format!("bytes {}-{}/{}", start, end, total_len),
+                        )
+                        .header(header::CONTENT_LENGTH, length.to_string())
+                        .body(buf)
+                        .unwrap(),
+                );
+            });
         })
         // Register plugins:
         // - shell: for opening URLs in the system browser
