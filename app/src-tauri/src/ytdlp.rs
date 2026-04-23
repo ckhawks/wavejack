@@ -262,6 +262,13 @@ fn process_ytdlp_line(
 /// - `output_dir`: Where to save the downloaded file
 /// - `download_id`: Unique ID to tag progress events with
 /// - `app`: Tauri app handle for emitting events
+/// True for any soundcloud.com / api.soundcloud.com URL. Used to switch
+/// on original-download behavior (see `download_with_ytdlp`).
+pub fn is_soundcloud_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.contains("soundcloud.com") || lower.contains("snd.sc")
+}
+
 pub async fn download_with_ytdlp(
     ytdlp_path: &PathBuf,
     url: &str,
@@ -269,6 +276,7 @@ pub async fn download_with_ytdlp(
     output_dir: &str,
     download_id: &str,
     app: &AppHandle,
+    soundcloud_cookies_browser: Option<&str>,
 ) -> Result<DownloadResult, AppError> {
     // Build the yt-dlp command with the right arguments for the requested format
     let mut cmd = Command::new(ytdlp_path);
@@ -296,22 +304,41 @@ pub async fn download_with_ytdlp(
         .arg("--convert-thumbnails")
         .arg("jpg");
 
-    // Add format-specific arguments
-    match format {
-        "mp3" => {
-            // Extract audio only, convert to mp3 at highest quality
-            cmd.arg("-x") // Extract audio
-                .arg("--audio-format").arg("mp3")
-                .arg("--audio-quality").arg("0"); // 0 = best quality
+    // SoundCloud: prefer the uploader's original file (the "download"
+    // format) over the 128/160 kbps streams. Requires SC-account cookies
+    // to actually unlock the original; without cookies this falls back
+    // to bestaudio, matching prior behavior. We intentionally skip the
+    // mp3 re-encode so lossless originals (WAV/FLAC/AIFF) stay lossless.
+    let is_sc = is_soundcloud_url(url);
+    if is_sc {
+        cmd.arg("-f").arg("download/bestaudio/best");
+        if let Some(browser) = soundcloud_cookies_browser {
+            if !browser.is_empty() {
+                cmd.arg("--cookies-from-browser").arg(browser);
+            }
         }
-        _ => {
-            // Only select H.264+AAC streams — guarantees Premiere/editor compatibility.
-            // YouTube always has H.264; final fallback grabs best and yt-dlp will
-            // remux into mp4 container.
-            cmd.arg("-f")
-                .arg("bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*[vcodec^=avc1]+ba/bv*+ba/b")
-                .arg("--merge-output-format")
-                .arg("mp4");
+    } else {
+        match format {
+            "mp3" => {
+                // Prefer M4A (AAC) passthrough — YouTube's native audio stream,
+                // so no transcode and no generation loss. Rekordbox/Serato/iTunes
+                // read m4a natively. Fallback chain skips Opus/WebM (`.webm`
+                // isn't supported by most DJ software) by requiring an AAC-ish
+                // codec before the final bestaudio catch-all.
+                cmd.arg("-f")
+                    .arg("bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[ext=mp3]/bestaudio")
+                    .arg("--embed-thumbnail")
+                    .arg("--embed-metadata");
+            }
+            _ => {
+                // Only select H.264+AAC streams — guarantees Premiere/editor compatibility.
+                // YouTube always has H.264; final fallback grabs best and yt-dlp will
+                // remux into mp4 container.
+                cmd.arg("-f")
+                    .arg("bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*[vcodec^=avc1]+ba/bv*+ba/b")
+                    .arg("--merge-output-format")
+                    .arg("mp4");
+            }
         }
     }
 

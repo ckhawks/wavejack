@@ -164,3 +164,18 @@ Discover keeps go to `outputDir` only — should respect the new
 - **Spotify / Apple Music import**: paste a playlist URL, app fetches the
   track list and queues searches against YouTube/SoundCloud. Bulk fill a
   library folder from a Spotify playlist.
+- **Auto-fetch curated Spotify playlists into the feed**: periodically pull
+  Release Radar, Discover Weekly, and user-selected curator playlists
+  (e.g. Monstercat, mau5trap) and auto-populate the download/discover feed
+  so new music shows up without the user opening Spotify. Respect the
+  existing resolution chain (Tidal ISRC → yt-dlp fallback).
+- **Tidal previews for Discover / search results**: where we currently pull
+  a preview via yt-dlp YouTube search (Discover candidates, search-box
+  previews), prefer a Tidal ISRC lookup when the user is logged into Tidal.
+  Higher quality preview, avoids burning a YouTube request, and the preview
+  file is already the thing we'd download if they keep it.
+- **Source toggles on the search box**: checkboxes / pill buttons to enable
+  or disable YouTube / SoundCloud / Tidal / Spotify per query, so a search
+  for a rare bootleg doesn't also fire Tidal/Spotify calls (and vice versa
+  — "I know this is on Tidal, skip the YouTube results"). Persist the last
+  selection so power users don't re-toggle every time.

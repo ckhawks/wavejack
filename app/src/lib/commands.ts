@@ -118,9 +118,13 @@ export async function extractAudio(id: string, inputPath: string): Promise<strin
   return invoke("extract_audio", { id, inputPath });
 }
 
-/** Search YouTube and SoundCloud for tracks matching a query */
-export async function searchSources(query: string): Promise<SearchResult[]> {
-  return invoke("search_sources", { query });
+/** Search enabled sources for tracks matching a query.
+ *  `sources` = array of "youtube" / "soundcloud". Omit to search all. */
+export async function searchSources(
+  query: string,
+  sources?: string[],
+): Promise<SearchResult[]> {
+  return invoke("search_sources", { query, sources });
 }
 
 /** Download a search result to the preview directory for inline playback */

@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from "react";
-import { Download, Loader, Music, Video, FileAudio, FolderDown, Library, Search } from "lucide-react";
+import { Download, Loader, Music, Video, FileAudio, FolderDown, Library, Search, Youtube, Cloud, Waves, Disc } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import { useDownloadStore } from "../stores/downloadStore";
@@ -8,6 +8,7 @@ import { usePlayerStore } from "../stores/playerStore";
 import {
   startDownload, extractPlaylist, extractAudio, searchSources, searchPreview,
   discoverKeep, discoverTrash, spotifyFetchPlaylist, spotifyFetchTrack, formatErr,
+  tidalDownloadMatched, tidalAuthStatus, spotifyAuthStatus,
 } from "../lib/commands";
 import { PlaylistPreview } from "./PlaylistPreview";
 import { SpotifyPlaylistPreview } from "./SpotifyPlaylistPreview";
@@ -51,12 +52,56 @@ export function UrlInput() {
   previewsRef.current = previews;
   const format = useSettingsStore((s) => s.settings.format);
   const destination = useSettingsStore((s) => s.settings.lastDestination);
+  const searchSourcesEnabled = useSettingsStore((s) => s.settings.searchSourcesEnabled);
   const updateSetting = useSettingsStore((s) => s.updateSetting);
   const addDownload = useDownloadStore((s) => s.addDownload);
 
   const setFormat = (f: "mp4" | "mp3") => updateSetting("format", f);
   const setDestination = (d: "downloads" | "music") =>
     updateSetting("lastDestination", d);
+
+  const enabledSources: string[] = searchSourcesEnabled
+    ? searchSourcesEnabled.split(",").map((s) => s.trim()).filter(Boolean)
+    : [];
+  const toggleSource = (source: "youtube" | "soundcloud" | "tidal" | "spotify") => {
+    const has = enabledSources.includes(source);
+    const next = has
+      ? enabledSources.filter((s) => s !== source)
+      : [...enabledSources, source];
+    updateSetting("searchSourcesEnabled", next.join(","));
+  };
+
+  // Track which external services are logged in so we only show their
+  // pills when the user could actually get results. Tidal tokens are
+  // revoked by their side on a short schedule, so we also listen for
+  // `tidal-auth-expired` and refresh reactively after login events.
+  const [tidalAuthed, setTidalAuthed] = useState(false);
+  const [spotifyAuthed, setSpotifyAuthed] = useState(false);
+  const [tidalAuthExpired, setTidalAuthExpired] = useState(false);
+  useEffect(() => {
+    const refresh = () => {
+      tidalAuthStatus().then((u) => setTidalAuthed(u !== null)).catch(() => setTidalAuthed(false));
+      spotifyAuthStatus().then((u) => setSpotifyAuthed(u !== null)).catch(() => setSpotifyAuthed(false));
+    };
+    refresh();
+
+    const unExpired = listen("tidal-auth-expired", () => {
+      setTidalAuthed(false);
+      setTidalAuthExpired(true);
+    });
+    const unChanged = listen<boolean>("tidal-auth-changed", (e) => {
+      setTidalAuthed(e.payload === true);
+      if (e.payload === true) setTidalAuthExpired(false);
+    });
+    const unSpotifyChanged = listen<boolean>("spotify-auth-changed", (e) => {
+      setSpotifyAuthed(e.payload === true);
+    });
+    return () => {
+      unExpired.then((fn) => fn());
+      unChanged.then((fn) => fn());
+      unSpotifyChanged.then((fn) => fn());
+    };
+  }, []);
 
   const handleSubmit = async () => {
     const trimmed = url.trim();
@@ -115,7 +160,7 @@ export function UrlInput() {
     setSearching(true);
     setHasSearched(true);
     try {
-      const results = await searchSources(query);
+      const results = await searchSources(query, enabledSources);
       setSearchResults(results);
     } catch (e) {
       console.error("Search failed:", e);
@@ -264,8 +309,42 @@ export function UrlInput() {
     }
   }, []);
 
-  // Download a search result directly to the output dir (skip preview)
+  // Download a search result directly. Route by source:
+  //  - youtube / soundcloud → yt-dlp via `startDownload`
+  //  - tidal → tidal-dl-ng via `tidalDownloadMatched`
+  //  - spotify → open the Spotify single-track modal so the user can confirm
+  //    the Tidal match (may fall back to YouTube) before we kick off the
+  //    resolve+download pipeline.
   const handleDirectDownload = useCallback((result: SearchResult) => {
+    if (result.source === "tidal") {
+      const id = crypto.randomUUID();
+      addDownload({
+        id,
+        url: result.url,
+        format: "flac",
+        status: "pending",
+        progress: 0,
+        message: "Starting Tidal download...",
+        backend: "tidal-dl-ng",
+        title: result.title,
+      });
+      setSavedIds((prev) => new Set(prev).add(result.id));
+      tidalDownloadMatched(
+        [{ id, tidal_url: result.url, title: `${result.artist} - ${result.title}` }],
+        destination,
+      ).catch((e) => console.error("Failed to start Tidal download:", e));
+      return;
+    }
+
+    if (result.source === "spotify") {
+      // Open the existing Spotify single-track modal — the user confirms the
+      // Tidal match + download there. Mirrors what pasting a Spotify URL does.
+      spotifyFetchTrack(result.url)
+        .then((pl) => setSpotifyPlaylist(pl))
+        .catch((e) => setSpotifyError(formatErr(e)));
+      return;
+    }
+
     const id = crypto.randomUUID();
     addDownload({
       id,
@@ -353,7 +432,7 @@ export function UrlInput() {
           value={url}
           onChange={(e) => setUrl(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder="Search or paste a YouTube/SoundCloud URL..."
+          placeholder="Search or paste a Tidal / Spotify / YouTube / SoundCloud URL..."
           className="flex-1 rounded-lg border border-[#333] bg-[#111] px-4 py-3 text-sm text-white placeholder-neutral-500 outline-none transition-all duration-200 focus:border-[#555]"
           disabled={extracting || searching}
         />
@@ -370,7 +449,7 @@ export function UrlInput() {
           >
             <span className="flex items-center gap-1.5">
               <Music size={14} />
-              MP3
+              M4A
             </span>
           </button>
           <button
@@ -458,6 +537,84 @@ export function UrlInput() {
           )}
         </button>
       </div>
+
+      {/* Tidal auth expired — appears after a background refresh fails. */}
+      {tidalAuthExpired && (
+        <div className="mt-2 flex items-center justify-between rounded-lg border border-cyan-500/30 bg-cyan-500/5 px-3 py-2 text-xs text-cyan-200">
+          <span>
+            Tidal session expired. Re-authenticate in Settings → Tidal to keep using Tidal search &amp; downloads.
+          </span>
+          <button
+            onClick={() => setTidalAuthExpired(false)}
+            className="ml-3 text-cyan-300/70 hover:text-cyan-200"
+            title="Dismiss"
+          >
+            ×
+          </button>
+        </div>
+      )}
+
+      {/* Search source toggles (only affect search queries, not URL downloads) */}
+      {!inputIsUrl && (
+        <div className="mt-2 flex items-center gap-2 text-xs text-neutral-500">
+          <span>Search:</span>
+          {tidalAuthed && (
+            <button
+              onClick={() => toggleSource("tidal")}
+              className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 transition-colors ${
+                enabledSources.includes("tidal")
+                  ? "border-cyan-500/40 bg-cyan-500/10 text-cyan-200"
+                  : "border-[#333] bg-transparent text-neutral-500 hover:text-neutral-300"
+              }`}
+              title="Toggle Tidal as a search source (downloads via tidal-dl-ng, HI_RES_LOSSLESS FLAC)"
+            >
+              <Waves size={12} />
+              Tidal
+            </button>
+          )}
+          {spotifyAuthed && (
+            <button
+              onClick={() => toggleSource("spotify")}
+              className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 transition-colors ${
+                enabledSources.includes("spotify")
+                  ? "border-green-500/40 bg-green-500/10 text-green-200"
+                  : "border-[#333] bg-transparent text-neutral-500 hover:text-neutral-300"
+              }`}
+              title="Toggle Spotify as a search source (resolves via Tidal → YouTube)"
+            >
+              <Disc size={12} />
+              Spotify
+            </button>
+          )}
+          <button
+            onClick={() => toggleSource("youtube")}
+            className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 transition-colors ${
+              enabledSources.includes("youtube")
+                ? "border-red-500/40 bg-red-500/10 text-red-200"
+                : "border-[#333] bg-transparent text-neutral-500 hover:text-neutral-300"
+            }`}
+            title="Toggle YouTube as a search source"
+          >
+            <Youtube size={12} />
+            YouTube
+          </button>
+          <button
+            onClick={() => toggleSource("soundcloud")}
+            className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 transition-colors ${
+              enabledSources.includes("soundcloud")
+                ? "border-orange-500/40 bg-orange-500/10 text-orange-200"
+                : "border-[#333] bg-transparent text-neutral-500 hover:text-neutral-300"
+            }`}
+            title="Toggle SoundCloud as a search source"
+          >
+            <Cloud size={12} />
+            SoundCloud
+          </button>
+          {enabledSources.length === 0 && (
+            <span className="text-red-400/80">No sources selected — searches will return nothing.</span>
+          )}
+        </div>
+      )}
 
       {/* Playlist preview modal */}
       {playlist && (

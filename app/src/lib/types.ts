@@ -43,6 +43,12 @@ export interface AppSettings {
   /** Spotify Web API client credentials (user-provided via Spotify Dev Dashboard). */
   spotifyClientId: string;
   spotifyClientSecret: string;
+  /** Browser to extract SoundCloud cookies from (chrome|firefox|edge|brave|safari...).
+   *  Empty = no cookies → yt-dlp falls back to the 128/160 kbps SoundCloud stream
+   *  instead of the uploader's original file. Any free SC account is enough. */
+  soundcloudCookiesBrowser: string;
+  /** Comma-separated list of enabled search sources ("youtube,soundcloud"). */
+  searchSourcesEnabled: string;
 }
 
 /** A single Spotify track as returned by the Web API (fields we care about). */
@@ -220,14 +226,14 @@ export interface TagInfo {
   track_count: number;
 }
 
-/** A search result from YouTube or SoundCloud */
+/** A search result from any enabled source (YT / SC / Tidal / Spotify). */
 export interface SearchResult {
   id: string;
   title: string;
   artist: string;
   duration_secs: number;
   thumbnail_url: string;
-  source: "youtube" | "soundcloud";
+  source: "youtube" | "soundcloud" | "tidal" | "spotify";
   url: string;
 }
 

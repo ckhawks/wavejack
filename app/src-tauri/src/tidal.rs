@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 const AUTH_BASE: &str = "https://auth.tidal.com/v1/oauth2";
 const API_BASE: &str = "https://api.tidal.com/v1";
@@ -260,9 +260,23 @@ async fn ensure_token(app: &AppHandle) -> Result<CachedToken, AppError> {
     if !cached.expired() {
         return Ok(cached);
     }
-    let refreshed = refresh_token(&cached).await?;
-    save_cached_token(app, &refreshed)?;
-    Ok(refreshed)
+    match refresh_token(&cached).await {
+        Ok(refreshed) => {
+            save_cached_token(app, &refreshed)?;
+            Ok(refreshed)
+        }
+        Err(e) => {
+            // Tidal's TV client tokens get revoked on their schedule — when a
+            // refresh comes back 401 (`invalid_client` / `invalid_grant`) there
+            // is no recovery short of re-running the device-code flow. Drop the
+            // stale token so `tidal_auth_status` starts reporting logged-out,
+            // and signal the UI to prompt for re-auth.
+            eprintln!("[tidal] refresh failed, clearing cached token: {}", e);
+            let _ = clear_cached_token(app);
+            let _ = app.emit("tidal-auth-expired", ());
+            Err(e)
+        }
+    }
 }
 
 // ------- public types ------------------------------------------------------
@@ -283,6 +297,61 @@ pub struct TidalDeviceAuth {
     pub device_code: String,
     pub expires_in: u64,
     pub interval: u64,
+}
+
+/// Tidal catalog search for the URL/search box.
+///
+/// Returns an empty vec if the user isn't logged in (so callers can compose
+/// this with yt-dlp / SoundCloud searches without needing to pre-check auth).
+pub async fn search_for_box(
+    app: &AppHandle,
+    query: &str,
+    limit: u32,
+) -> Vec<crate::discover::SearchResult> {
+    eprintln!("[tidal] search_for_box(query={:?}, limit={})", query, limit);
+    let token = match ensure_token(app).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[tidal] search_for_box: ensure_token failed: {}", e);
+            return Vec::new();
+        }
+    };
+    eprintln!("[tidal] search_for_box: got token (country={})", token.country_code);
+    let tracks = match search_tracks(&token, query, limit).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[tidal] search_for_box: search_tracks failed: {}", e);
+            return Vec::new();
+        }
+    };
+    eprintln!("[tidal] search_for_box: got {} result(s)", tracks.len());
+    tracks
+        .into_iter()
+        .map(|t| {
+            let artist = t
+                .artists
+                .iter()
+                .map(|a| a.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let duration = t.duration.max(0) as u32;
+            let thumbnail_url = t
+                .album
+                .as_ref()
+                .and_then(|a| a.cover.as_deref())
+                .map(|uuid| tidal_cover_url(uuid, 160))
+                .unwrap_or_default();
+            crate::discover::SearchResult {
+                id: format!("tidal-{}", t.id),
+                title: t.title,
+                artist,
+                duration_secs: duration,
+                thumbnail_url,
+                source: "tidal".to_string(),
+                url: format!("https://tidal.com/browse/track/{}", t.id),
+            }
+        })
+        .collect()
 }
 
 /// Input for a match lookup — a trimmed Spotify track.
@@ -335,12 +404,30 @@ struct SearchTrack {
     isrc: Option<String>,
     #[serde(default)]
     artists: Vec<SearchArtist>,
+    #[serde(default)]
+    album: Option<SearchAlbum>,
 }
 
 #[derive(Debug, Deserialize)]
 struct SearchArtist {
     #[serde(default)]
     name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchAlbum {
+    /// UUID-with-dashes like "0b0e2f4a-8b3e-4c5c-9f76-01a2b3c4d5e6".
+    /// Resolve to an image URL via `tidal_cover_url`.
+    #[serde(default)]
+    cover: Option<String>,
+}
+
+/// Tidal cover art: the UUID in `album.cover` maps to
+/// `https://resources.tidal.com/images/<uuid-with-slashes>/<size>.jpg`.
+/// Available sizes: 80, 160, 320, 640, 1280. We pick 160 for search rows.
+fn tidal_cover_url(uuid: &str, size: u32) -> String {
+    let path = uuid.replace('-', "/");
+    format!("https://resources.tidal.com/images/{}/{}x{}.jpg", path, size, size)
 }
 
 #[derive(Debug, Deserialize)]
@@ -632,6 +719,7 @@ pub async fn tidal_login_finish_cmd(app: AppHandle) -> Result<TidalUser, AppErro
     let token = poll_for_token(&pending.device_code, pending.interval, pending.deadline).await?;
     let user = TidalUser { id: token.user_id, country_code: token.country_code.clone() };
     save_cached_token(&app, &token)?;
+    let _ = app.emit("tidal-auth-changed", true);
     Ok(user)
 }
 
@@ -640,7 +728,9 @@ pub fn tidal_auth_status_cmd(app: AppHandle) -> Option<TidalUser> {
 }
 
 pub fn tidal_logout_cmd(app: AppHandle) -> Result<(), AppError> {
-    clear_cached_token(&app)
+    clear_cached_token(&app)?;
+    let _ = app.emit("tidal-auth-changed", false);
+    Ok(())
 }
 
 pub async fn tidal_match_tracks_cmd(

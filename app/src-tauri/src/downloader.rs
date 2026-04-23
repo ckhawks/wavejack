@@ -35,6 +35,7 @@ pub async fn download(
     format: &str,
     output_dir: &str,
     cobalt_url: &str,
+    soundcloud_cookies_browser: Option<&str>,
 ) -> Result<DownloadResult, AppError> {
     // Step 1: Make sure yt-dlp is available (download if needed)
     let ytdlp_result = ensure_ytdlp(app).await;
@@ -43,7 +44,7 @@ pub async fn download(
     let ytdlp_error = match ytdlp_result {
         Ok(ytdlp_path) => {
             // We have yt-dlp, try using it
-            match download_with_ytdlp(&ytdlp_path, url, format, output_dir, download_id, app).await
+            match download_with_ytdlp(&ytdlp_path, url, format, output_dir, download_id, app, soundcloud_cookies_browser).await
             {
                 Ok(result) => return Ok(result), // Success! We're done.
                 Err(e) => {

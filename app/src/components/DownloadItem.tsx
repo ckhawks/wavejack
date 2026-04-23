@@ -63,6 +63,11 @@ export function DownloadItem({ item }: Props) {
   const isComplete = item.status === "complete" && item.filePath;
   const isFileMissing = item.status === "file_missing";
   const isMp3Complete = isComplete && item.format === "mp3";
+  // Formats HTML5 audio can play inline (everything but video containers).
+  // Prefer the post-download ground truth; fall back to the intent field.
+  const audioFmt = (item.audioFormat || item.format || "").toLowerCase();
+  const PLAYABLE_AUDIO = ["mp3", "flac", "m4a", "mp4a", "aac", "wav", "ogg", "opus"];
+  const isAudioPlayable = isComplete && PLAYABLE_AUDIO.includes(audioFmt);
 
   const [editing, setEditing] = useState(false);
   const [editTitle, setEditTitle] = useState("");
@@ -210,8 +215,8 @@ export function DownloadItem({ item }: Props) {
           {/* Actions for completed downloads */}
           {isComplete && !isFileMissing && (
             <>
-              {/* MP3: Play in-app; MP4: Open externally */}
-              {isMp3Complete ? (
+              {/* Audio (mp3/flac/m4a/...): Play in-app; video: Open externally */}
+              {isAudioPlayable ? (
                 <>
                   <button
                     onClick={handlePlay}

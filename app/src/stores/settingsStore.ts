@@ -22,6 +22,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     lastTab: "downloads",
     spotifyClientId: "",
     spotifyClientSecret: "",
+    soundcloudCookiesBrowser: "",
+    searchSourcesEnabled: "youtube,soundcloud",
   },
   loaded: false,
 

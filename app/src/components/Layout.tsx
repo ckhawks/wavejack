@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Settings as SettingsIcon, Minus, Square, X, Download, Radio, Library, Compass, Rss } from "lucide-react";
+import { Settings as SettingsIcon, Minus, Square, X, Download, Radio, Library, Compass, Rss, Home } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { UrlInput } from "./UrlInput";
 import { DownloadQueue } from "./DownloadQueue";
@@ -14,6 +14,7 @@ import { RoomView } from "./rooms/RoomView";
 import { LibraryView } from "./LibraryView";
 import { DiscoverView } from "./discover/DiscoverView";
 import { FeedView } from "./FeedView";
+import { HomeView } from "./HomeView";
 
 function WindowControls() {
   const appWindow = getCurrentWindow();
@@ -42,7 +43,7 @@ function WindowControls() {
   );
 }
 
-const VALID_TABS: Tab[] = ["downloads", "library", "discover", "feed", "rooms"];
+const VALID_TABS: Tab[] = ["home", "downloads", "library", "discover", "feed", "rooms"];
 
 export function Layout() {
   const [showSettings, setShowSettings] = useState(false);
@@ -73,6 +74,7 @@ export function Layout() {
   };
 
   const tabs: Array<{ id: Tab; label: string; icon: typeof Download }> = [
+    { id: "home", label: "Home", icon: Home },
     { id: "downloads", label: "Downloads", icon: Download },
     { id: "library", label: "Library", icon: Library },
     { id: "discover", label: "Discover", icon: Compass },
@@ -96,20 +98,24 @@ export function Layout() {
           </h1>
 
           {/* Tabs */}
-          <nav className="flex gap-1">
+          <nav className="flex items-center gap-1">
             {tabs.map(({ id, label, icon: Icon }) => (
-              <button
-                key={id}
-                onClick={() => switchTab(id)}
-                className={`flex items-center gap-1 rounded px-2 py-1 text-xs transition-colors ${
-                  activeTab === id
-                    ? "bg-[#222] text-white"
-                    : "text-neutral-500 hover:text-neutral-300"
-                }`}
-              >
-                <Icon size={12} />
-                {label}
-              </button>
+              <div key={id} className="flex items-center gap-1">
+                {id === "rooms" && (
+                  <div className="mx-1 h-4 w-px bg-[#333]" aria-hidden />
+                )}
+                <button
+                  onClick={() => switchTab(id)}
+                  className={`flex items-center gap-1 rounded px-2 py-1 text-xs transition-colors ${
+                    activeTab === id
+                      ? "bg-[#222] text-white"
+                      : "text-neutral-500 hover:text-neutral-300"
+                  }`}
+                >
+                  <Icon size={12} />
+                  {label}
+                </button>
+              </div>
             ))}
           </nav>
         </div>
@@ -126,7 +132,11 @@ export function Layout() {
 
       {/* Content area */}
       <div className="relative flex flex-1 flex-col overflow-hidden">
-        {activeTab === "downloads" ? (
+        {activeTab === "home" ? (
+          <main className={`flex flex-1 flex-col overflow-hidden ${hasPlayer ? "pb-36" : ""}`}>
+            <HomeView />
+          </main>
+        ) : activeTab === "downloads" ? (
           <main className={`flex flex-1 flex-col gap-6 overflow-hidden p-6 ${hasPlayer ? "pb-36" : ""}`}>
             <UrlInput />
             <DownloadQueue />

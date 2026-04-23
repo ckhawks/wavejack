@@ -21,7 +21,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_store::StoreExt;
 use tokio::sync::{oneshot, Mutex};
 use url::form_urlencoded;
@@ -348,6 +348,91 @@ pub struct SpotifyUser {
     pub display_name: String,
 }
 
+/// Return a cached + refreshed token without triggering the interactive login
+/// flow. Used by paths that should silently no-op when the user isn't authed.
+async fn try_valid_token(app: &AppHandle) -> Option<String> {
+    let cached = load_cached_token(app)?;
+    if !cached.expired() {
+        return Some(cached.access_token);
+    }
+    let (id, secret) = client_creds(app).ok()?;
+    match refresh_token(&id, &secret, &cached).await {
+        Ok(new) => {
+            let _ = save_cached_token(app, &new);
+            Some(new.access_token)
+        }
+        Err(_) => None,
+    }
+}
+
+/// Spotify catalog search for the URL/search box.
+///
+/// Returns an empty vec if the user isn't logged in or credentials aren't
+/// configured — callers compose this alongside other sources.
+pub async fn search_for_box(
+    app: &AppHandle,
+    query: &str,
+    limit: u32,
+) -> Vec<crate::discover::SearchResult> {
+    let Some(token) = try_valid_token(app).await else {
+        return Vec::new();
+    };
+    let url = format!(
+        "https://api.spotify.com/v1/search?q={}&type=track&limit={}",
+        urlencoding::encode(query),
+        limit,
+    );
+    let json = match api_get(&token, &url).await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[spotify] search_for_box failed: {}", e);
+            return Vec::new();
+        }
+    };
+    let items = json
+        .get("tracks")
+        .and_then(|t| t.get("items"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    items
+        .into_iter()
+        .filter_map(|item| {
+            let id = item.get("id")?.as_str()?.to_string();
+            let name = item.get("name")?.as_str()?.to_string();
+            let artists = item
+                .get("artists")
+                .and_then(|a| a.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|a| a.get("name")?.as_str().map(|s| s.to_string()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let duration_ms = item.get("duration_ms").and_then(|d| d.as_u64()).unwrap_or(0);
+            // Pick the smallest album image so the UI stays light.
+            let thumbnail_url = item
+                .get("album")
+                .and_then(|al| al.get("images"))
+                .and_then(|v| v.as_array())
+                .and_then(|imgs| imgs.last())
+                .and_then(|img| img.get("url")?.as_str().map(|s| s.to_string()))
+                .unwrap_or_default();
+            Some(crate::discover::SearchResult {
+                id: format!("spotify-{}", id),
+                title: name,
+                artist: artists,
+                duration_secs: (duration_ms / 1000) as u32,
+                thumbnail_url,
+                source: "spotify".to_string(),
+                url: format!("https://open.spotify.com/track/{}", id),
+            })
+        })
+        .collect()
+}
+
 // ------- API calls ---------------------------------------------------------
 
 async fn api_get(token: &str, url: &str) -> Result<serde_json::Value, AppError> {
@@ -540,6 +625,7 @@ pub async fn fetch_playlist(app: &AppHandle, raw_url: &str) -> Result<SpotifyPla
 pub async fn spotify_login_cmd(app: AppHandle) -> Result<SpotifyUser, AppError> {
     let token = ensure_token(&app).await?;
     let me = api_get(&token, &format!("{}/me", API_BASE)).await?;
+    let _ = app.emit("spotify-auth-changed", true);
     Ok(SpotifyUser {
         id: me.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         display_name: me
@@ -580,7 +666,9 @@ pub async fn spotify_auth_status_cmd(app: AppHandle) -> Result<Option<SpotifyUse
 }
 
 pub fn spotify_logout_cmd(app: AppHandle) -> Result<(), AppError> {
-    clear_cached_token(&app)
+    clear_cached_token(&app)?;
+    let _ = app.emit("spotify-auth-changed", false);
+    Ok(())
 }
 
 pub async fn spotify_fetch_playlist_cmd(

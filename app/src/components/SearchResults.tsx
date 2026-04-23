@@ -17,19 +17,25 @@ function formatDuration(secs: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-function SourceBadge({ source }: { source: "youtube" | "soundcloud" }) {
-  if (source === "youtube") {
-    return (
-      <span className="shrink-0 rounded bg-red-900/60 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-red-300">
-        YT
-      </span>
-    );
-  }
+function SourceBadge({ source }: { source: SearchResult["source"] }) {
+  const styles: Record<SearchResult["source"], { bg: string; text: string; label: string }> = {
+    youtube: { bg: "bg-red-900/60", text: "text-red-300", label: "YT" },
+    soundcloud: { bg: "bg-orange-900/60", text: "text-orange-300", label: "SC" },
+    tidal: { bg: "bg-cyan-900/60", text: "text-cyan-200", label: "TIDAL" },
+    spotify: { bg: "bg-green-900/60", text: "text-green-300", label: "SPOT" },
+  };
+  const s = styles[source];
   return (
-    <span className="shrink-0 rounded bg-orange-900/60 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-orange-300">
-      SC
+    <span className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase ${s.bg} ${s.text}`}>
+      {s.label}
     </span>
   );
+}
+
+function canPreviewSource(source: SearchResult["source"]): boolean {
+  // Preview currently shells out to yt-dlp. Tidal/Spotify results route
+  // through different backends and don't have a preview path yet.
+  return source === "youtube" || source === "soundcloud";
 }
 
 interface SearchResultsProps {
@@ -60,7 +66,7 @@ export function SearchResults({
     return (
       <div className="flex items-center gap-2 py-6 text-sm text-neutral-500">
         <Loader size={16} className="animate-spin" />
-        Searching YouTube and SoundCloud...
+        Searching...
       </div>
     );
   }
@@ -83,6 +89,7 @@ export function SearchResults({
         const isCurrentlyPlaying = currentTrackId === r.id && isPlaying;
         const isDownloading = preview?.status === "downloading";
         const isReady = preview?.status === "ready";
+        const previewable = canPreviewSource(r.source);
 
         return (
           <div
@@ -95,10 +102,16 @@ export function SearchResults({
           >
             {/* Play / Preview button (thumbnail area) */}
             <button
-              onClick={() => onPreview(r)}
-              disabled={isDownloading}
-              className="relative h-10 w-10 shrink-0 overflow-hidden rounded bg-[#222]"
-              title={isReady ? "Play" : "Preview"}
+              onClick={() => previewable && onPreview(r)}
+              disabled={isDownloading || !previewable}
+              className="relative h-10 w-10 shrink-0 overflow-hidden rounded bg-[#222] disabled:cursor-not-allowed"
+              title={
+                !previewable
+                  ? "Preview not available for this source — click download"
+                  : isReady
+                    ? "Play"
+                    : "Preview"
+              }
             >
               {r.thumbnail_url ? (
                 <img
@@ -152,14 +165,20 @@ export function SearchResults({
 
             {/* Preview button */}
             <button
-              onClick={() => onPreview(r)}
-              disabled={isDownloading}
+              onClick={() => previewable && onPreview(r)}
+              disabled={isDownloading || !previewable}
               className={`flex shrink-0 items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
                 isCurrentlyPlaying
                   ? "border-violet-500/50 text-violet-400 hover:border-violet-400"
                   : "border-[#333] text-neutral-400 hover:border-[#555] hover:text-white"
               }`}
-              title={isReady ? "Play" : "Preview"}
+              title={
+                !previewable
+                  ? "Preview not available for this source"
+                  : isReady
+                    ? "Play"
+                    : "Preview"
+              }
             >
               {isDownloading ? (
                 <Loader size={12} className="animate-spin" />

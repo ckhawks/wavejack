@@ -59,6 +59,8 @@ async fn start_download(
     };
     let cobalt_url = get_store_value(&app, "cobaltUrl")
         .unwrap_or_default();
+    let sc_cookies_browser = get_store_value(&app, "soundcloudCookiesBrowser")
+        .unwrap_or_default();
 
     let pl_title = playlist_title.unwrap_or_default();
     let output_dir_for_scan = output_dir.clone();
@@ -68,6 +70,7 @@ async fn start_download(
     // We use tauri::async_runtime::spawn so it runs independently.
     // This means start_download returns immediately while the download continues.
     tauri::async_runtime::spawn(async move {
+        let sc_opt = if sc_cookies_browser.is_empty() { None } else { Some(sc_cookies_browser.as_str()) };
         let result = downloader::download(
             &app,
             &id,
@@ -75,6 +78,7 @@ async fn start_download(
             &format,
             &output_dir,
             &cobalt_url,
+            sc_opt,
         )
         .await;
 
@@ -185,6 +189,11 @@ async fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, AppErr
     let shuffle = get_store_value(&app, "shuffle").unwrap_or_else(|| "0".to_string());
     let spotify_client_id = get_store_value(&app, "spotifyClientId").unwrap_or_default();
     let spotify_client_secret = get_store_value(&app, "spotifyClientSecret").unwrap_or_default();
+    let soundcloud_cookies_browser = get_store_value(&app, "soundcloudCookiesBrowser").unwrap_or_default();
+    // Comma-separated list of enabled search sources ("youtube,soundcloud").
+    // Missing key = default to both enabled.
+    let search_sources_enabled = get_store_value(&app, "searchSourcesEnabled")
+        .unwrap_or_else(|| "youtube,soundcloud".to_string());
     Ok(serde_json::json!({
         "outputDir": output_dir,
         "musicDir": music_dir,
@@ -198,6 +207,8 @@ async fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, AppErr
         "shuffle": shuffle,
         "spotifyClientId": spotify_client_id,
         "spotifyClientSecret": spotify_client_secret,
+        "soundcloudCookiesBrowser": soundcloud_cookies_browser,
+        "searchSourcesEnabled": search_sources_enabled,
     }))
 }
 
@@ -650,16 +661,31 @@ async fn extract_audio(app: tauri::AppHandle, id: String, input_path: String) ->
 ///
 /// Called from JS: invoke("search_sources", { query })
 #[tauri::command]
-async fn search_sources(query: String) -> Result<Vec<discover::SearchResult>, AppError> {
+async fn search_sources(
+    app: tauri::AppHandle,
+    query: String,
+    sources: Option<Vec<String>>,
+) -> Result<Vec<discover::SearchResult>, AppError> {
     let query = query.trim().to_string();
     if query.is_empty() {
         return Ok(Vec::new());
     }
 
+    // If `sources` is None, default to YT+SC (original behavior). Empty vec =
+    // explicit "none". Tidal/Spotify are opt-in and only run when requested.
+    let default_yt_sc = sources.is_none();
+    let want_yt = default_yt_sc || sources.as_ref().is_some_and(|s| s.iter().any(|x| x == "youtube"));
+    let want_sc = default_yt_sc || sources.as_ref().is_some_and(|s| s.iter().any(|x| x == "soundcloud"));
+    let want_tidal = sources.as_ref().is_some_and(|s| s.iter().any(|x| x == "tidal"));
+    let want_spotify = sources.as_ref().is_some_and(|s| s.iter().any(|x| x == "spotify"));
+
     let ytdlp_path = ytdlp::find_ytdlp();
 
-    // Run YouTube and SoundCloud searches in parallel
+    // Run all enabled sources in parallel
     let yt_fut = async {
+        if !want_yt {
+            return Vec::new();
+        }
         match ytdlp_path {
             Some(ref path) => discover::yt_search_tracks(path, &query, 5).await,
             None => Vec::new(),
@@ -667,6 +693,9 @@ async fn search_sources(query: String) -> Result<Vec<discover::SearchResult>, Ap
     };
 
     let sc_fut = async {
+        if !want_sc {
+            return Vec::new();
+        }
         let client_id = match discover::resolve_sc_client_id().await {
             Some(id) => id,
             None => return Vec::new(),
@@ -674,28 +703,54 @@ async fn search_sources(query: String) -> Result<Vec<discover::SearchResult>, Ap
         discover::sc_search_tracks(&client_id, &query, 5).await
     };
 
-    let (yt_results, sc_results) = tokio::join!(yt_fut, sc_fut);
-
-    // Merge results: YouTube first, then SoundCloud
-    let mut all = yt_results;
-    let yt_titles: std::collections::HashSet<String> = all
-        .iter()
-        .map(|r| normalize_for_dedup(&r.title))
-        .collect();
-
-    // Skip SC results whose normalized title is a substring match of a YT result
-    for sc in sc_results {
-        let norm = normalize_for_dedup(&sc.title);
-        let is_dupe = yt_titles.iter().any(|yt| {
-            yt.contains(&norm) || norm.contains(yt.as_str())
-        });
-        if !is_dupe {
-            all.push(sc);
+    let tidal_fut = async {
+        if !want_tidal {
+            return Vec::new();
         }
+        tidal::search_for_box(&app, &query, 5).await
+    };
+
+    let spotify_fut = async {
+        if !want_spotify {
+            return Vec::new();
+        }
+        spotify::search_for_box(&app, &query, 5).await
+    };
+
+    let (yt_results, sc_results, tidal_results, spotify_results) =
+        tokio::join!(yt_fut, sc_fut, tidal_fut, spotify_fut);
+
+    // Merge results: Tidal first (best quality when authed), then Spotify,
+    // then YouTube, then SoundCloud. Dedup on normalized title across sources.
+    let mut all: Vec<discover::SearchResult> = Vec::new();
+    let mut seen_titles: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let push_if_new = |r: discover::SearchResult,
+                            all: &mut Vec<discover::SearchResult>,
+                            seen: &mut std::collections::HashSet<String>| {
+        let norm = normalize_for_dedup(&r.title);
+        let is_dupe = seen.iter().any(|s| s.contains(&norm) || norm.contains(s.as_str()));
+        if !is_dupe {
+            seen.insert(norm);
+            all.push(r);
+        }
+    };
+
+    for r in tidal_results {
+        push_if_new(r, &mut all, &mut seen_titles);
+    }
+    for r in spotify_results {
+        push_if_new(r, &mut all, &mut seen_titles);
+    }
+    for r in yt_results {
+        push_if_new(r, &mut all, &mut seen_titles);
+    }
+    for r in sc_results {
+        push_if_new(r, &mut all, &mut seen_titles);
     }
 
     // Cap total results
-    all.truncate(10);
+    all.truncate(15);
     Ok(all)
 }
 
@@ -753,6 +808,8 @@ async fn search_preview(
             }
         };
 
+        let sc_cookies = get_store_value(&app, "soundcloudCookiesBrowser").unwrap_or_default();
+        let sc_cookies_opt = if sc_cookies.is_empty() { None } else { Some(sc_cookies.as_str()) };
         match ytdlp::download_with_ytdlp(
             &ytdlp_path,
             &url,
@@ -760,6 +817,7 @@ async fn search_preview(
             &output_dir,
             &id,
             &app,
+            sc_cookies_opt,
         )
         .await
         {
@@ -866,6 +924,8 @@ async fn discover_preview(
             }
         };
 
+        let sc_cookies = get_store_value(&app, "soundcloudCookiesBrowser").unwrap_or_default();
+        let sc_cookies_opt = if sc_cookies.is_empty() { None } else { Some(sc_cookies.as_str()) };
         match ytdlp::download_with_ytdlp(
             &ytdlp_path,
             &search_query,
@@ -873,6 +933,7 @@ async fn discover_preview(
             &output_dir,
             &id,
             &app,
+            sc_cookies_opt,
         )
         .await
         {

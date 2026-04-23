@@ -26,6 +26,7 @@ export function Settings({ onClose }: Props) {
   const [copied, setCopied] = useState(false);
   const [spotifyClientId, setSpotifyClientId] = useState("");
   const [spotifyClientSecret, setSpotifyClientSecret] = useState("");
+  const [scCookiesBrowser, setScCookiesBrowser] = useState("");
   const [spotifyUser, setSpotifyUser] = useState<SpotifyUser | null>(null);
   const [spotifyBusy, setSpotifyBusy] = useState(false);
   const [spotifyError, setSpotifyError] = useState<string | null>(null);
@@ -41,8 +42,9 @@ export function Settings({ onClose }: Props) {
       setLastfmKey(settings.lastfmApiKey);
       setSpotifyClientId(settings.spotifyClientId);
       setSpotifyClientSecret(settings.spotifyClientSecret);
+      setScCookiesBrowser(settings.soundcloudCookiesBrowser);
     }
-  }, [loaded, settings.cobaltUrl, settings.lastfmApiKey, settings.spotifyClientId, settings.spotifyClientSecret]);
+  }, [loaded, settings.cobaltUrl, settings.lastfmApiKey, settings.spotifyClientId, settings.spotifyClientSecret, settings.soundcloudCookiesBrowser]);
 
   useEffect(() => {
     spotifyAuthStatus().then(setSpotifyUser).catch(() => {});
@@ -225,6 +227,35 @@ export function Settings({ onClose }: Props) {
             />
             <p className="mt-1.5 text-xs text-neutral-600">
               Free API key from last.fm/api/account/create. Powers the Discover tab.
+            </p>
+          </div>
+
+          {/* SoundCloud original-download cookies */}
+          <div>
+            <label className="mb-2 block text-sm font-medium text-neutral-400">
+              SoundCloud cookies browser (for original file downloads)
+            </label>
+            <select
+              value={scCookiesBrowser}
+              onChange={(e) => {
+                setScCookiesBrowser(e.target.value);
+                updateSetting("soundcloudCookiesBrowser", e.target.value);
+              }}
+              className="w-full rounded-lg border border-[#333] bg-black px-4 py-2.5 text-sm text-white outline-none transition-all duration-200 focus:border-[#555]"
+            >
+              <option value="">None (use 128/160 kbps stream)</option>
+              <option value="chrome">Chrome</option>
+              <option value="firefox">Firefox</option>
+              <option value="edge">Edge</option>
+              <option value="brave">Brave</option>
+              <option value="safari">Safari</option>
+              <option value="opera">Opera</option>
+              <option value="vivaldi">Vivaldi</option>
+            </select>
+            <p className="mt-1.5 text-xs text-neutral-600">
+              Pulls SoundCloud cookies from your browser so yt-dlp can grab the
+              uploader's original file (often WAV/FLAC/320 MP3) when they enabled
+              the download button. Any free SC account is enough — no Go+ required.
             </p>
           </div>
 
