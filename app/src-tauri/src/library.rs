@@ -154,9 +154,43 @@ fn is_audio_file(path: &Path) -> bool {
     )
 }
 
+/// Shell out to ffprobe for duration + bitrate when lofty can't read them.
+/// Needed for containers lofty doesn't grok — notably FLAC-in-MP4 (what
+/// tidal-dl-ng produces for HI_RES_LOSSLESS tracks, `.m4a` extension but a
+/// FLAC stream inside a QuickTime container). Returns (duration_secs,
+/// bitrate_kbps); zeros mean ffprobe couldn't parse either.
+fn ffprobe_duration_bitrate(path: &Path) -> (u32, u32) {
+    let Some(ffprobe) = which::which("ffprobe").ok() else {
+        return (0, 0);
+    };
+    let output = std::process::Command::new(ffprobe)
+        .args([
+            "-v", "error",
+            "-show_entries", "format=duration,bit_rate",
+            "-of", "default=nw=1:nk=1",
+        ])
+        .arg(path)
+        .output();
+    let Ok(out) = output else { return (0, 0) };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = text.lines();
+    let duration_secs = lines
+        .next()
+        .and_then(|l| l.trim().parse::<f64>().ok())
+        .map(|f| f as u32)
+        .unwrap_or(0);
+    let bitrate_kbps = lines
+        .next()
+        .and_then(|l| l.trim().parse::<u64>().ok())
+        .map(|b| (b / 1000) as u32)
+        .unwrap_or(0);
+    (duration_secs, bitrate_kbps)
+}
+
 /// Read metadata and (separately) raw cover art bytes for DB storage.
 /// Uses lofty for format-agnostic parsing (MP3/FLAC/OGG/M4A/...) and to read
 /// the actual encoded bitrate from frame headers instead of approximating.
+/// Falls back to ffprobe for containers lofty can't parse.
 fn read_track_metadata(path: &Path) -> Option<(LibraryTrack, Option<Vec<u8>>)> {
     let filename = path.file_name()?.to_string_lossy().to_string();
     let path_str = path.to_string_lossy().to_string();
@@ -164,8 +198,16 @@ fn read_track_metadata(path: &Path) -> Option<(LibraryTrack, Option<Vec<u8>>)> {
     if let Ok(probe) = Probe::open(path) {
         if let Ok(tagged) = probe.read() {
             let props = tagged.properties();
-            let duration_secs = props.duration().as_secs() as u32;
-            let bitrate_kbps = props.audio_bitrate().unwrap_or(0);
+            let mut duration_secs = props.duration().as_secs() as u32;
+            let mut bitrate_kbps = props.audio_bitrate().unwrap_or(0);
+            // FLAC-in-MP4 and a few other containers return 0/0 from lofty
+            // even though tags read fine. Fill the gap with ffprobe so the
+            // library table doesn't just show dashes.
+            if duration_secs == 0 || bitrate_kbps == 0 {
+                let (d, b) = ffprobe_duration_bitrate(path);
+                if duration_secs == 0 { duration_secs = d; }
+                if bitrate_kbps == 0 { bitrate_kbps = b; }
+            }
 
             let (title, artist, album, cover_bytes) = if let Some(tag) = tagged
                 .primary_tag()
@@ -206,6 +248,9 @@ fn read_track_metadata(path: &Path) -> Option<(LibraryTrack, Option<Vec<u8>>)> {
         }
     }
 
+    // lofty rejected the file entirely — still try ffprobe so we at least
+    // surface duration + bitrate in the library table.
+    let (duration_secs, bitrate_kbps) = ffprobe_duration_bitrate(path);
     Some((
         LibraryTrack {
             path: path_str,
@@ -213,10 +258,10 @@ fn read_track_metadata(path: &Path) -> Option<(LibraryTrack, Option<Vec<u8>>)> {
             title: stem_from_filename(&filename),
             artist: String::new(),
             album: String::new(),
-            duration_secs: 0,
+            duration_secs,
             cover_art_base64: String::new(),
             first_scanned_at: 0,
-            bitrate_kbps: 0,
+            bitrate_kbps,
             bitrate_estimated: false,
             play_count: 0,
             last_played_at: 0,

@@ -10,6 +10,7 @@
 // 127.0.0.1:8888 catches the OAuth redirect. Tokens (access + refresh) are
 // cached at {app_data_dir}/spotify_token.json and auto-refresh when expired.
 
+use crate::auth_cache;
 use crate::error::AppError;
 use axum::{extract::{Query, State}, response::Html, routing::get, Router};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -18,13 +19,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 use tauri_plugin_store::StoreExt;
 use tokio::sync::{oneshot, Mutex};
 use url::form_urlencoded;
+
+const TOKEN_FILE: &str = "spotify_token.json";
 
 const AUTH_URL: &str = "https://accounts.spotify.com/authorize";
 const TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
@@ -54,30 +56,16 @@ fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-fn token_path(app: &AppHandle) -> Result<PathBuf, AppError> {
-    let dir = app.path().app_data_dir().map_err(|e| AppError::Settings(e.to_string()))?;
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir.join("spotify_token.json"))
-}
-
 fn load_cached_token(app: &AppHandle) -> Option<CachedToken> {
-    let path = token_path(app).ok()?;
-    let data = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&data).ok()
+    auth_cache::load(app, TOKEN_FILE)
 }
 
 fn save_cached_token(app: &AppHandle, token: &CachedToken) -> Result<(), AppError> {
-    let path = token_path(app)?;
-    std::fs::write(path, serde_json::to_string(token).map_err(|e| AppError::Settings(e.to_string()))?)?;
-    Ok(())
+    auth_cache::save(app, TOKEN_FILE, token)
 }
 
 fn clear_cached_token(app: &AppHandle) -> Result<(), AppError> {
-    let path = token_path(app)?;
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
-    Ok(())
+    auth_cache::clear(app, TOKEN_FILE)
 }
 
 // ------- PKCE helpers ------------------------------------------------------

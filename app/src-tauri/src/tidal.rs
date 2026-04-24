@@ -11,12 +11,14 @@
 // The user approves Wavejack at tidal.com/authorize in their browser, then we
 // poll the token endpoint until approval lands.
 
+use crate::auth_cache;
 use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
+
+const TOKEN_FILE: &str = "tidal_token.json";
 
 const AUTH_BASE: &str = "https://auth.tidal.com/v1/oauth2";
 const API_BASE: &str = "https://api.tidal.com/v1";
@@ -29,7 +31,17 @@ const CLIENT_SECRET: &str = "VJKhDFqJPqvsPVNBV6ukXTJmwlvbttP7wlMlrc72se4=";
 // OAuth2 scope strings are space-separated per RFC; reqwest form-encodes spaces
 // to `+` on the wire, so this is the correct source form.
 const SCOPE: &str = "r_usr w_usr w_sub";
-const DURATION_TOLERANCE_SEC: i64 = 3;
+// ±5s covers the typical drift between Spotify's metadata duration and the
+// duration baked into Tidal masters. Tighter values produced false negatives
+// on tracks where one source rounded a fade-out differently.
+const DURATION_TOLERANCE_SEC: i64 = 5;
+
+/// ISRCs are 12 chars, all alphanumeric ASCII (CC-XXX-YY-NNNNN with the
+/// dashes stripped). Anything else burns API quota and risks rate-limit
+/// pressure on the shared "TV" client credentials.
+fn is_valid_isrc(s: &str) -> bool {
+    s.len() == 12 && s.chars().all(|c| c.is_ascii_alphanumeric())
+}
 
 // ------- persisted token ---------------------------------------------------
 
@@ -52,33 +64,16 @@ fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-fn token_path(app: &AppHandle) -> Result<PathBuf, AppError> {
-    let dir = app.path().app_data_dir().map_err(|e| AppError::Settings(e.to_string()))?;
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir.join("tidal_token.json"))
-}
-
 fn load_cached_token(app: &AppHandle) -> Option<CachedToken> {
-    let path = token_path(app).ok()?;
-    let data = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&data).ok()
+    auth_cache::load(app, TOKEN_FILE)
 }
 
 fn save_cached_token(app: &AppHandle, token: &CachedToken) -> Result<(), AppError> {
-    let path = token_path(app)?;
-    std::fs::write(
-        path,
-        serde_json::to_string(token).map_err(|e| AppError::Settings(e.to_string()))?,
-    )?;
-    Ok(())
+    auth_cache::save(app, TOKEN_FILE, token)
 }
 
 fn clear_cached_token(app: &AppHandle) -> Result<(), AppError> {
-    let path = token_path(app)?;
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
-    Ok(())
+    auth_cache::clear(app, TOKEN_FILE)
 }
 
 // ------- device-code flow --------------------------------------------------
@@ -253,12 +248,25 @@ async fn refresh_token(cached: &CachedToken) -> Result<CachedToken, AppError> {
     })
 }
 
+// Serialize concurrent refresh attempts. Without this, two parallel callers
+// can both observe the cached token as expired, both POST the same
+// refresh_token, and the slower one comes back invalid_grant — Tidal
+// invalidates the old refresh_token as soon as a new pair is issued.
+static REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn ensure_token(app: &AppHandle) -> Result<CachedToken, AppError> {
     let Some(cached) = load_cached_token(app) else {
         return Err(AppError::Settings("Not logged in to Tidal".into()));
     };
     if !cached.expired() {
         return Ok(cached);
+    }
+    let _guard = REFRESH_LOCK.lock().await;
+    // Re-check after acquiring the lock — a peer may have refreshed already.
+    if let Some(reread) = load_cached_token(app) {
+        if !reread.expired() {
+            return Ok(reread);
+        }
     }
     match refresh_token(&cached).await {
         Ok(refreshed) => {
@@ -398,8 +406,8 @@ struct SearchTrack {
     duration: i64,
     #[serde(default, rename = "audioQuality")]
     audio_quality: Option<String>,
-    // Populated by the byisrc endpoint; stripped by generic search. Kept so we
-    // can surface it if a later Tidal API revision starts including it.
+    // Populated by /tracks/{id} (v1 detail endpoint); generic search responses
+    // omit it. Used to verify ISRC fallback search hits.
     #[serde(default)]
     isrc: Option<String>,
     #[serde(default)]
@@ -602,7 +610,7 @@ async fn match_one(token: &CachedToken, input: &MatchInput) -> TidalMatch {
 
     // ISRC path: try the modern openapi endpoint first; on any failure or
     // empty result, fall through to v1 search + detail verification.
-    if let Some(isrc) = input.isrc.as_ref().filter(|s| !s.is_empty()) {
+    if let Some(isrc) = input.isrc.as_ref().filter(|s| is_valid_isrc(s)) {
         match isrc_via_openapi(token, isrc).await {
             Ok(Some(id)) => {
                 // openapi gave us an ID but not full track info; fetch details

@@ -42,11 +42,54 @@ interface PlayerStore {
   loadVolume: () => Promise<void>;
 }
 
-function getAdjacentMp3s(): string[] {
+function downloadQueueIds(): string[] {
   const downloads = useDownloadStore.getState().downloads;
   return downloads
     .filter((d) => d.status === "complete" && d.format === "mp3" && d.filePath)
     .map((d) => d.id);
+}
+
+function trackFromDownloadId(id: string): PlayerTrack | null {
+  const dl = useDownloadStore.getState().downloads.find((d) => d.id === id);
+  if (!dl?.filePath) return null;
+  return {
+    id: dl.id,
+    title: dl.title || "Unknown",
+    artist: dl.artist,
+    filePath: dl.filePath,
+    coverArtBase64: dl.coverArtBase64,
+  };
+}
+
+/** Resolve the next/previous track relative to `current`. `direction` = +1
+ *  for forward, -1 for back. Returns null if there's nowhere to go. */
+function resolveAdjacent(
+  current: PlayerTrack,
+  queue: PlayerTrack[],
+  shuffle: boolean,
+  direction: 1 | -1,
+): PlayerTrack | null {
+  if (queue.length > 0) {
+    const idx = queue.findIndex((t) => t.id === current.id);
+    if (idx >= 0) {
+      // Shuffle only applies to forward — "back" should remain deterministic.
+      if (direction === 1 && shuffle && queue.length > 1) {
+        let pick = idx;
+        while (pick === idx) pick = Math.floor(Math.random() * queue.length);
+        return queue[pick];
+      }
+      const nextIdx = idx + direction;
+      if (nextIdx >= 0 && nextIdx < queue.length) return queue[nextIdx];
+      return null;
+    }
+  }
+
+  const ids = downloadQueueIds();
+  const idx = ids.indexOf(current.id);
+  if (idx < 0) return null;
+  const nextIdx = idx + direction;
+  if (nextIdx < 0 || nextIdx >= ids.length) return null;
+  return trackFromDownloadId(ids[nextIdx]);
 }
 
 export const usePlayerStore = create<PlayerStore>((set, get) => ({
@@ -92,13 +135,13 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
     if (get().volumeLoaded) return;
     try {
       const settings = await getSettings();
-      const saved = (settings as any).playerVolume;
-      if (saved != null) {
-        const v = parseFloat(saved);
+      if (settings.playerVolume != null) {
+        const v = parseFloat(settings.playerVolume);
         if (isFinite(v)) set({ volume: v });
       }
-      const sh = (settings as any).shuffle;
-      if (sh != null) set({ shuffle: sh === "1" || sh === "true" });
+      if (settings.shuffle != null) {
+        set({ shuffle: settings.shuffle === "1" || settings.shuffle === "true" });
+      }
     } catch {}
     set({ volumeLoaded: true });
   },
@@ -107,7 +150,7 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
     const { currentTrack, queue, shuffle, history, forward } = get();
     if (!currentTrack) return;
 
-    // If we've recently rewound, retrace forward instead of picking anew.
+    // Retrace the forward stack first if we just rewound.
     if (forward.length > 0) {
       const next = forward[forward.length - 1];
       set({
@@ -121,63 +164,23 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
       return;
     }
 
-    // Try the explicit queue first
-    if (queue.length > 0) {
-      const idx = queue.findIndex((t) => t.id === currentTrack.id);
-      if (idx >= 0) {
-        if (shuffle && queue.length > 1) {
-          let pick = idx;
-          while (pick === idx) {
-            pick = Math.floor(Math.random() * queue.length);
-          }
-          set({
-            currentTrack: queue[pick],
-            isPlaying: true,
-            currentTime: 0,
-            duration: 0,
-            history: [...history, currentTrack],
-          });
-          return;
-        }
-        if (idx < queue.length - 1) {
-          set({
-            currentTrack: queue[idx + 1],
-            isPlaying: true,
-            currentTime: 0,
-            duration: 0,
-            history: [...history, currentTrack],
-          });
-          return;
-        }
-        // End of queue
-        set({ isPlaying: false });
-        return;
-      }
-    }
-
-    // Fallback: walk the download queue
-    const ids = getAdjacentMp3s();
-    const idx = ids.indexOf(currentTrack.id);
-    if (idx < 0 || idx >= ids.length - 1) {
+    const next = resolveAdjacent(currentTrack, queue, shuffle, 1);
+    if (!next) {
       set({ isPlaying: false });
       return;
     }
-    const nextId = ids[idx + 1];
-    const dl = useDownloadStore.getState().downloads.find((d) => d.id === nextId);
-    if (dl?.filePath) {
-      set({
-        currentTrack: {
-          id: dl.id,
-          title: dl.title || "Unknown",
-          artist: dl.artist,
-          filePath: dl.filePath,
-          coverArtBase64: dl.coverArtBase64,
-        },
-        isPlaying: true,
-        currentTime: 0,
-        duration: 0,
-      });
-    }
+    set({
+      currentTrack: next,
+      isPlaying: true,
+      currentTime: 0,
+      duration: 0,
+      // Only push to history when we walked an explicit queue (so back actually
+      // returns somewhere meaningful). Download-adjacency advances stay
+      // historyless to match the prior behavior.
+      history: queue.some((t) => t.id === currentTrack.id)
+        ? [...history, currentTrack]
+        : history,
+    });
   },
 
   playPrev: () => {
@@ -194,9 +197,8 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
       return;
     }
 
-    // Prefer the history stack so shuffle "back" actually returns to the
-    // previously played track. The current goes onto the forward stack so
-    // pressing next will retrace.
+    // Prefer the history stack so shuffle "back" returns to the previously
+    // played track. Current goes onto forward so next can retrace.
     if (history.length > 0) {
       const prev = history[history.length - 1];
       set({
@@ -210,39 +212,16 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
       return;
     }
 
-    if (queue.length > 0) {
-      const idx = queue.findIndex((t) => t.id === currentTrack.id);
-      if (idx > 0) {
-        set({
-          currentTrack: queue[idx - 1],
-          isPlaying: true,
-          currentTime: 0,
-          duration: 0,
-          forward: [...forward, currentTrack],
-        });
-        return;
-      }
-      if (idx === 0) return;
-    }
-
-    const ids = getAdjacentMp3s();
-    const idx = ids.indexOf(currentTrack.id);
-    if (idx <= 0) return;
-    const prevId = ids[idx - 1];
-    const dl = useDownloadStore.getState().downloads.find((d) => d.id === prevId);
-    if (dl?.filePath) {
-      set({
-        currentTrack: {
-          id: dl.id,
-          title: dl.title || "Unknown",
-          artist: dl.artist,
-          filePath: dl.filePath,
-          coverArtBase64: dl.coverArtBase64,
-        },
-        isPlaying: true,
-        currentTime: 0,
-        duration: 0,
-      });
-    }
+    const prev = resolveAdjacent(currentTrack, queue, false, -1);
+    if (!prev) return;
+    set({
+      currentTrack: prev,
+      isPlaying: true,
+      currentTime: 0,
+      duration: 0,
+      forward: queue.some((t) => t.id === currentTrack.id)
+        ? [...forward, currentTrack]
+        : forward,
+    });
   },
 }));

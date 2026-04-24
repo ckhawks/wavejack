@@ -57,7 +57,7 @@ export function UrlInput() {
   const addDownload = useDownloadStore((s) => s.addDownload);
 
   const setFormat = (f: "mp4" | "mp3") => updateSetting("format", f);
-  const setDestination = (d: "downloads" | "music") =>
+  const setDestination = (d: "downloads" | "music" | "song-requests") =>
     updateSetting("lastDestination", d);
 
   const enabledSources: string[] = searchSourcesEnabled
@@ -97,9 +97,9 @@ export function UrlInput() {
       setSpotifyAuthed(e.payload === true);
     });
     return () => {
-      unExpired.then((fn) => fn());
-      unChanged.then((fn) => fn());
-      unSpotifyChanged.then((fn) => fn());
+      unExpired.then((fn) => fn()).catch(() => {});
+      unChanged.then((fn) => fn()).catch(() => {});
+      unSpotifyChanged.then((fn) => fn()).catch(() => {});
     };
   }, []);
 
@@ -187,18 +187,31 @@ export function UrlInput() {
     );
   };
 
-  // Listen for search preview status events
+  // Preview download progress can arrive on either event channel:
+  // - "search-preview-status" is what the dedicated preview path emits.
+  // - "download-status" is the generic yt-dlp channel; we accept it too so
+  //   results that fall through to the regular downloader still surface.
+  // Both run the same handler — a previously-duplicated block now collapsed.
   useEffect(() => {
-    const unlisten1 = listen<DownloadStatusEvent>("search-preview-status", (e) => {
-      const { id, status, progress, message, file_path, cover_art_base64 } = e.payload;
+    const handle = (
+      payload: DownloadStatusEvent,
+      requireKnownPreview: boolean,
+    ) => {
+      const { id, status, progress, message, file_path, cover_art_base64 } = payload;
+      if (requireKnownPreview && !previewsRef.current.has(id)) return;
       setPreviews((prev) => {
         const next = new Map(prev);
         const existing = next.get(id) ?? { status: "pending", progress: 0, message: "" };
         if (status === "complete") {
-          next.set(id, { ...existing, status: "ready", progress: 100, message: "Ready", filePath: file_path ?? undefined, coverArtBase64: cover_art_base64 ?? undefined });
-          // Auto-play the preview
-          const results = searchResultsRef.current;
-          const result = results.find((r) => r.id === id);
+          next.set(id, {
+            ...existing,
+            status: "ready",
+            progress: 100,
+            message: "Ready",
+            filePath: file_path ?? undefined,
+            coverArtBase64: cover_art_base64 ?? undefined,
+          });
+          const result = searchResultsRef.current.find((r) => r.id === id);
           if (result && file_path) {
             usePlayerStore.getState().playTrack({
               id: result.id,
@@ -215,42 +228,20 @@ export function UrlInput() {
         }
         return next;
       });
-    });
+    };
 
-    // Also listen to download-status in case yt-dlp emits there
-    const unlisten2 = listen<DownloadStatusEvent>("download-status", (e) => {
-      const { id } = e.payload;
-      if (!previewsRef.current.has(id)) return;
-      // Forward to same handler logic
-      const { status, progress, message, file_path, cover_art_base64 } = e.payload;
-      setPreviews((prev) => {
-        const next = new Map(prev);
-        const existing = next.get(id) ?? { status: "pending", progress: 0, message: "" };
-        if (status === "complete") {
-          next.set(id, { ...existing, status: "ready", progress: 100, message: "Ready", filePath: file_path ?? undefined, coverArtBase64: cover_art_base64 ?? undefined });
-          const results = searchResultsRef.current;
-          const result = results.find((r) => r.id === id);
-          if (result && file_path) {
-            usePlayerStore.getState().playTrack({
-              id: result.id,
-              title: result.title,
-              artist: result.artist,
-              filePath: file_path,
-              coverArtBase64: cover_art_base64 ?? undefined,
-            });
-          }
-        } else if (status === "error") {
-          next.set(id, { ...existing, status: "error", progress: 0, message });
-        } else {
-          next.set(id, { ...existing, status: "downloading", progress, message });
-        }
-        return next;
-      });
-    });
+    const unlistenPreview = listen<DownloadStatusEvent>(
+      "search-preview-status",
+      (e) => handle(e.payload, false),
+    );
+    const unlistenDownload = listen<DownloadStatusEvent>(
+      "download-status",
+      (e) => handle(e.payload, true),
+    );
 
     return () => {
-      unlisten1.then((fn) => fn());
-      unlisten2.then((fn) => fn());
+      unlistenPreview.then((fn) => fn()).catch(() => {});
+      unlistenDownload.then((fn) => fn()).catch(() => {});
     };
   }, []);
 
@@ -283,8 +274,33 @@ export function UrlInput() {
     );
   }, []);
 
-  // Save a previewed track to the output directory
+  // Save a previewed track to the output directory.
+  //
+  // Tidal previews are intentionally low-res (HIGH tier ~96k AAC) for speed,
+  // so saving must re-download at full quality — we don't want the 96k file
+  // ending up in the library. YouTube/SoundCloud previews are already best-
+  // audio, so we just move the preview file.
   const handleSave = useCallback(async (result: SearchResult) => {
+    if (result.source === "tidal") {
+      const id = crypto.randomUUID();
+      addDownload({
+        id,
+        url: result.url,
+        format: "flac",
+        status: "pending",
+        progress: 0,
+        message: "Starting full-res Tidal download...",
+        backend: "tidal-dl-ng",
+        title: result.title,
+      });
+      setSavedIds((prev) => new Set(prev).add(result.id));
+      tidalDownloadMatched(
+        [{ id, tidal_url: result.url, title: `${result.artist} - ${result.title}` }],
+        destination,
+      ).catch((e) => console.error("Failed to save Tidal track:", e));
+      return;
+    }
+
     const preview = previewsRef.current.get(result.id);
     if (!preview?.filePath) return;
     try {
@@ -307,7 +323,7 @@ export function UrlInput() {
     } catch (e) {
       console.error("Failed to save track:", e);
     }
-  }, []);
+  }, [addDownload, destination]);
 
   // Download a search result directly. Route by source:
   //  - youtube / soundcloud → yt-dlp via `startDownload`
@@ -467,7 +483,9 @@ export function UrlInput() {
           </button>
         </div>
 
-        {/* Destination toggle */}
+        {/* Destination toggle — Downloads for ephemeral / meme clips, Music
+            for archival library, Song Requests for throwaway tracks we want
+            rekordbox to see but don't want to pollute the main library. */}
         <div className="relative flex overflow-hidden rounded-lg border border-[#333] bg-[#111]">
           <button
             onClick={() => setDestination("downloads")}
@@ -495,6 +513,20 @@ export function UrlInput() {
             <span className="flex items-center gap-1.5">
               <Library size={14} />
               Music
+            </span>
+          </button>
+          <button
+            onClick={() => setDestination("song-requests")}
+            className={`relative z-10 px-3 py-3 text-sm font-semibold transition-all duration-200 ${
+              destination === "song-requests"
+                ? "bg-[#222] text-white"
+                : "text-neutral-600 hover:text-neutral-400"
+            }`}
+            title="Save to <Music>/song-requests/ — throwaway, still scanned by rekordbox"
+          >
+            <span className="flex items-center gap-1.5">
+              <FolderDown size={14} />
+              Song Requests
             </span>
           </button>
         </div>

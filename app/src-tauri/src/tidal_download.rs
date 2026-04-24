@@ -49,7 +49,16 @@ fn find_bin() -> Result<PathBuf, AppError> {
 
 /// Set tidal-dl-ng's persistent config: output folder + embed metadata/cover.
 /// Run once per download batch from the caller.
-pub async fn configure_for_batch(output_dir: &Path) -> Result<(), AppError> {
+///
+/// `quality` selects the tidal-dl-ng audio tier:
+/// - "best" → HI_RES_LOSSLESS (24-bit FLAC where offered, 16-bit FLAC otherwise,
+///   AAC for HIGH-only tracks)
+/// - "aac320" → HIGH (AAC ~320 kbps m4a — the "throwaway" song-request tier)
+pub async fn configure_for_batch(output_dir: &Path, quality: &str) -> Result<(), AppError> {
+    let quality_audio = match quality {
+        "aac320" => "HIGH",
+        _ => "HI_RES_LOSSLESS",
+    };
     let bin = find_bin()?;
     tokio::fs::create_dir_all(output_dir).await?;
 
@@ -59,20 +68,25 @@ pub async fn configure_for_batch(output_dir: &Path) -> Result<(), AppError> {
     // download crashes with HistoryFormatError. Wavejack tracks completion
     // via its own DB + filesystem snapshot, so nuke the CLI's history each
     // batch to keep it from ever getting in the way.
-    if let Some(home) = dirs::home_dir() {
-        let hist = home.join(".config").join("tidal_dl_ng-dev").join("downloaded_history.json");
+    // tidal-dl-ng follows XDG: $XDG_CONFIG_HOME/tidal_dl_ng-dev/, falling back
+    // to ~/.config/. Honor the env var so users with a custom config location
+    // don't end up with stale history that we never clean.
+    let cfg_root = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".config")));
+    if let Some(root) = cfg_root {
+        let hist = root.join("tidal_dl_ng-dev").join("downloaded_history.json");
         if hist.exists() {
             let _ = tokio::fs::remove_file(&hist).await;
         }
     }
     for (key, value) in [
         ("download_base_path", output_dir.to_string_lossy().to_string()),
-        // Force the best tier Tidal has per track — tidal-dl-ng falls back
-        // per-track when a tier isn't available, so HI_RES_LOSSLESS gives
-        // 24-bit FLAC where offered, 16-bit FLAC for LOSSLESS-only tracks,
-        // and AAC for HIGH-only. The default is HIGH (AAC 320), which is
-        // why downloads come out as .m4a without this.
-        ("quality_audio", "HI_RES_LOSSLESS".into()),
+        // Per-batch tier: HI_RES_LOSSLESS for archival, HIGH (AAC ~320) for
+        // throwaway song-request downloads. tidal-dl-ng falls back per-track
+        // when a tier isn't available, so HI_RES_LOSSLESS gives 24-bit FLAC
+        // where offered, 16-bit FLAC for LOSSLESS-only, and AAC for HIGH-only.
+        ("quality_audio", quality_audio.into()),
         // Drop tidal-dl-ng's default "Tracks/" subfolder — Wavejack's musicDir
         // is already the library root, and Wavejack's own playlist folders
         // organize tracks separately.
@@ -135,10 +149,8 @@ fn snapshot_files(dir: &Path) -> HashSet<PathBuf> {
     out
 }
 
-fn emit(app: &AppHandle, id: &str, ev: DownloadStatusEvent) {
+fn emit(app: &AppHandle, _id: &str, ev: DownloadStatusEvent) {
     let _ = app.emit("download-status", ev);
-    // Keep the event noise out of the logs once per line is enough.
-    let _ = id;
 }
 
 /// Download a single Tidal track. Blocks until the tidal-dl-ng subprocess

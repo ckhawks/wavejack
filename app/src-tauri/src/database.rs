@@ -752,20 +752,6 @@ impl Database {
 
     // ===================== Tags =====================
 
-    /// Insert a tag if it doesn't exist, return its ID.
-    pub fn upsert_tag(&self, name: &str) -> Result<i64, rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT OR IGNORE INTO tags (name) VALUES (?1)",
-            params![name],
-        )?;
-        conn.query_row(
-            "SELECT id FROM tags WHERE name = ?1",
-            params![name],
-            |row| row.get(0),
-        )
-    }
-
     /// Replace all tags for a track. `tags` is a list of (normalized_name, weight).
     pub fn set_track_tags(&self, track_path: &str, tags: &[(String, i32)]) -> Result<(), rusqlite::Error> {
         let mut conn = self.conn.lock().unwrap();

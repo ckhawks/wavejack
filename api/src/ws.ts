@@ -346,7 +346,12 @@ export class WsHandler {
   private send(ws: WSContext, msg: ServerMessage): void {
     try {
       ws.send(JSON.stringify(msg));
-    } catch {}
+    } catch (e) {
+      // Send can throw if the socket closed between our connection-list scan
+      // and this call. Not worth logging at error — clients drop all the
+      // time. Keep at debug so it shows up if something else is going wrong.
+      console.debug("[ws] send failed:", e);
+    }
   }
 
   private broadcastToRoom(roomId: string, msg: ServerMessage, exclude?: WSContext): void {
@@ -354,10 +359,11 @@ export class WsHandler {
     if (!conns) return;
     const data = JSON.stringify(msg);
     for (const ws of conns) {
-      if (ws !== exclude) {
-        try {
-          ws.send(data);
-        } catch {}
+      if (ws === exclude) continue;
+      try {
+        ws.send(data);
+      } catch (e) {
+        console.debug("[ws] broadcast send failed:", e);
       }
     }
   }

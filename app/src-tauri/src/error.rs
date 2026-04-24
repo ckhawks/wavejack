@@ -8,12 +8,8 @@ use thiserror::Error;
 /// Every error that can happen in our backend.
 /// Each variant maps to a different failure mode so the frontend can show useful messages.
 #[derive(Debug, Error, Serialize)]
-#[serde(tag = "kind", content = "message")] // produces JSON like { "kind": "YtDlpNotFound", "message": "..." }
+#[serde(tag = "kind", content = "message")] // produces JSON like { "kind": "YtDlpFailed", "message": "..." }
 pub enum AppError {
-    /// yt-dlp binary couldn't be found on PATH or in our app data directory
-    #[error("yt-dlp not found: {0}")]
-    YtDlpNotFound(String),
-
     /// yt-dlp ran but exited with an error (bad URL, network issue, etc.)
     #[error("yt-dlp failed: {0}")]
     YtDlpFailed(String),

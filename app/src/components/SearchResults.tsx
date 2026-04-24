@@ -33,9 +33,10 @@ function SourceBadge({ source }: { source: SearchResult["source"] }) {
 }
 
 function canPreviewSource(source: SearchResult["source"]): boolean {
-  // Preview currently shells out to yt-dlp. Tidal/Spotify results route
-  // through different backends and don't have a preview path yet.
-  return source === "youtube" || source === "soundcloud";
+  // yt-dlp handles youtube/soundcloud; tidal-dl-ng HIGH tier (~96k AAC)
+  // handles Tidal previews for near-instant auditioning. Spotify results
+  // still don't have a preview backend — they open the match modal instead.
+  return source === "youtube" || source === "soundcloud" || source === "tidal";
 }
 
 interface SearchResultsProps {

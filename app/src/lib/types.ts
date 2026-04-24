@@ -33,7 +33,10 @@ export interface AppSettings {
   cobaltUrl: string;
   format: "mp4" | "mp3";
   lastfmApiKey: string;
-  lastDestination: "downloads" | "music";
+  /** Three-way destination toggle. "song-requests" writes to
+   *  `<musicDir>/song-requests/` — full-quality downloads for throwaway tracks
+   *  we don't want polluting the main archival library folder. */
+  lastDestination: "downloads" | "music" | "song-requests";
   /** JSON-encoded record of which library columns are visible. */
   libraryColumns: string;
   /** JSON-encoded { field, dir } sort state for the library table. */
@@ -49,6 +52,10 @@ export interface AppSettings {
   soundcloudCookiesBrowser: string;
   /** Comma-separated list of enabled search sources ("youtube,soundcloud"). */
   searchSourcesEnabled: string;
+  /** Persisted player volume, 0..1 stored as a decimal string. */
+  playerVolume?: string;
+  /** "1" / "0" — persisted shuffle toggle. */
+  shuffle?: string;
 }
 
 /** A single Spotify track as returned by the Web API (fields we care about). */

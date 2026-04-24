@@ -37,7 +37,7 @@ export async function startDownload(
   url: string,
   format: string,
   playlistTitle?: string,
-  destination: "downloads" | "music" = "downloads",
+  destination: "downloads" | "music" | "song-requests" = "downloads",
 ): Promise<void> {
   return invoke("start_download", { id, url, format, playlistTitle, destination });
 }
@@ -432,7 +432,7 @@ export interface TidalDownloadJob {
  *  progress streams over "download-status" events. */
 export async function tidalDownloadMatched(
   jobs: TidalDownloadJob[],
-  destination: "downloads" | "music",
+  destination: "downloads" | "music" | "song-requests",
   playlistTitle?: string,
 ): Promise<void> {
   return invoke("tidal_download_matched", { jobs, destination, playlistTitle });

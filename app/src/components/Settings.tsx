@@ -141,10 +141,10 @@ export function Settings({ onClose }: Props) {
   };
 
   return (
-    <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-      <div className="w-full max-w-lg rounded-xl border border-[#222] bg-[#111] shadow-2xl">
-        {/* Header */}
-        <div className="flex items-center justify-between border-b border-[#222] px-6 py-4">
+    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
+      <div className="flex max-h-full w-full max-w-lg flex-col overflow-hidden rounded-xl border border-[#222] bg-[#111] shadow-2xl">
+        {/* Header — sticky so it stays visible while the body scrolls. */}
+        <div className="flex shrink-0 items-center justify-between border-b border-[#222] px-6 py-4">
           <h2 className="text-base font-semibold text-white">Settings</h2>
           <button
             onClick={onClose}
@@ -154,8 +154,8 @@ export function Settings({ onClose }: Props) {
           </button>
         </div>
 
-        {/* Body */}
-        <div className="space-y-6 p-6">
+        {/* Body — scrolls when the content is taller than the viewport. */}
+        <div className="min-h-0 flex-1 space-y-6 overflow-y-auto p-6">
           {/* Downloads directory */}
           <div>
             <label className="mb-2 block text-sm font-medium text-neutral-400">

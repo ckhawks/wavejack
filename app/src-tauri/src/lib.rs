@@ -7,6 +7,7 @@
 // Each command function is async so it doesn't block the main thread.
 // Tauri automatically handles serialization/deserialization of arguments and return values.
 
+mod auth_cache;
 mod cobalt;
 mod cover_art;
 mod database;
@@ -47,16 +48,14 @@ async fn start_download(
     playlist_title: Option<String>,
     destination: Option<String>,
 ) -> Result<(), AppError> {
-    // Resolve the output directory based on the destination choice.
+    // Resolve the output directory. "song-requests" is a sibling of "music"
+    // that writes to <musicDir>/song-requests/ — rekordbox still scans it, but
+    // it keeps throwaways out of the main archival library folder.
     let dest = destination.unwrap_or_else(|| "downloads".to_string());
-    let output_dir = match dest.as_str() {
-        "music" => get_store_value(&app, "musicDir")
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(default_music_dir),
-        _ => get_store_value(&app, "outputDir")
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(default_output_dir),
-    };
+    let output_dir = resolve_destination_dir(&app, &dest);
+    if dest == "song-requests" {
+        let _ = std::fs::create_dir_all(&output_dir);
+    }
     let cobalt_url = get_store_value(&app, "cobaltUrl")
         .unwrap_or_default();
     let sc_cookies_browser = get_store_value(&app, "soundcloudCookiesBrowser")
@@ -86,63 +85,42 @@ async fn start_download(
         let db = app.state::<Database>();
         match result {
             Ok(dl) => {
-                let record = DownloadRecord {
-                    id: id.clone(),
-                    url: url.clone(),
-                    format: format.clone(),
-                    status: "complete".to_string(),
-                    title: dl.title.unwrap_or_default(),
-                    artist: String::new(),
-                    album: String::new(),
-                    cover_art_path: String::new(),
-                    file_path: dl.file_path.unwrap_or_default(),
-                    backend: dl.backend,
-                    message: "Download complete!".to_string(),
-                    playlist_title: pl_title.clone(),
-                    created_at: database::now_timestamp(),
-                    cover_art_base64: dl.cover_art_base64.unwrap_or_default(),
-                };
+                let record = build_download_record(
+                    id.clone(),
+                    url.clone(),
+                    format.clone(),
+                    dl.backend,
+                    pl_title.clone(),
+                    dl.title.unwrap_or_default(),
+                    dl.file_path.unwrap_or_default(),
+                    dl.cover_art_base64.unwrap_or_default(),
+                    "complete",
+                    "Download complete!".to_string(),
+                );
                 if let Err(e) = db.insert_or_update(&record) {
                     eprintln!("Failed to save download record: {}", e);
                 }
 
-                // If this went into the music destination and that folder
-                // is part of the library, refresh its cache so the new
-                // track shows up without a manual rescan.
-                if dest_clone == "music" {
-                    if let Ok(folders) = db.list_library_folders() {
-                        for folder in folders {
-                            if output_dir_for_scan.starts_with(&folder) {
-                                let dir = std::path::PathBuf::from(&folder);
-                                let app_inner = app.clone();
-                                tokio::task::spawn_blocking(move || {
-                                    let db = app_inner.state::<Database>();
-                                    library::scan_folder_incremental(&dir, &db);
-                                    let _ = app_inner.emit("library-updated", ());
-                                });
-                                break;
-                            }
-                        }
-                    }
+                // Music + song-requests both land under musicDir — rescan so
+                // rekordbox (and our library table) pick up the new file
+                // without a manual refresh.
+                if dest_clone == "music" || dest_clone == "song-requests" {
+                    rescan_library_for_path(&app, std::path::Path::new(&output_dir_for_scan));
                 }
             }
             Err(ref e) => {
-                let record = DownloadRecord {
-                    id: id.clone(),
-                    url: url.clone(),
-                    format: format.clone(),
-                    status: "error".to_string(),
-                    title: String::new(),
-                    artist: String::new(),
-                    album: String::new(),
-                    cover_art_path: String::new(),
-                    file_path: String::new(),
-                    backend: String::new(),
-                    message: e.to_string(),
-                    playlist_title: pl_title.clone(),
-                    created_at: database::now_timestamp(),
-                    cover_art_base64: String::new(),
-                };
+                let record = build_download_record(
+                    id.clone(),
+                    url.clone(),
+                    format.clone(),
+                    String::new(),
+                    pl_title.clone(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    "error",
+                    e.to_string(),
+                );
                 if let Err(db_err) = db.insert_or_update(&record) {
                     eprintln!("Failed to save error record: {}", db_err);
                 }
@@ -786,6 +764,70 @@ async fn search_preview(
 ) -> Result<(), AppError> {
     let preview_dir = discover::preview_dir(&app)?;
     let output_dir = preview_dir.to_string_lossy().to_string();
+
+    // Tidal URLs: use tidal-dl-ng at HIGH tier (AAC ~96 m4a). Previews are
+    // throwaway auditioning — 96k downloads in under a second. If the user
+    // clicks Save, the frontend re-kicks a full-res FLAC download instead of
+    // reusing the preview file.
+    let is_tidal = url.contains("tidal.com");
+    if is_tidal {
+        let preview_path = preview_dir.clone();
+        let id_clone = id.clone();
+        let title_clone = title.clone();
+        let url_clone = url.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = tidal_download::configure_for_batch(&preview_path, "aac320").await {
+                let _ = app.emit("search-preview-status", ytdlp::DownloadStatusEvent {
+                    id: id_clone.clone(),
+                    status: "error".into(),
+                    progress: 0.0,
+                    message: format!("Tidal preview config failed: {}", e),
+                    backend: "tidal-dl-ng".into(),
+                    title: Some(title_clone.clone()),
+                    file_path: None,
+                    cover_art_base64: None,
+                });
+                return;
+            }
+            let result = tidal_download::download_one(
+                &app,
+                &id_clone,
+                &url_clone,
+                &preview_path,
+                Some(&title_clone),
+            )
+            .await;
+            // tidal_download already emits on "download-status"; forward the
+            // final state to "search-preview-status" so the preview UI sees it.
+            match result {
+                Ok(path) => {
+                    let _ = app.emit("search-preview-status", ytdlp::DownloadStatusEvent {
+                        id: id_clone,
+                        status: "complete".into(),
+                        progress: 100.0,
+                        message: "Ready to preview".into(),
+                        backend: "tidal-dl-ng".into(),
+                        title: Some(title_clone),
+                        file_path: Some(path.to_string_lossy().to_string()),
+                        cover_art_base64: None,
+                    });
+                }
+                Err(e) => {
+                    let _ = app.emit("search-preview-status", ytdlp::DownloadStatusEvent {
+                        id: id_clone,
+                        status: "error".into(),
+                        progress: 0.0,
+                        message: format!("Tidal preview failed: {}", e),
+                        backend: "tidal-dl-ng".into(),
+                        title: Some(title_clone),
+                        file_path: None,
+                        cover_art_base64: None,
+                    });
+                }
+            }
+        });
+        return Ok(());
+    }
 
     tauri::async_runtime::spawn(async move {
         let ytdlp_path = match ytdlp::ensure_ytdlp(&app).await {
@@ -1792,19 +1834,17 @@ async fn tidal_download_matched(
     playlist_title: Option<String>,
 ) -> Result<(), AppError> {
     let dest = destination.unwrap_or_else(|| "music".to_string());
-    let output_dir = match dest.as_str() {
-        "music" => get_store_value(&app, "musicDir")
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(default_music_dir),
-        _ => get_store_value(&app, "outputDir")
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(default_output_dir),
-    };
+    let output_dir = resolve_destination_dir(&app, &dest);
+    if dest == "song-requests" {
+        let _ = std::fs::create_dir_all(&output_dir);
+    }
 
     // Configure tidal-dl-ng once up front so the output dir + metadata/cover
-    // embed settings are right for every track in the batch.
+    // embed settings are right for every track in the batch. Full-quality
+    // FLAC regardless of destination — "throwaway" refers to foldering, not
+    // to audio tier.
     let out_path = std::path::PathBuf::from(&output_dir);
-    tidal_download::configure_for_batch(&out_path).await?;
+    tidal_download::configure_for_batch(&out_path, "best").await?;
 
     let pl_title = playlist_title.unwrap_or_default();
 
@@ -1822,40 +1862,32 @@ async fn tidal_download_matched(
             .await;
 
             let db = app.state::<Database>();
-            let record = match result {
-                Ok(ref path) => DownloadRecord {
-                    id: job.id.clone(),
-                    url: job.tidal_url.clone(),
-                    format: "flac".into(),
-                    status: "complete".into(),
-                    title: job.title.clone().unwrap_or_default(),
-                    artist: String::new(),
-                    album: String::new(),
-                    cover_art_path: String::new(),
-                    file_path: path.to_string_lossy().to_string(),
-                    backend: "tidal-dl-ng".into(),
-                    message: "Download complete".into(),
-                    playlist_title: pl_title.clone(),
-                    created_at: database::now_timestamp(),
-                    cover_art_base64: String::new(),
-                },
-                Err(ref e) => DownloadRecord {
-                    id: job.id.clone(),
-                    url: job.tidal_url.clone(),
-                    format: "flac".into(),
-                    status: "error".into(),
-                    title: job.title.clone().unwrap_or_default(),
-                    artist: String::new(),
-                    album: String::new(),
-                    cover_art_path: String::new(),
-                    file_path: String::new(),
-                    backend: "tidal-dl-ng".into(),
-                    message: e.to_string(),
-                    playlist_title: pl_title.clone(),
-                    created_at: database::now_timestamp(),
-                    cover_art_base64: String::new(),
-                },
+            let (status, file_path, message, title) = match result.as_ref() {
+                Ok(path) => (
+                    "complete",
+                    path.to_string_lossy().to_string(),
+                    "Download complete".to_string(),
+                    job.title.clone().unwrap_or_default(),
+                ),
+                Err(e) => (
+                    "error",
+                    String::new(),
+                    e.to_string(),
+                    job.title.clone().unwrap_or_default(),
+                ),
             };
+            let record = build_download_record(
+                job.id.clone(),
+                job.tidal_url.clone(),
+                "flac".into(),
+                "tidal-dl-ng".into(),
+                pl_title.clone(),
+                title,
+                file_path,
+                String::new(),
+                status,
+                message,
+            );
             if let Err(e) = db.insert_or_update(&record) {
                 eprintln!("Failed to save tidal download record: {}", e);
             }
@@ -1863,20 +1895,7 @@ async fn tidal_download_matched(
             // If this landed in a library folder, kick a rescan so the track
             // shows up in the Library tab without manual refresh.
             if let Ok(path) = result.as_ref() {
-                if let Ok(folders) = db.list_library_folders() {
-                    for folder in folders {
-                        if path.starts_with(&folder) {
-                            let dir = std::path::PathBuf::from(&folder);
-                            let app_inner = app.clone();
-                            tokio::task::spawn_blocking(move || {
-                                let db = app_inner.state::<Database>();
-                                library::scan_folder_incremental(&dir, &db);
-                                let _ = app_inner.emit("library-updated", ());
-                            });
-                            break;
-                        }
-                    }
-                }
+                rescan_library_for_path(&app, path);
             }
         }
     });
@@ -1887,6 +1906,80 @@ async fn tidal_download_matched(
 // ========================================================================
 // Helper functions
 // ========================================================================
+
+/// Build a download history record. Centralizes field defaults (artist/album/
+/// cover_art_path are always-empty for our writers) so adding/renaming a
+/// column doesn't require touching every call site.
+#[allow(clippy::too_many_arguments)]
+fn build_download_record(
+    id: String,
+    url: String,
+    format: String,
+    backend: String,
+    playlist_title: String,
+    title: String,
+    file_path: String,
+    cover_art_base64: String,
+    status: &'static str,
+    message: String,
+) -> DownloadRecord {
+    DownloadRecord {
+        id,
+        url,
+        format,
+        status: status.to_string(),
+        title,
+        artist: String::new(),
+        album: String::new(),
+        cover_art_path: String::new(),
+        file_path,
+        backend,
+        message,
+        playlist_title,
+        created_at: database::now_timestamp(),
+        cover_art_base64,
+    }
+}
+
+/// Trigger a library folder rescan if the given completed download landed
+/// inside one. Dedupes concurrent calls so two downloads completing into the
+/// same folder don't race two scans against each other.
+fn rescan_library_for_path(app: &tauri::AppHandle, completed_path: &std::path::Path) {
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    static IN_FLIGHT: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+
+    let db = app.state::<Database>();
+    let Ok(folders) = db.list_library_folders() else { return };
+    for folder in folders {
+        let folder_path = std::path::PathBuf::from(&folder);
+        if !completed_path.starts_with(&folder_path) {
+            continue;
+        }
+        // Dedupe: if a scan for this folder is already queued, drop this one.
+        // The other scan will pick up our file too because it walks the tree.
+        {
+            let mut guard = IN_FLIGHT.lock().unwrap();
+            let set = guard.get_or_insert_with(HashSet::new);
+            if !set.insert(folder_path.clone()) {
+                return;
+            }
+        }
+        let app_inner = app.clone();
+        let dir = folder_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let db = app_inner.state::<Database>();
+            library::scan_folder_incremental(&dir, &db);
+            let _ = app_inner.emit("library-updated", ());
+            let mut guard = IN_FLIGHT.lock().unwrap();
+            if let Some(set) = guard.as_mut() {
+                set.remove(&dir);
+            }
+        });
+        return;
+    }
+}
 
 /// Read a string value from the persistent store.
 /// Returns None if the key doesn't exist or isn't a string.
@@ -1902,6 +1995,30 @@ fn default_output_dir() -> String {
         .or_else(dirs::home_dir)
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| ".".to_string())
+}
+
+/// Resolve a destination toggle value ("downloads" | "music" | "song-requests")
+/// to an absolute output directory. "song-requests" is a sibling that writes
+/// to <musicDir>/song-requests/ so rekordbox still indexes it while the main
+/// archival library stays clean.
+fn resolve_destination_dir(app: &tauri::AppHandle, dest: &str) -> String {
+    match dest {
+        "music" => get_store_value(app, "musicDir")
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(default_music_dir),
+        "song-requests" => {
+            let music_dir = get_store_value(app, "musicDir")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(default_music_dir);
+            std::path::PathBuf::from(music_dir)
+                .join("song-requests")
+                .to_string_lossy()
+                .to_string()
+        }
+        _ => get_store_value(app, "outputDir")
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(default_output_dir),
+    }
 }
 
 /// Default music library directory (~/Music or home).
@@ -1984,9 +2101,17 @@ pub fn run() {
                     .nth(1)
                     .and_then(|rest| rest.splitn(2, '/').nth(1))
                     .unwrap_or("");
-                let decoded = urlencoding::decode(after_host)
+                let decoded_raw = urlencoding::decode(after_host)
                     .map(|s| s.into_owned())
                     .unwrap_or_default();
+                // Callers may produce either "C:/foo/bar.mp3" (forward slashes
+                // from the JS side) or percent-encoded native backslashes
+                // ("C:%5Cfoo%5Cbar.mp3"). After decode we normalize to native
+                // separators so std::fs::File::open sees a canonical path.
+                #[cfg(target_os = "windows")]
+                let decoded = decoded_raw.replace('/', "\\");
+                #[cfg(not(target_os = "windows"))]
+                let decoded = decoded_raw.replace('\\', "/");
 
                 let mime = match std::path::Path::new(&decoded)
                     .extension()
