@@ -24,7 +24,6 @@ which = "7"
 futures-util = "0.3"
 dirs = "6"
 uuid = { version = "1", features = ["v4"] }
-id3 = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
 urlencoding = "2"
 base64 = "0.22"

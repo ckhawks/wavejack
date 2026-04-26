@@ -1,5 +1,5 @@
+use crate::cover_art;
 use crate::error::AppError;
-use id3::TagLike;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -200,48 +200,38 @@ pub async fn apply_metadata_to_file(
         }
     }
 
-    // Write ID3 tags
-    let mut tag = id3::Tag::read_from_path(&file_path).unwrap_or_else(|_| id3::Tag::new());
-
-    if !title.is_empty() {
-        tag.set_title(title);
-    }
-    if !artist.is_empty() {
-        tag.set_artist(artist);
-    }
-    if !album.is_empty() {
-        tag.set_album(album);
-    }
-
-    // Embed cover art as APIC frame
-    if let Some(bytes) = cover_bytes {
-        tag.add_frame(id3::frame::Picture {
-            mime_type: "image/jpeg".to_string(),
-            picture_type: id3::frame::PictureType::CoverFront,
-            description: String::new(),
-            data: bytes,
-        });
-    }
-
-    tag.write_to_path(&file_path, id3::Version::Id3v24)
-        .map_err(|e| AppError::MetadataFailed(format!("Failed to write ID3 tags: {}", e)))?;
+    // Write tags + cover via lofty (format-agnostic).
+    cover_art::write_tags_to_file(
+        &file_path,
+        Some(title),
+        Some(artist),
+        Some(album),
+        cover_bytes.as_deref(),
+    )
+    .map_err(|e| AppError::MetadataFailed(format!("Failed to write tags: {}", e)))?;
 
     eprintln!(
-        "ID3 tags written to {:?}: title={:?}, artist={:?}, album={:?}, has_cover={}",
+        "Tags written to {:?}: title={:?}, artist={:?}, album={:?}, has_cover={}",
         file_path, title, artist, album, cover_art_base64.is_some()
     );
 
-    // Auto-rename: "Artist - Title.mp3"
+    // Auto-rename: "Artist - Title.<ext>" — preserve the original
+    // extension so flac/m4a/etc. don't get masqueraded as mp3.
     let current_filename = file_path
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_default();
+    let ext = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("mp3");
 
     let new_filename = if !artist.is_empty() && !title.is_empty() {
         let auto = format!(
-            "{} - {}.mp3",
+            "{} - {}.{}",
             sanitize_filename(artist),
-            sanitize_filename(title)
+            sanitize_filename(title),
+            ext
         );
         if auto != current_filename {
             auto

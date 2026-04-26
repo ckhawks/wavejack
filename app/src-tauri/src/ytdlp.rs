@@ -5,11 +5,11 @@
 //   3. Spawning yt-dlp as a child process and parsing its progress output
 //   4. Emitting Tauri events so the frontend can show real-time progress
 
+use crate::cover_art;
 use crate::downloader::DownloadResult;
 use crate::error::AppError;
 use futures_util::StreamExt;
-use id3::TagLike;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::process::Command;
@@ -269,6 +269,54 @@ pub fn is_soundcloud_url(url: &str) -> bool {
     lower.contains("soundcloud.com") || lower.contains("snd.sc")
 }
 
+/// Lossless containers we re-wrap to FLAC after a SoundCloud "original"
+/// download. Excludes `.flac` itself (already where we want to be) and
+/// lossy formats (transcoding to FLAC would just waste space).
+fn is_lossless_to_flac(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase()).as_deref(),
+        Some("wav" | "aiff" | "aif")
+    )
+}
+
+/// Re-encode a WAV/AIFF file to FLAC using ffmpeg. FLAC is lossless,
+/// roughly half the size, and supports proper Vorbis-comment metadata
+/// (including embedded cover art) — unlike WAV's spotty RIFF/ID3 mix.
+/// Returns the path to the new `.flac` file. The caller is responsible
+/// for deleting the original.
+async fn wav_to_flac(input: &Path) -> Result<PathBuf, AppError> {
+    let ffmpeg = which::which("ffmpeg")
+        .map_err(|_| AppError::Io("ffmpeg not found on PATH — required for WAV→FLAC conversion.".into()))?;
+
+    let output = input.with_extension("flac");
+    if output.exists() {
+        return Err(AppError::Io(format!(
+            "FLAC already exists at {}",
+            output.display()
+        )));
+    }
+
+    let status = Command::new(&ffmpeg)
+        .args(["-loglevel", "error", "-y", "-i"])
+        .arg(input)
+        .args(["-c:a", "flac", "-compression_level", "8"])
+        .arg(&output)
+        .status()
+        .await
+        .map_err(|e| AppError::Io(format!("Failed to spawn ffmpeg: {}", e)))?;
+
+    if !status.success() {
+        // Best-effort cleanup of a partial output file before bubbling up.
+        let _ = tokio::fs::remove_file(&output).await;
+        return Err(AppError::Io(format!(
+            "ffmpeg exited with {} converting WAV to FLAC",
+            status
+        )));
+    }
+
+    Ok(output)
+}
+
 pub async fn download_with_ytdlp(
     ytdlp_path: &PathBuf,
     url: &str,
@@ -420,6 +468,38 @@ pub async fn download_with_ytdlp(
         return Err(AppError::YtDlpFailed(error_msg));
     }
 
+    // SoundCloud's lossless originals come down as .wav (or .aiff). WAV
+    // metadata is a mess (RIFF INFO + nonstandard ID3 chunks) and the
+    // files are roughly 2× the size of FLAC for identical audio, so
+    // transcode lossless WAV/AIFF straight to FLAC. yt-dlp's thumbnail
+    // sidecar is renamed alongside the audio so the embed step below
+    // still finds it.
+    if is_sc {
+        if let Some(ref fp) = file_path {
+            let src_path = PathBuf::from(fp);
+            if is_lossless_to_flac(&src_path) {
+                match wav_to_flac(&src_path).await {
+                    Ok(flac_path) => {
+                        // Move the thumbnail sidecar (if any) to match
+                        // the new stem so the existing embed code finds it.
+                        let old_thumb = src_path.with_extension("jpg");
+                        let new_thumb = flac_path.with_extension("jpg");
+                        if old_thumb.exists() && old_thumb != new_thumb {
+                            let _ = tokio::fs::rename(&old_thumb, &new_thumb).await;
+                        }
+                        let _ = tokio::fs::remove_file(&src_path).await;
+                        file_path = Some(flac_path.to_string_lossy().to_string());
+                    }
+                    Err(e) => {
+                        // Non-fatal: keep the WAV, just warn. The user
+                        // still got the lossless audio they wanted.
+                        eprintln!("WAV→FLAC conversion failed: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
     // Try to find and process the YouTube thumbnail
     let mut cover_art_base64: Option<String> = None;
     if let Some(ref fp) = file_path {
@@ -433,21 +513,10 @@ pub async fn download_with_ytdlp(
                     let b64 = base64::engine::general_purpose::STANDARD.encode(&thumb_bytes);
                     cover_art_base64 = Some(b64);
 
-                    // Embed thumbnail as cover art in MP3 files
-                    if fp.ends_with(".mp3") {
-                        let mp3_path = std::path::PathBuf::from(fp);
-                        let mut tag = id3::Tag::read_from_path(&mp3_path)
-                            .unwrap_or_else(|_| id3::Tag::new());
-                        // Only embed if no cover art already present
-                        if tag.pictures().next().is_none() {
-                            tag.add_frame(id3::frame::Picture {
-                                mime_type: "image/jpeg".to_string(),
-                                picture_type: id3::frame::PictureType::CoverFront,
-                                description: String::new(),
-                                data: thumb_bytes,
-                            });
-                            let _ = tag.write_to_path(&mp3_path, id3::Version::Id3v24);
-                        }
+                    // Embed thumbnail as cover art via lofty so it works
+                    // for mp3, flac, m4a, and wav alike.
+                    if let Err(e) = cover_art::write_cover_to_file(media_path, &thumb_bytes) {
+                        eprintln!("Failed to embed cover art into {}: {}", fp, e);
                     }
                 }
             }

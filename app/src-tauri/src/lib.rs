@@ -26,7 +26,6 @@ mod ytdlp;
 
 use database::{Database, DownloadRecord};
 use error::AppError;
-use id3::TagLike;
 use metadata::RateLimiter;
 use tauri::{Emitter, Manager};
 use tauri_plugin_store::StoreExt;
@@ -259,29 +258,37 @@ async fn update_mp3_metadata(
 ) -> Result<String, AppError> {
     let file_path = std::path::PathBuf::from(&path);
 
-    // Write ID3 tags
-    let mut tag = id3::Tag::read_from_path(&file_path).unwrap_or_else(|_| id3::Tag::new());
-    if !title.is_empty() {
-        tag.set_title(&title);
-    }
-    if !artist.is_empty() {
-        tag.set_artist(&artist);
-    }
-    tag.write_to_path(&file_path, id3::Version::Id3v24)
-        .map_err(|e| AppError::Io(format!("Failed to write ID3 tags: {}", e)))?;
+    // Write tags via lofty (works on mp3/flac/m4a/wav).
+    cover_art::write_tags_to_file(
+        &file_path,
+        Some(&title),
+        Some(&artist),
+        None,
+        None,
+    )
+    .map_err(|e| AppError::Io(format!("Failed to write tags: {}", e)))?;
 
     // Determine target filename
     let current_filename = file_path
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_default();
+    let ext = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("mp3");
 
     let target_filename = if !new_filename.is_empty() && new_filename != current_filename {
         // User explicitly changed the filename
         new_filename
     } else if !artist.is_empty() && !title.is_empty() {
-        // Auto-name: "Artist - Title.mp3"
-        let auto_name = format!("{} - {}.mp3", sanitize_filename(&artist), sanitize_filename(&title));
+        // Auto-name: "Artist - Title.<ext>"
+        let auto_name = format!(
+            "{} - {}.{}",
+            sanitize_filename(&artist),
+            sanitize_filename(&title),
+            ext
+        );
         if auto_name != current_filename { auto_name } else { current_filename.clone() }
     } else {
         current_filename.clone()
@@ -360,14 +367,12 @@ async fn get_download_history(
                 record.status = "file_missing".to_string();
                 continue;
             }
-            // Read embedded cover art from MP3 files
+            // Read embedded cover art (mp3/flac/m4a/wav alike).
             if record.format == "mp3" {
-                if let Ok(tag) = id3::Tag::read_from_path(path) {
-                    if let Some(pic) = tag.pictures().next() {
-                        use base64::Engine;
-                        record.cover_art_base64 =
-                            base64::engine::general_purpose::STANDARD.encode(&pic.data);
-                    }
+                if let Some(bytes) = cover_art::read_cover_from_file(path) {
+                    use base64::Engine;
+                    record.cover_art_base64 =
+                        base64::engine::general_purpose::STANDARD.encode(&bytes);
                 }
             }
         }
@@ -1200,12 +1205,14 @@ async fn update_library_track(
         return Err(AppError::Io(format!("File not found: {}", path)));
     }
 
-    let mut tag = id3::Tag::read_from_path(&file_path).unwrap_or_else(|_| id3::Tag::new());
-    if !title.is_empty() { tag.set_title(&title); }
-    if !artist.is_empty() { tag.set_artist(&artist); }
-    if !album.is_empty() { tag.set_album(&album); }
-    tag.write_to_path(&file_path, id3::Version::Id3v24)
-        .map_err(|e| AppError::Io(format!("Failed to write ID3 tags: {}", e)))?;
+    cover_art::write_tags_to_file(
+        &file_path,
+        Some(&title),
+        Some(&artist),
+        Some(&album),
+        None,
+    )
+    .map_err(|e| AppError::Io(format!("Failed to write tags: {}", e)))?;
 
     let current_filename = file_path
         .file_name()
@@ -1240,9 +1247,7 @@ async fn update_library_track(
     };
 
     // Re-read cover art (may have been changed externally) for the cache.
-    let cover_bytes = id3::Tag::read_from_path(&final_path)
-        .ok()
-        .and_then(|t| t.pictures().next().map(|p| p.data.clone()));
+    let cover_bytes = cover_art::read_cover_from_file(std::path::Path::new(&final_path));
 
     let db = app.state::<Database>();
     db.update_library_track_after_edit(
@@ -1368,11 +1373,9 @@ async fn get_remote_info(app: tauri::AppHandle) -> Result<serde_json::Value, App
 #[tauri::command]
 async fn get_track_cover_art(path: String) -> Result<String, AppError> {
     let file_path = std::path::PathBuf::from(&path);
-    if let Ok(tag) = id3::Tag::read_from_path(&file_path) {
-        if let Some(pic) = tag.pictures().next() {
-            use base64::Engine;
-            return Ok(base64::engine::general_purpose::STANDARD.encode(&pic.data));
-        }
+    if let Some(bytes) = cover_art::read_cover_from_file(&file_path) {
+        use base64::Engine;
+        return Ok(base64::engine::general_purpose::STANDARD.encode(&bytes));
     }
     Ok(String::new())
 }

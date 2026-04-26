@@ -12,8 +12,12 @@
 use crate::database::Database;
 use crate::error::AppError;
 use base64::Engine;
-use id3::TagLike;
 use image::ImageFormat;
+use lofty::config::WriteOptions;
+use lofty::file::TaggedFileExt;
+use lofty::picture::{MimeType, Picture, PictureType};
+use lofty::probe::Probe;
+use lofty::tag::{Accessor, Tag, TagExt, TagType};
 use serde::Serialize;
 use std::io::Cursor;
 use std::path::Path;
@@ -100,8 +104,9 @@ pub async fn find_candidate(
     None
 }
 
-/// Embed JPEG bytes as the APIC cover-art frame on an MP3 and refresh the
-/// library_tracks cache row.
+/// Embed JPEG bytes as cover art on an audio file and refresh the
+/// library_tracks cache row. Format-agnostic: handles MP3 (ID3v2),
+/// FLAC (Vorbis comments), M4A (MP4 atoms), and WAV/AIFF (ID3v2 chunks).
 pub fn embed_cover_into_file(
     file_path: &str,
     jpeg_bytes: &[u8],
@@ -112,25 +117,126 @@ pub fn embed_cover_into_file(
         return Err(AppError::Io(format!("File not found: {}", file_path)));
     }
 
-    let mut tag = id3::Tag::read_from_path(&path).unwrap_or_else(|_| id3::Tag::new());
-
-    // Drop any existing pictures so we don't end up with duplicates.
-    tag.remove_all_pictures();
-    tag.add_frame(id3::frame::Picture {
-        mime_type: "image/jpeg".to_string(),
-        picture_type: id3::frame::PictureType::CoverFront,
-        description: String::new(),
-        data: jpeg_bytes.to_vec(),
-    });
-
-    tag.write_to_path(&path, id3::Version::Id3v24)
-        .map_err(|e| AppError::Io(format!("Failed to write ID3 tags: {}", e)))?;
+    write_cover_to_file(&path, jpeg_bytes)?;
 
     // Update the library cache row in place. We keep title/artist/album
     // intact and just refresh the cover BLOB + mtime/size so a rescan
     // doesn't immediately re-process this file.
     db.update_library_cover(file_path, jpeg_bytes)
         .map_err(|e| AppError::Io(e.to_string()))?;
+    Ok(())
+}
+
+/// Pick the natural tag type for a given audio file extension. Lofty
+/// supports all of these as the "primary" tag for the corresponding
+/// container, so writes round-trip cleanly with players like Rekordbox
+/// and Serato.
+fn tag_type_for(path: &Path) -> TagType {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("flac") | Some("ogg") | Some("opus") => TagType::VorbisComments,
+        Some("m4a") | Some("mp4") | Some("aac") => TagType::Mp4Ilst,
+        // mp3, wav, aif, aiff, and unknown all carry ID3v2.
+        _ => TagType::Id3v2,
+    }
+}
+
+/// Write JPEG bytes as the front-cover picture on any supported audio
+/// file via lofty. Preserves existing title/artist/album tags by editing
+/// the file's primary tag in place rather than overwriting it.
+pub fn write_cover_to_file(path: &Path, jpeg_bytes: &[u8]) -> Result<(), AppError> {
+    let tag_type = tag_type_for(path);
+
+    // Try to read existing tags so we don't clobber title/artist/album.
+    // If the file has no tags yet (fresh download), start a new tag of
+    // the correct type for the container.
+    let mut tag = match Probe::open(path).and_then(|p| p.read()) {
+        Ok(tagged) => tagged
+            .primary_tag()
+            .cloned()
+            .or_else(|| tagged.first_tag().cloned())
+            .unwrap_or_else(|| Tag::new(tag_type)),
+        Err(_) => Tag::new(tag_type),
+    };
+
+    // Drop any existing front-cover pictures so we don't accumulate
+    // duplicates on repeated embeds.
+    tag.remove_picture_type(PictureType::CoverFront);
+
+    tag.push_picture(Picture::new_unchecked(
+        PictureType::CoverFront,
+        Some(MimeType::Jpeg),
+        None,
+        jpeg_bytes.to_vec(),
+    ));
+
+    tag.save_to_path(path, WriteOptions::default())
+        .map_err(|e| AppError::Io(format!("Failed to write cover art: {}", e)))?;
+
+    Ok(())
+}
+
+/// Read raw cover-art bytes (any picture type, first one) from an audio
+/// file via lofty. Returns `None` for files without embedded art or
+/// formats lofty can't parse.
+pub fn read_cover_from_file(path: &Path) -> Option<Vec<u8>> {
+    let tagged = Probe::open(path).ok()?.read().ok()?;
+    let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
+    tag.pictures().first().map(|p| p.data().to_vec())
+}
+
+/// Write title/artist/album and an optional front-cover JPEG into the
+/// file's primary tag. Empty string fields are skipped (existing values
+/// preserved). Format-agnostic via lofty.
+pub fn write_tags_to_file(
+    path: &Path,
+    title: Option<&str>,
+    artist: Option<&str>,
+    album: Option<&str>,
+    cover_jpeg: Option<&[u8]>,
+) -> Result<(), AppError> {
+    let tag_type = tag_type_for(path);
+
+    let mut tag = match Probe::open(path).and_then(|p| p.read()) {
+        Ok(tagged) => tagged
+            .primary_tag()
+            .cloned()
+            .or_else(|| tagged.first_tag().cloned())
+            .unwrap_or_else(|| Tag::new(tag_type)),
+        Err(_) => Tag::new(tag_type),
+    };
+
+    if let Some(t) = title {
+        if !t.is_empty() {
+            tag.set_title(t.to_string());
+        }
+    }
+    if let Some(a) = artist {
+        if !a.is_empty() {
+            tag.set_artist(a.to_string());
+        }
+    }
+    if let Some(a) = album {
+        if !a.is_empty() {
+            tag.set_album(a.to_string());
+        }
+    }
+    if let Some(jpeg) = cover_jpeg {
+        tag.remove_picture_type(PictureType::CoverFront);
+        tag.push_picture(Picture::new_unchecked(
+            PictureType::CoverFront,
+            Some(MimeType::Jpeg),
+            None,
+            jpeg.to_vec(),
+        ));
+    }
+
+    tag.save_to_path(path, WriteOptions::default())
+        .map_err(|e| AppError::Io(format!("Failed to write tags: {}", e)))?;
     Ok(())
 }
 
