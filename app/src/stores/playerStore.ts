@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { useDownloadStore } from "./downloadStore";
-import { setSetting, getSettings } from "../lib/commands";
+import { setSetting, getSettings, audioSeek } from "../lib/commands";
 
 export interface PlayerTrack {
   id: string;
@@ -191,8 +191,7 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
     // the previous track. ~3s threshold matches Spotify / Apple Music.
     const RESTART_THRESHOLD_SECS = 3;
     if (currentTime > RESTART_THRESHOLD_SECS) {
-      const audio = document.querySelector("audio");
-      if (audio) audio.currentTime = 0;
+      void audioSeek(0);
       set({ currentTime: 0, isPlaying: true });
       return;
     }

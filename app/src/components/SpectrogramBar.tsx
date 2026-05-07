@@ -1,69 +1,14 @@
 import { useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { usePlayerStore } from "../stores/playerStore";
 
 const HEIGHT = 28;
+// Match SPECTRUM_BANDS in audio.rs. The Rust side log-buckets the FFT and
+// pushes a Vec<f32> at ~60Hz; we just render whatever it sends.
 const BANDS = 48;
 
-// Module-level singleton — MediaElementSource captures the audio element's
-// output exclusively, so we MUST re-connect it through the AnalyserNode to
-// the AudioContext destination, and the context MUST be resumed inside a
-// user-gesture callback for any sound to come out.
-let audioCtx: AudioContext | null = null;
-let analyser: AnalyserNode | null = null;
-const attached = new WeakSet<HTMLAudioElement>();
-
-/** Synchronous setup — must be called inside a user-gesture handler so that
- * resume() is treated as gesture-initiated. Returns the analyser immediately. */
-function getOrCreateAnalyser(audio: HTMLAudioElement): AnalyserNode | null {
-  try {
-    if (!audioCtx) {
-      const Ctx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      audioCtx = new Ctx();
-    }
-    // Kick resume synchronously; don't await (preserves gesture activation).
-    if (audioCtx.state === "suspended") {
-      void audioCtx.resume();
-    }
-    if (!analyser) {
-      analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 256;
-      analyser.smoothingTimeConstant = 0.75;
-    }
-    if (!attached.has(audio)) {
-      const source = audioCtx.createMediaElementSource(audio);
-      source.connect(analyser);
-      analyser.connect(audioCtx.destination);
-      attached.add(audio);
-    }
-    return analyser;
-  } catch (e) {
-    console.error("Spectrogram analyser setup failed:", e);
-    return null;
-  }
-}
-
-/** Bucket linear FFT bins into BANDS log-spaced bands so bass/mid/treble feel
- * balanced (linear bins overweight high frequencies). Returns 0..=1 per band. */
-function bucketLogBands(freqData: Uint8Array, bands: number): number[] {
-  const bins = freqData.length;
-  const out = new Array<number>(bands);
-  const minF = 1; // skip DC
-  const maxF = bins;
-  const logMin = Math.log(minF);
-  const logMax = Math.log(maxF);
-  let prev = minF;
-  for (let i = 0; i < bands; i++) {
-    const next = Math.exp(logMin + ((i + 1) / bands) * (logMax - logMin));
-    const lo = Math.floor(prev);
-    const hi = Math.min(bins, Math.max(lo + 1, Math.ceil(next)));
-    let peak = 0;
-    for (let j = lo; j < hi; j++) {
-      if (freqData[j] > peak) peak = freqData[j];
-    }
-    out[i] = peak / 255;
-    prev = next;
-  }
-  return out;
+interface SpectrumPayload {
+  bins: number[];
 }
 
 export function SpectrogramBar() {
@@ -71,6 +16,9 @@ export function SpectrogramBar() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [width, setWidth] = useState(0);
+  // Latest bins from Rust. A ref so the listener doesn't trigger React
+  // re-renders on every event — the canvas redraw is rAF-driven.
+  const binsRef = useRef<number[]>(new Array(BANDS).fill(0));
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -81,10 +29,21 @@ export function SpectrogramBar() {
     return () => obs.disconnect();
   }, []);
 
+  // Subscribe to spectrum events for the lifetime of the component.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<SpectrumPayload>("audio://spectrum", (e) => {
+      binsRef.current = e.payload.bins;
+    }).then((u) => {
+      unlisten = u;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
   useEffect(() => {
     if (!currentTrack) return;
-    const audio = document.querySelector("audio");
-    if (!audio) return;
     const canvas = canvasRef.current;
     if (!canvas || width === 0) return;
 
@@ -96,23 +55,13 @@ export function SpectrogramBar() {
     ctx.scale(dpr, dpr);
 
     let raf = 0;
-    let node: AnalyserNode | null = null;
-    let freqData: Uint8Array | null = null;
-
-    const drawIdle = () => {
-      ctx.clearRect(0, 0, width, HEIGHT);
-    };
-
     const draw = () => {
-      if (!node || !freqData) return;
-      node.getByteFrequencyData(freqData as Uint8Array<ArrayBuffer>);
-      const bands = bucketLogBands(freqData, BANDS);
-
+      const bins = binsRef.current;
       ctx.clearRect(0, 0, width, HEIGHT);
       const gap = 1;
       const barW = Math.max(1, (width - (BANDS - 1) * gap) / BANDS);
       for (let i = 0; i < BANDS; i++) {
-        const v = bands[i];
+        const v = bins[i] ?? 0;
         const h = Math.max(1, v * HEIGHT);
         const x = i * (barW + gap);
         const y = HEIGHT - h;
@@ -122,37 +71,8 @@ export function SpectrogramBar() {
       }
       raf = requestAnimationFrame(draw);
     };
-
-    // Defer Web Audio attachment until the audio element actually plays —
-    // browsers reroute the output through the AudioContext, which must be
-    // running (which requires a user gesture). Hooking the `play` event
-    // guarantees we're in a user-gesture context.
-    const onPlay = () => {
-      node = getOrCreateAnalyser(audio);
-      if (!node) return;
-      if (audioCtx && audioCtx.state === "suspended") {
-        void audioCtx.resume();
-      }
-      if (!freqData) freqData = new Uint8Array(new ArrayBuffer(node.frequencyBinCount));
-      cancelAnimationFrame(raf);
-      raf = requestAnimationFrame(draw);
-    };
-
-    audio.addEventListener("play", onPlay);
-    audio.addEventListener("playing", onPlay);
-    // If we mount mid-play (track switch with autoplay), kick off immediately
-    if (!audio.paused) onPlay();
-    else drawIdle();
-
-    return () => {
-      audio.removeEventListener("play", onPlay);
-      audio.removeEventListener("playing", onPlay);
-      cancelAnimationFrame(raf);
-    };
-    // Re-run only when the audio element identity could change (currentTrack
-    // appears/disappears) or the canvas resizes — NOT on filePath/isPlaying,
-    // which would tear down listeners around the play event and miss it on
-    // subsequent tracks.
+    raf = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(raf);
   }, [currentTrack ? "yes" : "no", width]);
 
   if (!currentTrack) return null;

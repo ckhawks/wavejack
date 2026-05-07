@@ -34,3 +34,5 @@ lofty = "0.22"
 sha2 = "0.10"
 webbrowser = "1"
 url = "2"
+rodio = { version = "0.22", features = ["symphonia-all"] }
+rustfft = "6"

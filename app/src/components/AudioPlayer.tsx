@@ -1,9 +1,17 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { Volume2, VolumeX, X, Shuffle, Maximize2 } from "lucide-react";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { usePlayerStore } from "../stores/playerStore";
 import { useDiscoverStore } from "../stores/discoverStore";
-import { recordTrackPlay } from "../lib/commands";
+import {
+  recordTrackPlay,
+  audioLoad,
+  audioPlay,
+  audioPause,
+  audioStop,
+  audioSeek,
+  audioSetVolume,
+} from "../lib/commands";
 import { useLibraryStore } from "../stores/libraryStore";
 import { WaveformBar } from "./WaveformBar";
 import { SpectrogramBar } from "./SpectrogramBar";
@@ -83,7 +91,6 @@ function Slider({
 }
 
 export function AudioPlayer() {
-  const audioRef = useRef<HTMLAudioElement>(null);
   const [showImmersive, setShowImmersive] = useState(false);
   const currentTrack = usePlayerStore((s) => s.currentTrack);
   const isPlaying = usePlayerStore((s) => s.isPlaying);
@@ -100,35 +107,69 @@ export function AudioPlayer() {
   const stop = usePlayerStore((s) => s.stop);
   const setVolume = usePlayerStore((s) => s.setVolume);
 
-  // Load new track. We use a custom Tauri URI scheme that serves files with
-  // permissive CORS so MediaElementSource (spectrogram) works; crossOrigin
-  // must be set BEFORE assigning src for the request to be CORS-enabled.
+  // Load new track natively. The Rust side decodes via symphonia and plays
+  // through rodio, so the audible output comes from the wavejack process.
   useEffect(() => {
-    const audio = audioRef.current;
-    if (!audio || !currentTrack) return;
-    audio.crossOrigin = "anonymous";
-    audio.src = convertFileSrc(currentTrack.filePath, "wjaudio");
-    audio.volume = usePlayerStore.getState().volume;
-    audio.load();
-    audio.play().catch(() => {});
-  }, [currentTrack?.id, currentTrack?.filePath]);
+    if (!currentTrack) return;
+    let cancelled = false;
+    audioLoad(currentTrack.filePath)
+      .then((result) => {
+        if (cancelled) return;
+        if (result.duration > 0) setDuration(result.duration);
+        // Honor the persisted shouldPlay state — the store sets isPlaying
+        // = true on playTrack, so this is the common path. If the user
+        // pressed pause between selecting and loading, leave it paused.
+        if (usePlayerStore.getState().isPlaying) {
+          void audioPlay();
+        }
+      })
+      .catch((e) => console.error("audio_load failed:", e));
+    return () => {
+      cancelled = true;
+    };
+  }, [currentTrack?.id, currentTrack?.filePath, setDuration]);
 
-  // Sync play/pause state
+  // Sync play/pause state with the Rust player.
   useEffect(() => {
-    const audio = audioRef.current;
-    if (!audio || !currentTrack) return;
+    if (!currentTrack) return;
     if (isPlaying) {
-      audio.play().catch(() => {});
+      void audioPlay();
     } else {
-      audio.pause();
+      void audioPause();
     }
   }, [isPlaying, currentTrack]);
 
   // Sync volume
   useEffect(() => {
-    const audio = audioRef.current;
-    if (audio) audio.volume = volume;
+    void audioSetVolume(volume);
   }, [volume]);
+
+  // Subscribe to Rust-side progress + ended events. The Rust emitter
+  // ticks at ~60Hz with the authoritative playback time (frozen during
+  // pauses, advanced by rodio's monotonic position counter).
+  useEffect(() => {
+    let unlistenProgress: (() => void) | undefined;
+    let unlistenEnded: (() => void) | undefined;
+    listen<{ currentTime: number; duration: number }>("audio://progress", (e) => {
+      const { currentTime, duration } = e.payload;
+      const store = usePlayerStore.getState();
+      if (!store.currentTrack) return;
+      // Avoid bumping store.duration on every tick if it's already set.
+      if (duration > 0 && store.duration !== duration) setDuration(duration);
+      setCurrentTime(currentTime);
+    }).then((u) => {
+      unlistenProgress = u;
+    });
+    listen<string>("audio://ended", () => {
+      onEndedRef.current?.();
+    }).then((u) => {
+      unlistenEnded = u;
+    });
+    return () => {
+      unlistenProgress?.();
+      unlistenEnded?.();
+    };
+  }, [setCurrentTime, setDuration]);
 
   // Register with OS media transport controls (MediaSession API) so hardware
   // media keys, Stream Deck buttons, and Windows media overlays work.
@@ -160,13 +201,15 @@ export function AudioPlayer() {
     navigator.mediaSession.setActionHandler("previoustrack", () => playPrev());
     navigator.mediaSession.setActionHandler("nexttrack", () => playNext());
     navigator.mediaSession.setActionHandler("seekto", (details) => {
-      const audio = audioRef.current;
-      if (audio && details.seekTime != null) {
-        audio.currentTime = details.seekTime;
+      if (details.seekTime != null) {
+        void audioSeek(details.seekTime);
         setCurrentTime(details.seekTime);
       }
     });
-    navigator.mediaSession.setActionHandler("stop", () => stop());
+    navigator.mediaSession.setActionHandler("stop", () => {
+      void audioStop();
+      stop();
+    });
     return () => {
       navigator.mediaSession.setActionHandler("play", null);
       navigator.mediaSession.setActionHandler("pause", null);
@@ -186,16 +229,6 @@ export function AudioPlayer() {
       position: Math.min(currentTime, duration),
     });
   }, [currentTime, duration]);
-
-  const onTimeUpdate = useCallback(() => {
-    const audio = audioRef.current;
-    if (audio) setCurrentTime(audio.currentTime);
-  }, [setCurrentTime]);
-
-  const onLoadedMetadata = useCallback(() => {
-    const audio = audioRef.current;
-    if (audio) setDuration(audio.duration);
-  }, [setDuration]);
 
   const onEnded = useCallback(() => {
     const discover = useDiscoverStore.getState();
@@ -222,13 +255,25 @@ export function AudioPlayer() {
     playNext();
   }, [playNext]);
 
+  // The audio://ended listener is attached once with a stable closure; route
+  // through a ref so the latest onEnded (which closes over fresh playNext)
+  // is always invoked without re-binding the listener.
+  const onEndedRef = useRef(onEnded);
+  useEffect(() => {
+    onEndedRef.current = onEnded;
+  }, [onEnded]);
+
   const handleSeek = (val: number) => {
-    const audio = audioRef.current;
-    if (audio) {
-      audio.currentTime = val;
-      setCurrentTime(val);
-    }
+    setCurrentTime(val);
+    void audioSeek(val);
   };
+
+  // When the user explicitly stops, also tear down the native player so the
+  // device handle is released and no stray ended event fires.
+  const handleStop = useCallback(() => {
+    void audioStop();
+    stop();
+  }, [stop]);
 
   if (!currentTrack) return null;
 
@@ -241,13 +286,6 @@ export function AudioPlayer() {
         <SpectrogramBar />
         <WaveformBar />
       <div className="flex h-16 items-center gap-3 border-t border-[#222] bg-[#111] px-4">
-        <audio
-          ref={audioRef}
-          onTimeUpdate={onTimeUpdate}
-          onLoadedMetadata={onLoadedMetadata}
-          onEnded={onEnded}
-        />
-
         {/* Album art — clickable to expand */}
         <button
           className="h-10 w-10 shrink-0 overflow-hidden rounded bg-[#222]"
@@ -342,7 +380,7 @@ export function AudioPlayer() {
         </button>
 
         {/* Close */}
-        <button onClick={stop} className="ml-1 rounded p-1 text-neutral-600 hover:text-white">
+        <button onClick={handleStop} className="ml-1 rounded p-1 text-neutral-600 hover:text-white">
           <X size={14} />
         </button>
         </div>

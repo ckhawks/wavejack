@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { usePlayerStore } from "../stores/playerStore";
-import { getOrComputeWaveform } from "../lib/commands";
+import { getOrComputeWaveform, audioSeek } from "../lib/commands";
 
 const BAR_GAP = 1; // px between bars
 
@@ -62,19 +62,32 @@ export function WaveformBar({
     };
   }, [currentTrack?.filePath]);
 
-  // Smooth playhead: read audio.currentTime each animation frame so the
-  // waveform updates at ~60Hz rather than the audio element's ~4Hz timeupdate.
+  // Smooth playhead: interpolate between the ~60Hz progress events from Rust
+  // using a local rAF loop. The Rust emitter ticks at ~16ms, but we want the
+  // visual playhead to advance every animation frame for buttery motion.
   useEffect(() => {
-    const audio = document.querySelector("audio");
-    if (!audio) return;
     let raf = 0;
-    const tick = () => {
-      setSmoothTime(audio.currentTime);
+    let lastTime = currentTime;
+    let lastWall = performance.now();
+    const tick = (now: number) => {
+      const store = usePlayerStore.getState();
+      // Re-anchor whenever the store's currentTime jumps (event tick or seek).
+      if (Math.abs(store.currentTime - lastTime) > 0.01) {
+        lastTime = store.currentTime;
+        lastWall = now;
+      }
+      const drift = store.isPlaying ? (now - lastWall) / 1000 : 0;
+      setSmoothTime(lastTime + drift);
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [isPlaying, currentTrack?.filePath]);
+    // Re-arm on track change so the initial anchor is fresh.
+  }, [currentTrack?.filePath]);
+  // Suppress unused-deps lint for the values we deliberately read off the
+  // store inside the rAF loop instead of via React state to avoid restarts.
+  void isPlaying;
+  void currentTime;
 
   // Cascade-in animation: drive appearProgress 0 -> 1 over ~600ms after load.
   useEffect(() => {
@@ -169,8 +182,7 @@ export function WaveformBar({
     const ratio = (e.clientX - rect.left) / rect.width;
     const t = Math.max(0, Math.min(duration, ratio * duration));
     setCurrentTime(t);
-    const audio = document.querySelector("audio");
-    if (audio) audio.currentTime = t;
+    void audioSeek(t);
   };
 
   if (!currentTrack) return null;

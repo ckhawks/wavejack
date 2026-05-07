@@ -287,6 +287,39 @@ export async function getRemoteInfo(): Promise<RemoteInfo> {
   return invoke("get_remote_info");
 }
 
+// ======================== Native audio playback ========================
+// Audio decode + output runs in the Rust process so that screenshare/window
+// capture sees it (WebView2's audio child process was opaque to per-window
+// capture). The frontend is now a controller; samples never enter the webview.
+
+export interface AudioLoadResult {
+  duration: number;
+}
+
+export async function audioLoad(path: string): Promise<AudioLoadResult> {
+  return invoke("audio_load", { path });
+}
+
+export async function audioPlay(): Promise<void> {
+  return invoke("audio_play");
+}
+
+export async function audioPause(): Promise<void> {
+  return invoke("audio_pause");
+}
+
+export async function audioStop(): Promise<void> {
+  return invoke("audio_stop");
+}
+
+export async function audioSeek(secs: number): Promise<void> {
+  return invoke("audio_seek", { secs });
+}
+
+export async function audioSetVolume(volume: number): Promise<void> {
+  return invoke("audio_set_volume", { volume });
+}
+
 // ======================== Playlists ========================
 
 export async function createPlaylist(name: string): Promise<Playlist> {
