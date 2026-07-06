@@ -127,6 +127,50 @@ export interface TidalMatchProgress {
   match: TidalMatch;
 }
 
+/** One SoundCloud playlist entry to fuzzy-match against Tidal. `index` keys
+ *  the result back to its playlist row. */
+export interface ScMatchInput {
+  index: number;
+  title: string;
+  uploader: string | null;
+  duration: number | null;
+}
+
+/** Result of matching a single SoundCloud entry on Tidal. No ISRC path — status
+ *  is only ever "found_fuzzy" | "not_found" | "error". */
+export interface ScTidalMatch {
+  index: number;
+  status: TidalMatchStatus;
+  query_artist: string;
+  query_title: string;
+  tidal_id: number | null;
+  tidal_title: string | null;
+  tidal_artists: string[] | null;
+  tidal_quality: string | null;
+  tidal_url: string | null;
+  duration_delta_sec: number | null;
+  /** Match confidence 0.0–1.0 for accepted matches; null when nothing cleared
+   *  the similarity gate. */
+  confidence: number | null;
+  reason: string | null;
+}
+
+/** Result of validating the configured SoundCloud cookies browser. `ok` is
+ *  true only when a logged-in SoundCloud session was found. */
+export interface CookieCheck {
+  ok: boolean;
+  status: "logged_in" | "not_logged_in" | "no_cookies" | "error";
+  message: string;
+  cookie_count: number;
+}
+
+/** Payload of the "tidal-sc-match-progress" Tauri event. */
+export interface ScTidalMatchProgress {
+  index: number;
+  total: number;
+  match: ScTidalMatch;
+}
+
 /** Shape of the download-status event from Rust */
 export interface DownloadStatusEvent {
   id: string;
@@ -187,6 +231,9 @@ export interface PlaylistEntry {
   title: string;
   duration: number | null;
   uploader: string | null;
+  /** SoundCloud AD_SUPPORTED (DRM-encrypted) track — the original can't be
+   *  downloaded from SoundCloud; use the Tidal match instead. */
+  drm: boolean;
 }
 
 /** A seed track for the Discover feature */

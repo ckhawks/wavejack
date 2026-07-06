@@ -155,6 +155,13 @@ impl Database {
             "ALTER TABLE library_tracks ADD COLUMN last_played_at INTEGER NOT NULL DEFAULT 0",
             [],
         ).ok();
+        // Content-detected container type ("MP3", "M4A", "FLAC", ...). Empty for
+        // legacy rows; the scanner backfills it by re-reading such rows (see
+        // library_tracks_fingerprint + the walk() skip condition).
+        conn.execute(
+            "ALTER TABLE library_tracks ADD COLUMN file_type TEXT NOT NULL DEFAULT ''",
+            [],
+        ).ok();
 
         // Playlists
         conn.execute_batch(
@@ -252,18 +259,18 @@ impl Database {
         Ok(())
     }
 
-    /// Return (path, mtime, size, duration_secs, bitrate_kbps, bitrate_estimated)
-    /// for every cached track in the given folder. The scanner uses these to
-    /// detect rows that need re-reading even when mtime/size are unchanged
-    /// (e.g. legacy rows missing values now produced by the lofty parser, or
-    /// rows whose bitrate is a size/duration estimate rather than a real read).
+    /// Return (path, mtime, size, duration_secs, bitrate_kbps, bitrate_estimated,
+    /// file_type) for every cached track in the given folder. The scanner uses
+    /// these to detect rows that need re-reading even when mtime/size are
+    /// unchanged (e.g. legacy rows missing values now produced by the lofty
+    /// parser, rows with an estimated bitrate, or rows missing file_type).
     pub fn library_tracks_fingerprint(
         &self,
         folder: &str,
-    ) -> Result<Vec<(String, i64, i64, i64, i64, bool)>, rusqlite::Error> {
+    ) -> Result<Vec<(String, i64, i64, i64, i64, bool, String)>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT path, mtime, size, duration_secs, bitrate_kbps, bitrate_estimated FROM library_tracks WHERE folder = ?1",
+            "SELECT path, mtime, size, duration_secs, bitrate_kbps, bitrate_estimated, file_type FROM library_tracks WHERE folder = ?1",
         )?;
         let rows = stmt.query_map(params![folder], |row| {
             Ok((
@@ -273,6 +280,7 @@ impl Database {
                 row.get::<_, i64>(3)?,
                 row.get::<_, i64>(4)?,
                 row.get::<_, i64>(5)? != 0,
+                row.get::<_, String>(6)?,
             ))
         })?;
         rows.collect()
@@ -305,8 +313,8 @@ impl Database {
         // Insert if new; otherwise update everything except first_scanned_at.
         conn.execute(
             "INSERT INTO library_tracks
-             (path, folder, filename, title, artist, album, duration_secs, mtime, size, cover_art, first_scanned_at, bitrate_kbps, bitrate_estimated)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             (path, folder, filename, title, artist, album, duration_secs, mtime, size, cover_art, first_scanned_at, bitrate_kbps, bitrate_estimated, file_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(path) DO UPDATE SET
                 folder = excluded.folder,
                 filename = excluded.filename,
@@ -318,7 +326,8 @@ impl Database {
                 size = excluded.size,
                 cover_art = excluded.cover_art,
                 bitrate_kbps = excluded.bitrate_kbps,
-                bitrate_estimated = excluded.bitrate_estimated",
+                bitrate_estimated = excluded.bitrate_estimated,
+                file_type = excluded.file_type",
             params![
                 track.path,
                 folder,
@@ -333,6 +342,7 @@ impl Database {
                 now,
                 bitrate_kbps,
                 bitrate_estimated as i64,
+                track.file_type,
             ],
         )?;
         Ok(())
@@ -463,6 +473,46 @@ impl Database {
         Ok(())
     }
 
+    /// Update a track's path/filename and cached content type after an
+    /// extension fix, cascading the path change to related tables. `new_path`
+    /// may equal `old_path` (type-only refresh with no rename).
+    pub fn update_track_path_and_type(
+        &self,
+        old_path: &str,
+        new_path: &str,
+        file_type: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let new_filename = std::path::Path::new(new_path)
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let meta = std::fs::metadata(new_path).ok();
+        let mtime = meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        conn.execute(
+            "UPDATE library_tracks
+             SET path = ?1, filename = ?2, file_type = ?3, mtime = ?4
+             WHERE path = ?5",
+            params![new_path, new_filename, file_type, mtime, old_path],
+        )?;
+        if old_path != new_path {
+            conn.execute(
+                "UPDATE playlist_tracks SET track_path = ?1 WHERE track_path = ?2",
+                params![new_path, old_path],
+            )?;
+            conn.execute(
+                "UPDATE track_tags SET track_path = ?1 WHERE track_path = ?2",
+                params![new_path, old_path],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn delete_library_tracks(&self, paths: &[String]) -> Result<(), rusqlite::Error> {
         if paths.is_empty() { return Ok(()); }
         let mut conn = self.conn.lock().unwrap();
@@ -501,7 +551,7 @@ impl Database {
         };
 
         let mut stmt = conn.prepare(
-            "SELECT path, filename, title, artist, album, duration_secs, cover_art, first_scanned_at, bitrate_kbps, play_count, last_played_at, bitrate_estimated
+            "SELECT path, filename, title, artist, album, duration_secs, cover_art, first_scanned_at, bitrate_kbps, play_count, last_played_at, bitrate_estimated, file_type
              FROM library_tracks
              ORDER BY LOWER(artist), LOWER(album), LOWER(title)",
         )?;
@@ -525,6 +575,7 @@ impl Database {
                 play_count: row.get::<_, i64>(9)? as u32,
                 last_played_at: row.get::<_, i64>(10)?,
                 bitrate_estimated: row.get::<_, i64>(11)? != 0,
+                file_type: row.get::<_, String>(12)?,
             })
         })?;
         rows.collect()

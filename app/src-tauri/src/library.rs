@@ -1,12 +1,123 @@
 use base64::Engine;
-use lofty::file::{AudioFile, TaggedFileExt};
+use lofty::file::{AudioFile, FileType, TaggedFile, TaggedFileExt};
 use lofty::probe::Probe;
 use lofty::tag::Accessor;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::database::Database;
+
+/// For a content-detected container type, return its (display label, canonical
+/// extension, set of acceptable extensions). `None` for exotic/unknown types we
+/// won't second-guess. The acceptable set matters because one container has
+/// several valid extensions (e.g. an MP4 audio file may be .m4a or .mp4), so we
+/// only flag a true mismatch — never rename .mp4→.m4a just to normalize.
+fn type_info(ft: FileType) -> Option<(&'static str, &'static str, &'static [&'static str])> {
+    use FileType::*;
+    Some(match ft {
+        Mpeg => ("MP3", "mp3", &["mp3"]),
+        Flac => ("FLAC", "flac", &["flac"]),
+        // MP4 container — may hold AAC or (Tidal HI_RES) FLAC; the extension is
+        // about the container, so .m4a/.mp4 are both correct.
+        Mp4 => ("M4A", "m4a", &["m4a", "mp4", "m4b", "m4p"]),
+        Opus => ("Opus", "opus", &["opus", "ogg"]),
+        Vorbis => ("OGG", "ogg", &["ogg", "oga"]),
+        Wav => ("WAV", "wav", &["wav", "wave"]),
+        Aiff => ("AIFF", "aiff", &["aiff", "aif", "aifc"]),
+        Aac => ("AAC", "aac", &["aac"]),
+        Ape => ("APE", "ape", &["ape"]),
+        WavPack => ("WavPack", "wv", &["wv"]),
+        Speex => ("Speex", "spx", &["spx", "ogg"]),
+        _ => return None,
+    })
+}
+
+/// Read a file's tags using **content-based** type detection. `Probe::open`
+/// alone trusts the filename extension, so a misnamed file (e.g. an AAC/MP4
+/// stream saved as ".mp3") would be parsed as the wrong container — or misread.
+/// `guess_file_type()` sniffs the actual magic bytes so we always work on the
+/// true format. Returns `None` when lofty can't parse the file at all.
+pub fn read_tagged(path: &Path) -> Option<TaggedFile> {
+    Probe::open(path).ok()?.guess_file_type().ok()?.read().ok()
+}
+
+/// Read embedded (title, artist, album) from a file's primary tag. Empty
+/// strings where a field is absent. Used to backfill download-history rows,
+/// which are stored blank at download time even though the downloader (yt-dlp,
+/// tidal-dl-ng) embeds these tags into the file itself.
+pub fn read_basic_tags(path: &Path) -> (String, String, String) {
+    let Some(tagged) = read_tagged(path) else {
+        return (String::new(), String::new(), String::new());
+    };
+    let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
+        return (String::new(), String::new(), String::new());
+    };
+    (
+        tag.title().map(|s| s.to_string()).unwrap_or_default(),
+        tag.artist().map(|s| s.to_string()).unwrap_or_default(),
+        tag.album().map(|s| s.to_string()).unwrap_or_default(),
+    )
+}
+
+/// Human-readable label for the Library "Type" column. Reads the file's real
+/// container via lofty; falls back to the (upper-cased) extension when lofty
+/// can't parse it (e.g. WMA).
+pub fn detect_type_label(path: &Path) -> String {
+    if let Some(tf) = read_tagged(path) {
+        if let Some((label, _, _)) = type_info(tf.file_type()) {
+            return label.to_string();
+        }
+    }
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_uppercase())
+        .unwrap_or_default()
+}
+
+/// If `path`'s extension doesn't match its actual container, return the correct
+/// extension. `None` means the extension is already valid or the file can't be
+/// read / isn't a type we rename.
+pub fn corrected_extension(path: &Path) -> Option<&'static str> {
+    let tf = read_tagged(path)?;
+    let (_, canonical, accepted) = type_info(tf.file_type())?;
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match ext {
+        Some(e) if accepted.contains(&e.as_str()) => None,
+        _ => Some(canonical),
+    }
+}
+
+/// Rename `path` to its content-correct extension when mislabeled, without
+/// clobbering an existing file. Returns (final path, whether it was renamed).
+pub fn fix_extension(path: &Path) -> std::io::Result<(PathBuf, bool)> {
+    let Some(correct) = corrected_extension(path) else {
+        return Ok((path.to_path_buf(), false));
+    };
+    let mut target = path.with_extension(correct);
+    if target == path {
+        return Ok((path.to_path_buf(), false));
+    }
+    // Never overwrite an unrelated file already sitting at the target name.
+    if target.exists() {
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("track");
+        let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let mut n = 1;
+        loop {
+            let candidate = dir.join(format!("{} ({}).{}", stem, n, correct));
+            if !candidate.exists() {
+                target = candidate;
+                break;
+            }
+            n += 1;
+        }
+    }
+    std::fs::rename(path, &target)?;
+    Ok((target, true))
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LibraryTrack {
@@ -41,6 +152,10 @@ pub struct LibraryTrack {
     /// Top tags from Last.fm, populated by bulk load from track_tags table.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Content-detected container type ("MP3", "M4A", "FLAC", ...). May differ
+    /// from the filename's extension for mislabeled files.
+    #[serde(default)]
+    pub file_type: String,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -60,10 +175,10 @@ pub fn scan_folder_incremental(folder: &Path, db: &Database) -> ScanResult {
     let cache = db
         .library_tracks_fingerprint(&folder_str)
         .unwrap_or_default();
-    // path -> (mtime, size, duration_secs, bitrate_kbps, bitrate_estimated)
-    let cache_map: HashMap<String, (i64, i64, i64, i64, bool)> = cache
+    // path -> (mtime, size, duration_secs, bitrate_kbps, bitrate_estimated, file_type)
+    let cache_map: HashMap<String, (i64, i64, i64, i64, bool, String)> = cache
         .into_iter()
-        .map(|(p, m, s, d, b, e)| (p, (m, s, d, b, e)))
+        .map(|(p, m, s, d, b, e, ft)| (p, (m, s, d, b, e, ft)))
         .collect();
 
     let mut seen_paths: Vec<String> = Vec::with_capacity(cache_map.len());
@@ -87,7 +202,7 @@ pub fn scan_folder_incremental(folder: &Path, db: &Database) -> ScanResult {
 fn walk(
     dir: &Path,
     folder_root: &str,
-    cache: &HashMap<String, (i64, i64, i64, i64, bool)>,
+    cache: &HashMap<String, (i64, i64, i64, i64, bool, String)>,
     seen: &mut Vec<String>,
     result: &mut ScanResult,
     db: &Database,
@@ -124,10 +239,13 @@ fn walk(
 
         match cache.get(&path_str) {
             // Skip only if mtime+size match AND duration+bitrate are populated
-            // AND the bitrate was read by lofty (not a size/duration estimate).
-            // A 0 in either, or an estimated bitrate, signals a row that needs
-            // re-reading through the lofty parser.
-            Some(&(m, s, d, b, est)) if m == mtime && s == size && d > 0 && b > 0 && !est => {
+            // AND the bitrate was read by lofty (not a size/duration estimate)
+            // AND we already have a content-detected file_type. A 0 in either,
+            // an estimated bitrate, or a blank file_type signals a row that
+            // needs re-reading through the lofty parser.
+            Some((m, s, d, b, est, ft))
+                if *m == mtime && *s == size && *d > 0 && *b > 0 && !*est && !ft.is_empty() =>
+            {
                 result.unchanged += 1;
                 continue;
             }
@@ -195,8 +313,8 @@ fn read_track_metadata(path: &Path) -> Option<(LibraryTrack, Option<Vec<u8>>)> {
     let filename = path.file_name()?.to_string_lossy().to_string();
     let path_str = path.to_string_lossy().to_string();
 
-    if let Ok(probe) = Probe::open(path) {
-        if let Ok(tagged) = probe.read() {
+    if let Some(tagged) = read_tagged(path) {
+        {
             let props = tagged.properties();
             let mut duration_secs = props.duration().as_secs() as u32;
             let mut bitrate_kbps = props.audio_bitrate().unwrap_or(0);
@@ -242,6 +360,9 @@ fn read_track_metadata(path: &Path) -> Option<(LibraryTrack, Option<Vec<u8>>)> {
                     play_count: 0,
                     last_played_at: 0,
                     tags: Vec::new(),
+                    file_type: type_info(tagged.file_type())
+                        .map(|(l, _, _)| l.to_string())
+                        .unwrap_or_default(),
                 },
                 cover_bytes,
             ));
@@ -266,6 +387,12 @@ fn read_track_metadata(path: &Path) -> Option<(LibraryTrack, Option<Vec<u8>>)> {
             play_count: 0,
             last_played_at: 0,
             tags: Vec::new(),
+            // lofty couldn't parse it — best-effort label from the extension.
+            file_type: path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_uppercase())
+                .unwrap_or_default(),
         },
         None,
     ))

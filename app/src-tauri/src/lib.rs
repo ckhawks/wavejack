@@ -368,12 +368,35 @@ async fn get_download_history(
                 record.status = "file_missing".to_string();
                 continue;
             }
-            // Read embedded cover art (mp3/flac/m4a/wav alike).
-            if record.format == "mp3" {
+            // Read embedded cover art. read_cover_from_file is lofty-based and
+            // format-agnostic, so cover any container we actually write —
+            // Tidal lands flac/m4a, SoundCloud re-encodes to flac, etc. Gating
+            // on "mp3" alone dropped the thumbnail for every lossless download
+            // on restart.
+            if matches!(
+                record.format.as_str(),
+                "mp3" | "flac" | "m4a" | "mp4" | "wav" | "ogg" | "opus"
+            ) {
                 if let Some(bytes) = cover_art::read_cover_from_file(path) {
                     use base64::Engine;
                     record.cover_art_base64 =
                         base64::engine::general_purpose::STANDARD.encode(&bytes);
+                }
+                // Download rows are stored with blank title/artist/album — the
+                // downloader embeds these into the file but Wavejack never
+                // copied them into the DB row, so the Downloads panel showed no
+                // artist while the Library (which reads file tags) did. Backfill
+                // from the file's embedded tags, only where the row is empty so
+                // a user's manual edit still wins.
+                let (t_title, t_artist, t_album) = library::read_basic_tags(path);
+                if record.title.is_empty() {
+                    record.title = t_title;
+                }
+                if record.artist.is_empty() {
+                    record.artist = t_artist;
+                }
+                if record.album.is_empty() {
+                    record.album = t_album;
                 }
             }
         }
@@ -1113,7 +1136,36 @@ async fn extract_playlist(
     url: String,
 ) -> Result<ytdlp::PlaylistInfo, AppError> {
     let ytdlp_path = ytdlp::ensure_ytdlp(&app).await?;
-    ytdlp::extract_playlist(&ytdlp_path, &url).await
+    // Pass SoundCloud cookies so private / Go+ / region-locked tracks resolve
+    // their real titles instead of falling back to a bare track ID — same
+    // cookies the download path uses.
+    let sc_cookies = get_store_value(&app, "soundcloudCookiesBrowser").unwrap_or_default();
+    let sc_cookies_opt = if sc_cookies.is_empty() { None } else { Some(sc_cookies.as_str()) };
+    ytdlp::extract_playlist(&ytdlp_path, &url, sc_cookies_opt).await
+}
+
+/// Resolve a single SoundCloud track URL to its metadata + DRM status, so the
+/// UI can offer a Tidal match when the SoundCloud original can't be downloaded.
+#[tauri::command]
+async fn resolve_soundcloud_track(
+    app: tauri::AppHandle,
+    url: String,
+) -> Result<ytdlp::PlaylistEntry, AppError> {
+    let ytdlp_path = ytdlp::ensure_ytdlp(&app).await?;
+    let sc_cookies = get_store_value(&app, "soundcloudCookiesBrowser").unwrap_or_default();
+    let sc_cookies_opt = if sc_cookies.is_empty() { None } else { Some(sc_cookies.as_str()) };
+    Ok(ytdlp::resolve_single_soundcloud(&ytdlp_path, &url, sc_cookies_opt).await)
+}
+
+/// Validate that the given browser yields a logged-in SoundCloud session, so
+/// the user can confirm cookies are set up before relying on them.
+#[tauri::command]
+async fn validate_soundcloud_cookies(
+    app: tauri::AppHandle,
+    browser: String,
+) -> Result<ytdlp::CookieCheck, AppError> {
+    let ytdlp_path = ytdlp::ensure_ytdlp(&app).await?;
+    Ok(ytdlp::check_soundcloud_cookies(&ytdlp_path, &browser).await)
 }
 
 // ========================================================================
@@ -1247,9 +1299,9 @@ async fn update_library_track(
         path.clone()
     };
 
-    // Re-read cover art (may have been changed externally) for the cache.
-    let cover_bytes = cover_art::read_cover_from_file(std::path::Path::new(&final_path));
-
+    // A metadata edit never touches the cover, so skip re-reading the whole
+    // file just to refresh the cache — passing None leaves the cached art
+    // intact. (Cover changes come through the dedicated embed path.)
     let db = app.state::<Database>();
     db.update_library_track_after_edit(
         &path,
@@ -1257,11 +1309,226 @@ async fn update_library_track(
         &title,
         &artist,
         &album,
-        cover_bytes.as_deref(),
+        None,
     )
     .map_err(|e| AppError::Io(e.to_string()))?;
 
     Ok(final_path)
+}
+
+/// One track's parsed edit for the bulk-parse command.
+#[derive(serde::Deserialize)]
+struct BulkParseEdit {
+    path: String,
+    title: String,
+    artist: String,
+    album: String,
+}
+
+/// Apply a single parsed edit: write tags, rename to "{Artist} - {Title}.{ext}",
+/// and update the DB row. Blocking (lofty + std::fs) — call from spawn_blocking.
+/// Unlike `update_library_track` this skips the cover re-read: parsing never
+/// touches cover art, and passing `None` leaves the cached art untouched.
+fn apply_bulk_parse_edit(app: &tauri::AppHandle, edit: &BulkParseEdit) -> Result<String, AppError> {
+    let file_path = std::path::PathBuf::from(&edit.path);
+    if !file_path.exists() {
+        return Err(AppError::Io(format!("File not found: {}", edit.path)));
+    }
+
+    cover_art::write_tags_to_file(
+        &file_path,
+        Some(&edit.title),
+        Some(&edit.artist),
+        Some(&edit.album),
+        None,
+    )
+    .map_err(|e| AppError::Io(format!("Failed to write tags: {}", e)))?;
+
+    let current_filename = file_path
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let ext = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_string();
+    let target_filename = if !edit.artist.is_empty() && !edit.title.is_empty() {
+        let stem = format!("{} - {}", sanitize_filename(&edit.artist), sanitize_filename(&edit.title));
+        if ext.is_empty() { stem } else { format!("{}.{}", stem, ext) }
+    } else {
+        current_filename.clone()
+    };
+
+    let final_path = if target_filename != current_filename {
+        let new_path = file_path.with_file_name(&target_filename);
+        std::fs::rename(&file_path, &new_path)
+            .map_err(|e| AppError::Io(format!("Failed to rename file: {}", e)))?;
+        new_path.to_string_lossy().to_string()
+    } else {
+        edit.path.clone()
+    };
+
+    let db = app.state::<Database>();
+    db.update_library_track_after_edit(
+        &edit.path,
+        &final_path,
+        &edit.title,
+        &edit.artist,
+        &edit.album,
+        None,
+    )
+    .map_err(|e| AppError::Io(e.to_string()))?;
+
+    Ok(final_path)
+}
+
+/// Bulk-apply parsed "Artist - Title" edits to many library tracks at once.
+/// Runs the per-file work (tag rewrite + rename) concurrently on the blocking
+/// pool instead of one blocking IPC round-trip per track, and emits a
+/// `library-bulk-parse-progress` event as each track finishes. Returns the
+/// number of tracks successfully updated.
+#[tauri::command]
+async fn bulk_parse_library_tracks(
+    app: tauri::AppHandle,
+    edits: Vec<BulkParseEdit>,
+) -> Result<usize, AppError> {
+    use futures_util::stream::StreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    // A single file that lofty can't rewrite (e.g. locked by the OS because
+    // it's the currently-playing track) must not stall the whole batch. Cap
+    // each file's work; the leaked blocking thread finishes on its own.
+    const PER_FILE_TIMEOUT: Duration = Duration::from_secs(30);
+
+    let total = edits.len();
+    let done = Arc::new(AtomicUsize::new(0));
+
+    let results = futures_util::stream::iter(edits.into_iter())
+        .map(|edit| {
+            let app = app.clone();
+            let done = done.clone();
+            async move {
+                // Show the file we're starting on so the badge names in-flight
+                // work, not just the last thing that finished.
+                let name = std::path::Path::new(&edit.path)
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let _ = app.emit(
+                    "library-bulk-parse-progress",
+                    serde_json::json!({ "done": done.load(Ordering::Relaxed), "total": total, "current": name }),
+                );
+
+                let app_task = app.clone();
+                let join = tokio::task::spawn_blocking(move || apply_bulk_parse_edit(&app_task, &edit));
+                let res = match tokio::time::timeout(PER_FILE_TIMEOUT, join).await {
+                    Ok(joined) => joined.unwrap_or_else(|e| Err(AppError::Io(format!("Task panicked: {}", e)))),
+                    Err(_) => Err(AppError::Io(format!("Timed out after {}s (file locked?)", PER_FILE_TIMEOUT.as_secs()))),
+                };
+                if let Err(e) = &res {
+                    eprintln!("Bulk parse failed for {}: {}", name, e);
+                }
+
+                let n = done.fetch_add(1, Ordering::SeqCst) + 1;
+                let _ = app.emit(
+                    "library-bulk-parse-progress",
+                    serde_json::json!({ "done": n, "total": total, "current": name }),
+                );
+                res.is_ok()
+            }
+        })
+        .buffer_unordered(8)
+        .collect::<Vec<bool>>()
+        .await;
+
+    Ok(results.into_iter().filter(|ok| *ok).count())
+}
+
+/// Scan every library track, detect files whose extension doesn't match their
+/// actual container (e.g. an AAC/MP4 stream saved as ".mp3"), rename them to the
+/// correct extension, and refresh each row's cached content type. Runs the
+/// per-file probe/rename concurrently and emits `library-fix-ext-progress`
+/// ({ done, total, current, fixed }). Returns the number of files renamed.
+#[tauri::command]
+async fn fix_library_extensions(app: tauri::AppHandle) -> Result<usize, AppError> {
+    use futures_util::stream::StreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    const PER_FILE_TIMEOUT: Duration = Duration::from_secs(20);
+
+    let paths: Vec<String> = {
+        let db = app.state::<Database>();
+        db.get_all_library_tracks()
+            .map_err(|e| AppError::Io(e.to_string()))?
+            .into_iter()
+            .map(|t| t.path)
+            .collect()
+    };
+    let total = paths.len();
+    let done = Arc::new(AtomicUsize::new(0));
+    let fixed = Arc::new(AtomicUsize::new(0));
+
+    futures_util::stream::iter(paths.into_iter())
+        .map(|path| {
+            let app = app.clone();
+            let done = done.clone();
+            let fixed = fixed.clone();
+            async move {
+                let app_task = app.clone();
+                let path_task = path.clone();
+                // Probe, rename if mislabeled, and refresh the cached type — all
+                // on the blocking pool.
+                let join = tokio::task::spawn_blocking(move || -> bool {
+                    let p = std::path::Path::new(&path_task);
+                    if !p.exists() {
+                        return false;
+                    }
+                    let label = library::detect_type_label(p);
+                    let (new_path, changed) =
+                        library::fix_extension(p).unwrap_or_else(|_| (p.to_path_buf(), false));
+                    let db = app_task.state::<Database>();
+                    let _ = db.update_track_path_and_type(
+                        &path_task,
+                        &new_path.to_string_lossy(),
+                        &label,
+                    );
+                    changed
+                });
+                let changed = tokio::time::timeout(PER_FILE_TIMEOUT, join)
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .unwrap_or(false);
+                if changed {
+                    fixed.fetch_add(1, Ordering::SeqCst);
+                }
+
+                let n = done.fetch_add(1, Ordering::SeqCst) + 1;
+                let current = std::path::Path::new(&path)
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let _ = app.emit(
+                    "library-fix-ext-progress",
+                    serde_json::json!({
+                        "done": n,
+                        "total": total,
+                        "current": current,
+                        "fixed": fixed.load(Ordering::SeqCst),
+                    }),
+                );
+            }
+        })
+        .buffer_unordered(8)
+        .collect::<Vec<()>>()
+        .await;
+
+    Ok(fixed.load(Ordering::SeqCst))
 }
 
 /// Increment the play counter and timestamp for a library track. Called from
@@ -1820,6 +2087,17 @@ async fn tidal_match_tracks(
     tidal::tidal_match_tracks_cmd(app, tracks).await
 }
 
+/// Fuzzy-match a SoundCloud playlist's entries against Tidal so the user can
+/// swap individual tracks to the higher-quality Tidal source. No ISRC path —
+/// SoundCloud has none — so all matches are surfaced for manual review.
+#[tauri::command]
+async fn tidal_match_soundcloud(
+    app: tauri::AppHandle,
+    entries: Vec<tidal::ScMatchInput>,
+) -> Result<Vec<tidal::ScTidalMatch>, AppError> {
+    tidal::tidal_match_soundcloud_cmd(app, entries).await
+}
+
 /// A single Tidal match the frontend wants to download. Carries the display
 /// title/artist for pre-populating the DownloadQueue entry while tidal-dl-ng
 /// works on the file.
@@ -2150,6 +2428,8 @@ pub fn run() {
             discover_trash,
             discover_cleanup,
             extract_playlist,
+            resolve_soundcloud_track,
+            validate_soundcloud_cookies,
             get_library_folders,
             add_library_folder,
             remove_library_folder,
@@ -2157,6 +2437,8 @@ pub fn run() {
             scan_library_incremental,
             apply_library_metadata,
             update_library_track,
+            bulk_parse_library_tracks,
+            fix_library_extensions,
             find_cover_candidate,
             embed_cover_art,
             get_or_compute_waveform,
@@ -2198,6 +2480,7 @@ pub fn run() {
             tidal_auth_status,
             tidal_logout,
             tidal_match_tracks,
+            tidal_match_soundcloud,
             tidal_download_matched,
         ])
         .run(tauri::generate_context!())

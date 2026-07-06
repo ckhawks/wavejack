@@ -14,7 +14,7 @@
 use crate::auth_cache;
 use crate::error::AppError;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 
@@ -680,6 +680,246 @@ async fn match_one(token: &CachedToken, input: &MatchInput) -> TidalMatch {
     }
 }
 
+// ------- SoundCloud → Tidal match ------------------------------------------
+//
+// SoundCloud exposes no ISRC, so this path is fuzzy-only: clean the freeform
+// title/uploader into (artist, title) via `ytdlp::clean_sc_metadata`, search
+// Tidal, and pick the closest candidate by duration. Every result — including
+// low-confidence ones — is surfaced for the user to review and confirm; we
+// never silently swap a SoundCloud source for a guessed Tidal track.
+
+// ------- fuzzy string similarity (for SoundCloud matching) -----------------
+
+/// Filler tokens that add noise to music-title/artist comparison.
+const MATCH_STOPWORDS: &[&str] = &["feat", "ft", "featuring", "prod", "with", "the"];
+
+/// Lowercase and split into tokens, breaking on non-alphanumerics *and* on
+/// digit↔letter boundaries so "4AM" and "4 AM" tokenize identically
+/// (`["4", "am"]`). `&` is normalized to "and" first.
+fn tokenize_lower(s: &str) -> Vec<String> {
+    let lower = s.to_lowercase().replace('&', " and ");
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut cur_digit = false;
+    for ch in lower.chars() {
+        if ch.is_alphanumeric() {
+            let d = ch.is_numeric();
+            if !cur.is_empty() && d != cur_digit {
+                out.push(std::mem::take(&mut cur));
+            }
+            cur.push(ch);
+            cur_digit = d;
+        } else if !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Token set for comparison, with filler words dropped.
+fn token_set(s: &str) -> HashSet<String> {
+    tokenize_lower(s)
+        .into_iter()
+        .filter(|t| !MATCH_STOPWORDS.contains(&t.as_str()))
+        .collect()
+}
+
+/// Sørensen–Dice coefficient over two token sets: `2·|A∩B| / (|A|+|B|)`.
+/// Symmetric and length-sensitive, so "Sun Models" vs "Sun Models (X Remix)"
+/// scores well below 1.0 — exactly the discrimination we want between an
+/// original and a remix.
+fn dice(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let inter = a.intersection(b).count() as f64;
+    2.0 * inter / (a.len() as f64 + b.len() as f64)
+}
+
+/// Similarity gate: a Tidal candidate must clear all of these to be accepted as
+/// a SoundCloud match. Tuned for precision — the user would rather keep the
+/// SoundCloud original than get a wrong Tidal track.
+const TITLE_MIN: f64 = 0.6;
+const ARTIST_MIN: f64 = 0.5;
+/// Max duration gap (seconds) when the SoundCloud duration is known. Different
+/// edits/versions usually differ by more than this.
+const SC_DUR_GATE_SEC: i64 = 5;
+
+/// Score a Tidal candidate against the cleaned SoundCloud (artist, title).
+/// Returns `None` if it fails any gate, else `(score, duration_delta)`.
+fn score_candidate(
+    q_title: &HashSet<String>,
+    q_artist: &HashSet<String>,
+    candidate: &SearchTrack,
+    target_sec: Option<i64>,
+) -> Option<(f64, i64)> {
+    let c_title = token_set(&candidate.title);
+    let c_artist_joined = candidate
+        .artists
+        .iter()
+        .map(|a| a.name.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let c_artist = token_set(&c_artist_joined);
+
+    let title_sim = dice(q_title, &c_title);
+    // When we couldn't derive a SoundCloud artist (no dash, uploader was a
+    // label), don't penalize on artist — lean on title + duration instead.
+    let artist_sim = if q_artist.is_empty() { 1.0 } else { dice(q_artist, &c_artist) };
+    let delta = target_sec.map(|t| (candidate.duration - t).abs());
+
+    let dur_ok = delta.is_none_or(|d| d <= SC_DUR_GATE_SEC);
+    if !dur_ok || title_sim < TITLE_MIN || artist_sim < ARTIST_MIN {
+        return None;
+    }
+
+    let dur_score = match delta {
+        Some(d) => 1.0 - (d as f64 / SC_DUR_GATE_SEC as f64),
+        None => 0.5, // unknown duration — neutral contribution
+    };
+    let score = 0.55 * title_sim + 0.30 * artist_sim + 0.15 * dur_score;
+    Some((score, delta.unwrap_or(0)))
+}
+
+/// One SoundCloud playlist entry to match. `index` keys the result back to the
+/// playlist row on the frontend.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScMatchInput {
+    pub index: usize,
+    pub title: String,
+    pub uploader: Option<String>,
+    /// Track length in seconds (yt-dlp reports fractional); optional because
+    /// `--flat-playlist` occasionally omits it.
+    pub duration: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScTidalMatch {
+    pub index: usize,
+    pub status: MatchStatus,
+    /// The cleaned artist/title we actually searched Tidal with — shown in the
+    /// preview so the user can compare "what we asked for" vs. "what came back".
+    pub query_artist: String,
+    pub query_title: String,
+    pub tidal_id: Option<u64>,
+    pub tidal_title: Option<String>,
+    pub tidal_artists: Option<Vec<String>>,
+    pub tidal_quality: Option<String>,
+    pub tidal_url: Option<String>,
+    /// Absolute duration gap (seconds) between the SoundCloud track and the
+    /// chosen Tidal candidate, when both are known. Lets the UI flag shaky
+    /// matches without dropping them.
+    pub duration_delta_sec: Option<i64>,
+    /// Match confidence 0.0–1.0 (title/artist/duration blend) for accepted
+    /// matches. `None` when nothing cleared the similarity gate.
+    pub confidence: Option<f64>,
+    pub reason: Option<String>,
+}
+
+/// Fuzzy-match one SoundCloud entry on Tidal. No ISRC path exists for
+/// SoundCloud, so this always returns `FoundFuzzy`, `NotFound`, or `Error`.
+async fn match_one_sc(token: &CachedToken, input: &ScMatchInput) -> ScTidalMatch {
+    let (artist, title) =
+        crate::ytdlp::clean_sc_metadata(&input.title, input.uploader.as_deref());
+    // Only trust a positive, sane duration for the proximity pick.
+    let target_sec = input.duration.map(|d| d.round() as i64).filter(|d| *d > 0);
+
+    let base = ScTidalMatch {
+        index: input.index,
+        status: MatchStatus::NotFound,
+        query_artist: artist.clone(),
+        query_title: title.clone(),
+        tidal_id: None,
+        tidal_title: None,
+        tidal_artists: None,
+        tidal_quality: None,
+        tidal_url: None,
+        duration_delta_sec: None,
+        confidence: None,
+        reason: None,
+    };
+
+    let query = if artist.is_empty() { title.clone() } else { format!("{} {}", artist, title) };
+    if query.trim().is_empty() {
+        return ScTidalMatch { reason: Some("empty query after cleaning title".into()), ..base };
+    }
+
+    eprintln!("[tidal] sc match_one index={} query={:?} target={:?}s", input.index, query, target_sec);
+    let items = match search_tracks(token, &query, 12).await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[tidal]   -> sc search error: {}", e);
+            return ScTidalMatch { status: MatchStatus::Error, reason: Some(e.to_string()), ..base };
+        }
+    };
+    if items.is_empty() {
+        eprintln!("[tidal]   -> sc no results");
+        return base; // NotFound
+    }
+
+    // Score every candidate on title + artist similarity (with a hard duration
+    // gate) and keep the highest scorer that clears the thresholds. Anything
+    // that fails the gates leaves this a NotFound — we do NOT fall back to a
+    // duration-only guess, which is what produced the earlier wrong matches.
+    let q_title = token_set(&title);
+    let q_artist = token_set(&artist);
+    let mut best: Option<(&SearchTrack, f64, i64)> = None;
+    for c in &items {
+        if let Some((score, delta)) = score_candidate(&q_title, &q_artist, c, target_sec) {
+            if best.is_none_or(|(_, s, _)| score > s) {
+                best = Some((c, score, delta));
+            }
+        }
+    }
+
+    let Some((track, score, delta)) = best else {
+        eprintln!("[tidal]   -> sc no candidate cleared the similarity gate");
+        return base; // NotFound
+    };
+    eprintln!(
+        "[tidal]   -> sc hit id={} title={:?} score={:.2} delta={}s",
+        track.id, track.title, score, delta,
+    );
+
+    ScTidalMatch {
+        status: MatchStatus::FoundFuzzy,
+        tidal_id: Some(track.id),
+        tidal_title: Some(track.title.clone()),
+        tidal_artists: Some(track.artists.iter().map(|a| a.name.clone()).collect()),
+        tidal_quality: track.audio_quality.clone(),
+        tidal_url: Some(format!("https://tidal.com/browse/track/{}", track.id)),
+        duration_delta_sec: target_sec.map(|_| delta),
+        confidence: Some((score * 100.0).round() / 100.0),
+        reason: None,
+        ..base
+    }
+}
+
+/// Match every entry of a SoundCloud playlist against Tidal. Emits a
+/// `tidal-sc-match-progress` event per entry so the UI can show a counter.
+pub async fn tidal_match_soundcloud_cmd(
+    app: AppHandle,
+    entries: Vec<ScMatchInput>,
+) -> Result<Vec<ScTidalMatch>, AppError> {
+    let token = ensure_token(&app).await?;
+    let mut out = Vec::with_capacity(entries.len());
+    for (i, e) in entries.iter().enumerate() {
+        let m = match_one_sc(&token, e).await;
+        let _ = app.emit("tidal-sc-match-progress", serde_json::json!({
+            "index": i,
+            "total": entries.len(),
+            "match": &m,
+        }));
+        out.push(m);
+        // Same conservative ~3.3/sec pacing as the Spotify matcher.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    Ok(out)
+}
+
 // ------- command entry points ----------------------------------------------
 
 /// Shared module state: pending device-code flow, so `tidal_login_start` can
@@ -765,5 +1005,90 @@ pub async fn tidal_match_tracks_cmd(
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn track(title: &str, artists: &[&str], duration: i64) -> SearchTrack {
+        SearchTrack {
+            id: 1,
+            title: title.to_string(),
+            duration,
+            audio_quality: Some("LOSSLESS".to_string()),
+            isrc: None,
+            artists: artists
+                .iter()
+                .map(|n| SearchArtist { name: n.to_string() })
+                .collect(),
+            album: None,
+        }
+    }
+
+    #[test]
+    fn tokenize_splits_digit_letter_boundary() {
+        assert_eq!(tokenize_lower("4AM"), vec!["4", "am"]);
+        assert_eq!(tokenize_lower("4 AM"), vec!["4", "am"]);
+    }
+
+    #[test]
+    fn dice_identical_is_one() {
+        assert!((dice(&token_set("Strobe"), &token_set("Strobe")) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn accepts_exact_title_artist_and_duration() {
+        let q_title = token_set("4 AM");
+        let q_artist = token_set("Kaskade");
+        let c = track("4 AM", &["Kaskade"], 300);
+        assert!(score_candidate(&q_title, &q_artist, &c, Some(301)).is_some());
+    }
+
+    #[test]
+    fn rejects_wrong_title_even_with_close_duration() {
+        let q_title = token_set("Strobe");
+        let q_artist = token_set("deadmau5");
+        // Same artist + near-identical duration, but a completely different song.
+        let c = track("Ghosts N Stuff", &["deadmau5"], 300);
+        assert!(score_candidate(&q_title, &q_artist, &c, Some(300)).is_none());
+    }
+
+    #[test]
+    fn rejects_wrong_artist() {
+        let q_title = token_set("Strobe");
+        let q_artist = token_set("deadmau5");
+        let c = track("Strobe", &["Some Coverband"], 300);
+        assert!(score_candidate(&q_title, &q_artist, &c, Some(300)).is_none());
+    }
+
+    #[test]
+    fn rejects_when_duration_gate_fails() {
+        let q_title = token_set("4 AM");
+        let q_artist = token_set("Kaskade");
+        let c = track("4 AM", &["Kaskade"], 300);
+        // 20s off — different edit/version.
+        assert!(score_candidate(&q_title, &q_artist, &c, Some(320)).is_none());
+    }
+
+    #[test]
+    fn distinguishes_original_from_remix() {
+        let q_title = token_set("Sun Models (Bear Grillz Remix)");
+        let q_artist = token_set("ODESZA");
+        // Original, not the remix the SoundCloud title asked for.
+        let original = track("Sun Models", &["ODESZA"], 200);
+        assert!(score_candidate(&q_title, &q_artist, &original, Some(200)).is_none());
+        // The actual remix clears the gate.
+        let remix = track("Sun Models (Bear Grillz Remix)", &["ODESZA", "Bear Grillz"], 200);
+        assert!(score_candidate(&q_title, &q_artist, &remix, Some(200)).is_some());
+    }
+
+    #[test]
+    fn no_artist_leans_on_title_and_duration() {
+        let q_title = token_set("Brightest Lights");
+        let q_artist: HashSet<String> = HashSet::new(); // uploader was a label; dropped
+        let c = track("Brightest Lights", &["Lane 8"], 240);
+        assert!(score_candidate(&q_title, &q_artist, &c, Some(240)).is_some());
+    }
 }
 

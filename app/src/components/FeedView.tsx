@@ -8,6 +8,7 @@ import { usePlayerStore } from "../stores/playerStore";
 import { startDownload, searchPreview } from "../lib/commands";
 import type { FeedItem } from "../lib/types";
 import type { DownloadStatusEvent } from "../lib/types";
+import { FeedDownloadDialog } from "./FeedDownloadDialog";
 
 interface PreviewState {
   status: "downloading" | "ready" | "error";
@@ -58,6 +59,7 @@ export function FeedView() {
   const [url, setUrl] = useState("");
   const [previews, setPreviews] = useState<Map<string, PreviewState>>(new Map());
   const [downloadedIds, setDownloadedIds] = useState<Set<string>>(new Set());
+  const [dialogItem, setDialogItem] = useState<FeedItem | null>(null);
 
   const currentTrackId = usePlayerStore((s) => s.currentTrack?.id);
   const isPlaying = usePlayerStore((s) => s.isPlaying);
@@ -150,7 +152,7 @@ export function FeedView() {
     );
   }, [previews]);
 
-  const handleDownload = useCallback((item: FeedItem) => {
+  const runYoutubeDownload = useCallback((item: FeedItem) => {
     const id = crypto.randomUUID();
     addDownload({
       id,
@@ -166,6 +168,10 @@ export function FeedView() {
       console.error("Download failed:", e)
     );
   }, [addDownload, format, destination]);
+
+  const handleDownload = useCallback((item: FeedItem) => {
+    setDialogItem(item);
+  }, []);
 
   const items = filteredItems();
 
@@ -343,6 +349,18 @@ export function FeedView() {
           </div>
         )}
       </div>
+
+      {dialogItem && (
+        <FeedDownloadDialog
+          item={dialogItem}
+          onUseYoutube={() => runYoutubeDownload(dialogItem)}
+          onDownloaded={() => {
+            setDownloadedIds((prev) => new Set(prev).add(dialogItem.video_id));
+            setDialogItem(null);
+          }}
+          onClose={() => setDialogItem(null)}
+        />
+      )}
     </div>
   );
 }

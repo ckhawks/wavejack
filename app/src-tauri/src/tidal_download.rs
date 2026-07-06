@@ -104,6 +104,13 @@ pub async fn configure_for_batch(output_dir: &Path, quality: &str) -> Result<(),
     ] {
         let status = Command::new(&bin)
             .args(["cfg", key, &value])
+            // Force UTF-8 stdio: tidal-dl-ng renders Rich output that contains
+            // Unicode glyphs, and when its stdout/stderr are piped (not a real
+            // console) Python defaults to the legacy cp1252 codec on Windows,
+            // which crashes Rich inside `_render_buffer` (exit 120). See spawn
+            // in `download_one` for the full explanation.
+            .env("PYTHONIOENCODING", "utf-8")
+            .env("PYTHONUTF8", "1")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -185,6 +192,14 @@ pub async fn download_one(
 
     let mut child = Command::new(&bin)
         .args(["dl", tidal_url])
+        // tidal-dl-ng prints progress via Rich, which emits Unicode glyphs
+        // (spinners, box-drawing, non-ASCII track titles). We pipe its stdio
+        // to capture output, so it's not a real console — on Windows Python
+        // then defaults piped streams to the legacy cp1252 codec, and Rich
+        // crashes with a UnicodeEncodeError inside `_render_buffer`, exiting
+        // 120 mid-download. Forcing UTF-8 stdio makes the encode succeed.
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -277,7 +292,7 @@ pub async fn download_one(
     // Prefer files mtime >= started_at in case the diff misses something
     // (e.g. the track was already there and got overwritten).
     let after_files = snapshot_files(output_dir);
-    let new_file = after_files
+    let mut new_file = after_files
         .difference(&before_files)
         .max_by_key(|p| p.metadata().and_then(|m| m.modified()).ok())
         .cloned()
@@ -292,6 +307,25 @@ pub async fn download_one(
                 .map(|(p, _)| p)
         });
 
+    // Tidal serves AAC/MP4 for some tracks; make sure the extension matches the
+    // real container before we report the path downstream.
+    if let Some(p) = new_file.as_ref() {
+        if let Ok((fixed, true)) = crate::library::fix_extension(p) {
+            new_file = Some(fixed);
+        }
+    }
+
+    // tidal-dl-ng embeds cover art into the file itself (metadata_cover_embed),
+    // but our events never carried it, so the download queue rendered a blank
+    // thumbnail for Tidal tracks. Read the embedded art back out of the finished
+    // file and ship it as base64, mirroring the yt-dlp path.
+    let cover_art_base64 = new_file.as_ref().and_then(|p| {
+        crate::cover_art::read_cover_from_file(p).map(|bytes| {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(&bytes)
+        })
+    });
+
     let file_path_str = new_file.as_ref().map(|p| p.to_string_lossy().to_string());
     emit(app, download_id, DownloadStatusEvent {
         id: download_id.to_string(),
@@ -301,7 +335,7 @@ pub async fn download_one(
         backend: "tidal-dl-ng".into(),
         title: title_hint.map(String::from),
         file_path: file_path_str,
-        cover_art_base64: None,
+        cover_art_base64,
     });
 
     // Probe the actual file for its real format + bitrate. Tidal serves AAC

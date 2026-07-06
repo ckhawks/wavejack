@@ -9,6 +9,8 @@ use crate::cover_art;
 use crate::downloader::DownloadResult;
 use crate::error::AppError;
 use futures_util::StreamExt;
+use lofty::file::AudioFile;
+use lofty::probe::Probe;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncReadExt, BufReader};
@@ -500,6 +502,15 @@ pub async fn download_with_ytdlp(
         }
     }
 
+    // Correct the extension if it lies about the content (e.g. yt-dlp/Tidal
+    // handed back an AAC/MP4 stream but the filename ended up ".mp3"). Doing
+    // this before the cover embed means art is written to the right file.
+    if let Some(ref fp) = file_path {
+        if let Ok((fixed, true)) = crate::library::fix_extension(std::path::Path::new(fp)) {
+            file_path = Some(fixed.to_string_lossy().to_string());
+        }
+    }
+
     // Try to find and process the YouTube thumbnail
     let mut cover_art_base64: Option<String> = None;
     if let Some(ref fp) = file_path {
@@ -537,12 +548,105 @@ pub async fn download_with_ytdlp(
         cover_art_base64: cover_art_base64.clone(),
     });
 
+    // Probe the finalized file for its real format + bitrate so the queue badge
+    // reflects ground truth — not the requested intent. The extension is the
+    // post-conversion truth (e.g. a SoundCloud WAV re-encoded to FLAC above).
+    if let Some(ref fp) = file_path {
+        let path = Path::new(fp);
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        let bitrate = Probe::open(path)
+            .ok()
+            .and_then(|p| p.read().ok())
+            .map(|t| t.properties().audio_bitrate().unwrap_or(0))
+            .unwrap_or(0);
+        let _ = app.emit("download-enriched", serde_json::json!({
+            "id": download_id,
+            "audio_format": ext,
+            "bitrate_kbps": bitrate,
+        }));
+    }
+
     Ok(DownloadResult {
         title,
         file_path,
         backend: "ytdlp".to_string(),
         cover_art_base64,
     })
+}
+
+/// Promo/junk fragments that show up bracketed in SoundCloud titles and only
+/// hurt a Tidal catalog search. Matched case-insensitively against the *inner*
+/// text of a `(...)` or `[...]` group. Remix/mix descriptors are deliberately
+/// absent — those identify genuinely distinct tracks on Tidal, so we keep them.
+const SC_PROMO_MARKERS: &[&str] = &[
+    "free download", "free dl", "free d/l", "buy now", "out now", "click buy",
+    "premiere", "exclusive", "supported by", "played by", "hypeddit", "toneden",
+    "repost", "teaser", "snippet", "download in description",
+];
+
+/// Collapse runs of whitespace to single spaces and trim the ends.
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Remove bracketed groups that look like promo noise, keeping every other
+/// bracket group verbatim. Unbalanced brackets stop the scan and the rest is
+/// kept as-is (better to over-keep than mangle a weird title).
+fn strip_promo_brackets(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(open_idx) = rest.find(['(', '[']) {
+        let open = rest.as_bytes()[open_idx] as char;
+        let close = if open == '(' { ')' } else { ']' };
+        let Some(rel_close) = rest[open_idx + 1..].find(close) else {
+            break; // unbalanced — bail and keep the remainder
+        };
+        let close_idx = open_idx + 1 + rel_close;
+        let inner = rest[open_idx + 1..close_idx].to_ascii_lowercase();
+        let is_promo = SC_PROMO_MARKERS.iter().any(|m| inner.contains(m));
+        out.push_str(&rest[..open_idx]);
+        if !is_promo {
+            out.push_str(&rest[open_idx..=close_idx]);
+        }
+        rest = &rest[close_idx + 1..];
+    }
+    out.push_str(rest);
+    collapse_ws(&out)
+}
+
+/// Split `Artist - Title` on the first spaced dash (ASCII or unicode en/em).
+/// Returns `None` when there's no such separator or either side is empty.
+fn split_artist_title(s: &str) -> Option<(String, String)> {
+    const SEPS: &[&str] = &[" - ", " – ", " — ", " -- "];
+    // Pick the earliest-occurring separator so "A - B - C" splits at the first.
+    let hit = SEPS
+        .iter()
+        .filter_map(|sep| s.find(sep).map(|idx| (idx, *sep)))
+        .min_by_key(|(idx, _)| *idx);
+    let (idx, sep) = hit?;
+    let artist = s[..idx].trim();
+    let title = s[idx + sep.len()..].trim();
+    if artist.is_empty() || title.is_empty() {
+        return None;
+    }
+    Some((artist.to_string(), title.to_string()))
+}
+
+/// Best-guess `(artist, title)` for a SoundCloud track, for feeding a Tidal
+/// catalog search. SoundCloud titles are freeform; the dominant convention is
+/// `Artist - Title`, frequently with promo tags appended
+/// (`Kaskade - 4 AM (Adam K & Soha Remix) [Free Download]`). We strip promo
+/// brackets, split on the first spaced dash, and fall back to the uploader as
+/// the artist when the title has no dash structure.
+pub fn clean_sc_metadata(title: &str, uploader: Option<&str>) -> (String, String) {
+    let cleaned = strip_promo_brackets(title);
+    match split_artist_title(&cleaned) {
+        Some(pair) => pair,
+        None => {
+            let artist = uploader.map(str::trim).unwrap_or_default().to_string();
+            (artist, cleaned)
+        }
+    }
 }
 
 /// A single entry in a playlist.
@@ -552,6 +656,12 @@ pub struct PlaylistEntry {
     pub title: String,
     pub duration: Option<f64>,
     pub uploader: Option<String>,
+    /// True for SoundCloud tracks that are `AD_SUPPORTED` monetized — SoundCloud
+    /// serves those as DRM-encrypted HLS and gates the plain streams to 404, so
+    /// yt-dlp cannot download the original. The UI flags these and steers the
+    /// user to the Tidal match instead. Defaults false (unknown / downloadable).
+    #[serde(default)]
+    pub drm: bool,
 }
 
 /// Playlist metadata extracted via yt-dlp --flat-playlist.
@@ -563,11 +673,26 @@ pub struct PlaylistInfo {
     pub playlist_url: String,
 }
 
+/// How many per-track SoundCloud metadata lookups to run at once. Each is its
+/// own short-lived yt-dlp process; 8 keeps a big set fast without hammering
+/// SoundCloud or spawning dozens of processes.
+const SC_META_CONCURRENCY: usize = 8;
+
 /// Extract playlist entries without downloading.
+///
+/// SoundCloud is handled specially — see `extract_soundcloud_playlist`. Every
+/// other site populates per-entry `title`/`duration` in the fast
+/// `--flat-playlist` listing, so we use that. `sc_cookies_browser` is the
+/// browser name to pull SoundCloud cookies from (only used for SoundCloud).
 pub async fn extract_playlist(
     ytdlp_path: &PathBuf,
     url: &str,
+    sc_cookies_browser: Option<&str>,
 ) -> Result<PlaylistInfo, AppError> {
+    if is_soundcloud_url(url) {
+        return extract_soundcloud_playlist(ytdlp_path, url, sc_cookies_browser).await;
+    }
+
     let output = Command::new(ytdlp_path)
         .args(["--flat-playlist", "-J", "--no-warnings", url])
         .output()
@@ -619,6 +744,7 @@ pub async fn extract_playlist(
                 title,
                 duration,
                 uploader,
+                drm: false,
             })
         })
         .collect();
@@ -635,4 +761,562 @@ pub async fn extract_playlist(
         entries,
         playlist_url: url.to_string(),
     })
+}
+
+/// Derive a human-ish title from a SoundCloud track URL when metadata can't be
+/// resolved: the last path segment with dashes turned to spaces
+/// (`.../never-be-like-you-feat-kai` → `never be like you feat kai`).
+///
+/// When the segment is a bare numeric track ID — which is all yt-dlp knows for
+/// tracks it couldn't fully resolve (private / Go+ / deleted / region-locked) —
+/// we return a clearly-flagged label instead of a naked number, so the row
+/// reads as "unavailable" rather than looking like corrupt data.
+fn slug_to_title(url: &str) -> String {
+    let slug = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .trim_end_matches('/')
+        .rsplit('/')
+        .find(|s| !s.is_empty());
+    match slug {
+        Some(s) if s.chars().all(|c| c.is_ascii_digit()) => {
+            format!("Unavailable SoundCloud track ({})", s)
+        }
+        Some(s) => {
+            let words = s.split('-').filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" ");
+            if words.is_empty() { "Unknown".to_string() } else { words }
+        }
+        None => "Unknown".to_string(),
+    }
+}
+
+/// Append `--cookies-from-browser <browser>` when a non-empty browser is set,
+/// so SoundCloud auth-gated tracks resolve. Mirrors the download path.
+fn apply_sc_cookies(cmd: &mut Command, browser: Option<&str>) {
+    if let Some(b) = browser {
+        if !b.is_empty() {
+            cmd.arg("--cookies-from-browser").arg(b);
+        }
+    }
+}
+
+/// Result of checking whether the configured browser yields usable, logged-in
+/// SoundCloud cookies. `ok` is true only when an actual SoundCloud session is
+/// found (an `oauth_token` cookie), which is what unlocks original-file
+/// downloads and private / Go+ / region-locked track resolution.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CookieCheck {
+    pub ok: bool,
+    /// "logged_in" | "not_logged_in" | "no_cookies" | "error"
+    pub status: String,
+    pub message: String,
+    pub cookie_count: usize,
+}
+
+/// Validate SoundCloud cookies for `browser`. Works by asking yt-dlp to export
+/// the browser's cookie jar (it writes the jar even though it then errors on
+/// the missing URL — no network, ~0.5s) and inspecting it for a SoundCloud
+/// `oauth_token`. This cleanly separates the three real failure modes: cookies
+/// unreadable (e.g. Chrome/Edge DPAPI lock on Windows), cookies readable but
+/// not logged in, and a genuine logged-in session.
+pub async fn check_soundcloud_cookies(ytdlp_path: &PathBuf, browser: &str) -> CookieCheck {
+    if browser.is_empty() {
+        return CookieCheck {
+            ok: false,
+            status: "no_cookies".into(),
+            message: "No browser selected — pick the browser you're signed in to SoundCloud with.".into(),
+            cookie_count: 0,
+        };
+    }
+
+    // Unique temp path so concurrent checks don't clobber each other. The jar
+    // contains ALL of the browser's cookies, so we delete it immediately after.
+    let tmp = std::env::temp_dir().join(format!("wavejack_sc_cookies_{}.txt", std::process::id()));
+
+    let output = Command::new(ytdlp_path)
+        .arg("--cookies-from-browser")
+        .arg(browser)
+        .arg("--cookies")
+        .arg(&tmp)
+        .arg("--no-warnings")
+        .output()
+        .await;
+
+    let stderr = output
+        .as_ref()
+        .map(|o| String::from_utf8_lossy(&o.stderr).to_string())
+        .unwrap_or_default();
+
+    let jar = tokio::fs::read_to_string(&tmp).await.unwrap_or_default();
+    let _ = tokio::fs::remove_file(&tmp).await;
+
+    let cookie_count = jar
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+        .count();
+    let has_oauth = jar.lines().any(|l| {
+        let low = l.to_ascii_lowercase();
+        low.contains("soundcloud.com") && low.contains("oauth_token")
+    });
+
+    if has_oauth {
+        return CookieCheck {
+            ok: true,
+            status: "logged_in".into(),
+            message: format!(
+                "Signed in to SoundCloud via {} ({} cookies). Original-file downloads and private / Go+ tracks will resolve.",
+                browser, cookie_count
+            ),
+            cookie_count,
+        };
+    }
+
+    // A real cookie-extraction error (yt-dlp prints these as `ERROR:`; the
+    // benign "you must provide a URL" note is `yt-dlp: error:`, so it's excluded).
+    if let Some(err) = stderr.lines().find(|l| l.contains("ERROR:")) {
+        let low = err.to_ascii_lowercase();
+        let friendly = if low.contains("dpapi") {
+            format!(
+                "{}'s cookies are locked by Windows (DPAPI) and can't be read. Use Firefox (recommended), or fully quit {} and try again.",
+                browser, browser
+            )
+        } else if low.contains("unsupported platform") {
+            format!("{} isn't available on this system.", browser)
+        } else if low.contains("could not find") || low.contains("not find") {
+            format!(
+                "Couldn't find {}'s cookie database — make sure it's installed and you've opened it at least once.",
+                browser
+            )
+        } else {
+            err.split("ERROR:").nth(1).unwrap_or(err).trim().to_string()
+        };
+        return CookieCheck { ok: false, status: "error".into(), message: friendly, cookie_count };
+    }
+
+    if cookie_count == 0 {
+        return CookieCheck {
+            ok: false,
+            status: "no_cookies".into(),
+            message: format!("No cookies could be read from {}.", browser),
+            cookie_count: 0,
+        };
+    }
+
+    CookieCheck {
+        ok: false,
+        status: "not_logged_in".into(),
+        message: format!(
+            "Read {} cookies from {}, but you're not signed in to SoundCloud there. Sign in at soundcloud.com in {}, then re-test.",
+            cookie_count, browser, browser
+        ),
+        cookie_count,
+    }
+}
+
+// ------- SoundCloud api-v2 resolution --------------------------------------
+//
+// yt-dlp's `--flat-playlist` leaves monetized / private / region tracks as bare
+// numeric IDs (it can't attach a client_id to a bare-ID URL), which is why they
+// showed up as "Unavailable SoundCloud track (id)". SoundCloud's own api-v2 DOES
+// resolve those IDs — given a `client_id` scraped from the site's JS (the same
+// technique yt-dlp uses internally) — returning the real title / artist /
+// permalink. We use it to (a) recover those titles so the track is at least
+// Tidal-matchable, and (b) skip the slow per-track yt-dlp resolve for the whole
+// playlist. Falls back to yt-dlp when scraping or a lookup fails.
+
+/// Everything between `start` and the next `end` after it.
+fn slice_between<'a>(hay: &'a str, start: &str, end: &str) -> Option<&'a str> {
+    let i = hay.find(start)? + start.len();
+    let rest = &hay[i..];
+    let j = rest.find(end)?;
+    Some(&rest[..j])
+}
+
+/// Pull a `client_id` out of a SoundCloud JS bundle. Public — pure string
+/// parsing, unit-tested.
+fn parse_client_id(js: &str) -> Option<String> {
+    let id = slice_between(js, "client_id:\"", "\"")
+        .or_else(|| slice_between(js, "\"client_id\":\"", "\""))
+        .or_else(|| slice_between(js, "client_id=", "&"))?;
+    if id.len() >= 20 && id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        Some(id.to_string())
+    } else {
+        None
+    }
+}
+
+/// Process-lifetime cache of the scraped client_id (they rotate slowly).
+static SC_CLIENT_ID: tokio::sync::Mutex<Option<String>> = tokio::sync::Mutex::const_new(None);
+
+/// Scrape a public web `client_id` from SoundCloud's asset bundles. `None` if
+/// the site layout changed or the network failed — callers fall back to yt-dlp.
+async fn soundcloud_client_id(client: &reqwest::Client) -> Option<String> {
+    if let Some(id) = SC_CLIENT_ID.lock().await.clone() {
+        return Some(id);
+    }
+    let home = client.get("https://soundcloud.com/").send().await.ok()?.text().await.ok()?;
+
+    // Collect the asset bundle URLs in document order; the client_id lives in
+    // one of the later ones, so we probe from the end.
+    let mut asset_urls: Vec<String> = Vec::new();
+    let mut hay = home.as_str();
+    while let Some(pos) = hay.find("https://a-v2.sndcdn.com/assets/") {
+        let rest = &hay[pos..];
+        let Some(end) = rest.find(".js") else { break };
+        asset_urls.push(rest[..end + 3].to_string());
+        hay = &rest[end + 3..];
+    }
+
+    for url in asset_urls.into_iter().rev() {
+        let Ok(resp) = client.get(&url).send().await else { continue };
+        let Ok(body) = resp.text().await else { continue };
+        if let Some(id) = parse_client_id(&body) {
+            *SC_CLIENT_ID.lock().await = Some(id.clone());
+            return Some(id);
+        }
+    }
+    None
+}
+
+#[derive(serde::Deserialize)]
+struct ApiV2Track {
+    id: u64,
+    #[serde(default)]
+    title: String,
+    /// Playable duration in milliseconds.
+    #[serde(default)]
+    duration: u64,
+    #[serde(default)]
+    permalink_url: Option<String>,
+    #[serde(default)]
+    user: Option<ApiV2User>,
+    /// "AD_SUPPORTED" means DRM-encrypted streams only — not downloadable.
+    #[serde(default)]
+    monetization_model: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ApiV2User {
+    #[serde(default)]
+    username: String,
+}
+
+/// Convert an api-v2 track object into a `PlaylistEntry`, using the real
+/// permalink as the download URL and flagging AD_SUPPORTED (DRM) tracks. Returns
+/// `None` when the track has no permalink (nothing we can hand to yt-dlp).
+fn apiv2_to_entry(t: ApiV2Track) -> Option<PlaylistEntry> {
+    let permalink = t.permalink_url?;
+    Some(PlaylistEntry {
+        url: permalink,
+        title: t.title,
+        duration: if t.duration > 0 { Some(t.duration as f64 / 1000.0) } else { None },
+        uploader: t.user.map(|u| u.username),
+        drm: t.monetization_model.as_deref() == Some("AD_SUPPORTED"),
+    })
+}
+
+/// Resolve a single SoundCloud track URL to a `PlaylistEntry` (title / artist /
+/// duration / DRM flag) via api-v2, so the caller can decide whether the SC
+/// original is downloadable or the user should be offered the Tidal match.
+/// Falls back to a yt-dlp resolve when api-v2 is unavailable.
+pub async fn resolve_single_soundcloud(
+    ytdlp_path: &PathBuf,
+    url: &str,
+    cookies_browser: Option<&str>,
+) -> PlaylistEntry {
+    let http = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0")
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    if let Some(cid) = soundcloud_client_id(&http).await {
+        let resolve_url = format!(
+            "https://api-v2.soundcloud.com/resolve?url={}&client_id={}",
+            urlencoding::encode(url),
+            cid
+        );
+        if let Ok(resp) = http.get(&resolve_url).send().await {
+            if resp.status().is_success() {
+                if let Ok(t) = resp.json::<ApiV2Track>().await {
+                    if let Some(entry) = apiv2_to_entry(t) {
+                        return entry;
+                    }
+                }
+            }
+        }
+    }
+    // api-v2 unavailable — fall back to a yt-dlp resolve (won't know DRM, but at
+    // least returns real metadata for non-gated tracks).
+    resolve_sc_track(ytdlp_path, url.to_string(), cookies_browser).await
+}
+
+/// Batch-resolve SoundCloud track IDs via api-v2 (50 per request). Returns a
+/// map of id → fully-populated `PlaylistEntry` (with the real permalink as the
+/// download URL). IDs that don't come back are simply absent.
+async fn resolve_sc_ids_apiv2(
+    client: &reqwest::Client,
+    client_id: &str,
+    ids: &[u64],
+) -> std::collections::HashMap<u64, PlaylistEntry> {
+    let mut out = std::collections::HashMap::new();
+    for chunk in ids.chunks(50) {
+        let joined = chunk.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        let url = format!(
+            "https://api-v2.soundcloud.com/tracks?ids={}&client_id={}",
+            joined, client_id
+        );
+        let Ok(resp) = client.get(&url).send().await else { continue };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(tracks) = resp.json::<Vec<ApiV2Track>>().await else { continue };
+        for t in tracks {
+            let id = t.id;
+            if let Some(entry) = apiv2_to_entry(t) {
+                out.insert(id, entry);
+            }
+        }
+    }
+    out
+}
+
+/// Resolve one SoundCloud track's real metadata. Never fails — on any error
+/// (network, geo-block, dead track) it returns an entry titled from the URL
+/// slug so the row still shows up in the preview.
+async fn resolve_sc_track(
+    ytdlp_path: &PathBuf,
+    page_url: String,
+    cookies_browser: Option<&str>,
+) -> PlaylistEntry {
+    let fallback = || PlaylistEntry {
+        url: page_url.clone(),
+        title: slug_to_title(&page_url),
+        duration: None,
+        uploader: None,
+        drm: false,
+    };
+
+    let mut cmd = Command::new(ytdlp_path);
+    cmd.args(["-J", "--no-warnings", "--no-playlist", &page_url]);
+    apply_sc_cookies(&mut cmd, cookies_browser);
+    let Ok(output) = cmd.output().await else {
+        return fallback();
+    };
+    if !output.status.success() {
+        return fallback();
+    }
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+        return fallback();
+    };
+
+    PlaylistEntry {
+        url: json["webpage_url"].as_str().unwrap_or(&page_url).to_string(),
+        title: json["title"]
+            .as_str()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| slug_to_title(&page_url)),
+        duration: json["duration"].as_f64(),
+        uploader: json["uploader"].as_str().map(|s| s.to_string()),
+        // yt-dlp only resolves this track if it wasn't DRM-gated in the first
+        // place, so anything reaching here is treated as downloadable.
+        drm: false,
+    }
+}
+
+/// SoundCloud's flat listing omits per-track titles/durations, so we do a fast
+/// flat pass to get the ordered page URLs, then resolve each track's metadata
+/// concurrently (bounded). Individual failures degrade to a slug-derived title
+/// instead of failing the whole playlist — that avoids the old behavior where a
+/// single dead track sank extraction and the UI silently downloaded the URL.
+async fn extract_soundcloud_playlist(
+    ytdlp_path: &PathBuf,
+    url: &str,
+    cookies_browser: Option<&str>,
+) -> Result<PlaylistInfo, AppError> {
+    let mut flat_cmd = Command::new(ytdlp_path);
+    flat_cmd.args(["--flat-playlist", "-J", "--no-warnings", url]);
+    apply_sc_cookies(&mut flat_cmd, cookies_browser);
+    let output = flat_cmd
+        .output()
+        .await
+        .map_err(|e| AppError::YtDlpFailed(format!("Failed to spawn yt-dlp: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::YtDlpFailed(format!(
+            "yt-dlp playlist extraction failed: {}",
+            stderr
+        )));
+    }
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| AppError::YtDlpFailed(format!("Invalid JSON from yt-dlp: {}", e)))?;
+
+    let entries_arr = json["entries"]
+        .as_array()
+        .ok_or_else(|| AppError::YtDlpFailed("Not a playlist (no entries array)".to_string()))?;
+
+    let playlist_title = json["title"].as_str().unwrap_or("Playlist").to_string();
+    let uploader = json["uploader"].as_str().map(|s| s.to_string());
+
+    // (track id, page URL) for each flat entry. The id lets us batch-resolve via
+    // api-v2; the URL is the yt-dlp fallback.
+    let flat: Vec<(Option<u64>, String)> = entries_arr
+        .iter()
+        .filter_map(|e| {
+            let url = e["webpage_url"]
+                .as_str()
+                .or_else(|| e["url"].as_str())
+                .map(|s| s.to_string())?;
+            let id = e["id"]
+                .as_u64()
+                .or_else(|| e["id"].as_str().and_then(|s| s.parse::<u64>().ok()));
+            Some((id, url))
+        })
+        .collect();
+
+    if flat.is_empty() {
+        return Err(AppError::YtDlpFailed("Playlist has no entries".to_string()));
+    }
+
+    // Batch-resolve as many tracks as possible via api-v2 (fast, one HTTP call
+    // per 50, and it recovers monetized/private tracks yt-dlp leaves as bare
+    // IDs). Anything it can't return falls back to a per-track yt-dlp resolve.
+    let http = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0")
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let ids: Vec<u64> = flat.iter().filter_map(|(id, _)| *id).collect();
+    let resolved = match soundcloud_client_id(&http).await {
+        Some(cid) => resolve_sc_ids_apiv2(&http, &cid, &ids).await,
+        None => std::collections::HashMap::new(),
+    };
+
+    // Preserve playlist order; api-v2 hits are instant, misses fall back to yt-dlp.
+    let entries: Vec<PlaylistEntry> = futures_util::stream::iter(flat)
+        .map(|(id, url)| {
+            let hit = id.and_then(|i| resolved.get(&i).cloned());
+            async move {
+                match hit {
+                    Some(entry) => entry,
+                    None => resolve_sc_track(ytdlp_path, url, cookies_browser).await,
+                }
+            }
+        })
+        .buffered(SC_META_CONCURRENCY)
+        .collect()
+        .await;
+
+    Ok(PlaylistInfo {
+        title: playlist_title,
+        uploader,
+        entries,
+        playlist_url: url.to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clean_sc_metadata;
+
+    #[test]
+    fn splits_artist_dash_title() {
+        assert_eq!(
+            clean_sc_metadata("Kaskade - 4 AM", None),
+            ("Kaskade".to_string(), "4 AM".to_string())
+        );
+    }
+
+    #[test]
+    fn strips_free_download_promo_but_keeps_remix() {
+        assert_eq!(
+            clean_sc_metadata("Kaskade - 4 AM (Adam K & Soha Remix) [Free Download]", None),
+            ("Kaskade".to_string(), "4 AM (Adam K & Soha Remix)".to_string())
+        );
+    }
+
+    #[test]
+    fn keeps_remix_descriptor() {
+        let (_, title) = clean_sc_metadata("ODESZA - Sun Models (Bear Grillz Remix)", None);
+        assert_eq!(title, "Sun Models (Bear Grillz Remix)");
+    }
+
+    #[test]
+    fn falls_back_to_uploader_without_dash() {
+        assert_eq!(
+            clean_sc_metadata("Strobe", Some("deadmau5")),
+            ("deadmau5".to_string(), "Strobe".to_string())
+        );
+    }
+
+    #[test]
+    fn no_dash_no_uploader_yields_empty_artist() {
+        assert_eq!(
+            clean_sc_metadata("Some Bootleg", None),
+            (String::new(), "Some Bootleg".to_string())
+        );
+    }
+
+    #[test]
+    fn handles_unicode_en_dash() {
+        assert_eq!(
+            clean_sc_metadata("Lane 8 – Brightest Lights", None),
+            ("Lane 8".to_string(), "Brightest Lights".to_string())
+        );
+    }
+
+    #[test]
+    fn drops_trailing_promo_bracket_and_collapses_ws() {
+        assert_eq!(
+            clean_sc_metadata("Rezz - Edge [OUT NOW]", None),
+            ("Rezz".to_string(), "Edge".to_string())
+        );
+    }
+
+    #[test]
+    fn splits_at_first_dash_when_multiple() {
+        assert_eq!(
+            clean_sc_metadata("Artist - Title - Bootleg", None),
+            ("Artist".to_string(), "Title - Bootleg".to_string())
+        );
+    }
+
+    #[test]
+    fn slug_numeric_id_is_flagged_unavailable() {
+        assert_eq!(
+            super::slug_to_title("https://api.soundcloud.com/tracks/2095011300"),
+            "Unavailable SoundCloud track (2095011300)"
+        );
+    }
+
+    #[test]
+    fn parses_client_id_from_js_bundle() {
+        let js = r#"...,client_id:"O7atZytS4Rr0Bq0jQ235nWm4T9tHzYqM",env:"production"..."#;
+        assert_eq!(
+            super::parse_client_id(js).as_deref(),
+            Some("O7atZytS4Rr0Bq0jQ235nWm4T9tHzYqM")
+        );
+    }
+
+    #[test]
+    fn rejects_short_or_missing_client_id() {
+        assert_eq!(super::parse_client_id("no id here"), None);
+        assert_eq!(super::parse_client_id(r#"client_id:"tooShort""#), None);
+    }
+
+    #[test]
+    fn slug_permalink_becomes_words() {
+        assert_eq!(
+            super::slug_to_title("https://soundcloud.com/flume/never-be-like-you-feat-kai"),
+            "never be like you feat kai"
+        );
+    }
+
+    #[test]
+    fn uploader_whitespace_is_trimmed() {
+        assert_eq!(
+            clean_sc_metadata("Untitled", Some("  Some Label  ")),
+            ("Some Label".to_string(), "Untitled".to_string())
+        );
+    }
 }

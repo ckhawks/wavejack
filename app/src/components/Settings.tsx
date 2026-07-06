@@ -6,8 +6,9 @@ import {
   ensureYtdlpReady, getRemoteInfo, formatErr,
   spotifyLogin, spotifyAuthStatus, spotifyLogout,
   tidalLoginStart, tidalLoginFinish, tidalAuthStatus, tidalLogout,
+  validateSoundcloudCookies,
 } from "../lib/commands";
-import type { SpotifyUser, TidalUser, TidalDeviceAuth } from "../lib/types";
+import type { SpotifyUser, TidalUser, TidalDeviceAuth, CookieCheck } from "../lib/types";
 
 interface Props {
   onClose: () => void;
@@ -27,6 +28,8 @@ export function Settings({ onClose }: Props) {
   const [spotifyClientId, setSpotifyClientId] = useState("");
   const [spotifyClientSecret, setSpotifyClientSecret] = useState("");
   const [scCookiesBrowser, setScCookiesBrowser] = useState("");
+  const [scCookieCheck, setScCookieCheck] = useState<CookieCheck | null>(null);
+  const [scCookieBusy, setScCookieBusy] = useState(false);
   const [spotifyUser, setSpotifyUser] = useState<SpotifyUser | null>(null);
   const [spotifyBusy, setSpotifyBusy] = useState(false);
   const [spotifyError, setSpotifyError] = useState<string | null>(null);
@@ -72,6 +75,18 @@ export function Settings({ onClose }: Props) {
   const doTidalLogout = async () => {
     await tidalLogout();
     setTidalUser(null);
+  };
+
+  const testScCookies = async () => {
+    setScCookieBusy(true);
+    setScCookieCheck(null);
+    try {
+      setScCookieCheck(await validateSoundcloudCookies(scCookiesBrowser));
+    } catch (e) {
+      setScCookieCheck({ ok: false, status: "error", message: formatErr(e), cookie_count: 0 });
+    } finally {
+      setScCookieBusy(false);
+    }
   };
 
   const doSpotifyLogin = async () => {
@@ -235,27 +250,58 @@ export function Settings({ onClose }: Props) {
             <label className="mb-2 block text-sm font-medium text-neutral-400">
               SoundCloud cookies browser (for original file downloads)
             </label>
-            <select
-              value={scCookiesBrowser}
-              onChange={(e) => {
-                setScCookiesBrowser(e.target.value);
-                updateSetting("soundcloudCookiesBrowser", e.target.value);
-              }}
-              className="w-full rounded-lg border border-[#333] bg-black px-4 py-2.5 text-sm text-white outline-none transition-all duration-200 focus:border-[#555]"
-            >
-              <option value="">None (use 128/160 kbps stream)</option>
-              <option value="chrome">Chrome</option>
-              <option value="firefox">Firefox</option>
-              <option value="edge">Edge</option>
-              <option value="brave">Brave</option>
-              <option value="safari">Safari</option>
-              <option value="opera">Opera</option>
-              <option value="vivaldi">Vivaldi</option>
-            </select>
+            <div className="flex items-center gap-3">
+              <select
+                value={scCookiesBrowser}
+                onChange={(e) => {
+                  setScCookiesBrowser(e.target.value);
+                  updateSetting("soundcloudCookiesBrowser", e.target.value);
+                  setScCookieCheck(null);
+                }}
+                className="min-w-0 flex-1 rounded-lg border border-[#333] bg-black px-4 py-2.5 text-sm text-white outline-none transition-all duration-200 focus:border-[#555]"
+              >
+                <option value="">None (use 128/160 kbps stream)</option>
+                <option value="chrome">Chrome</option>
+                <option value="firefox">Firefox</option>
+                <option value="edge">Edge</option>
+                <option value="brave">Brave</option>
+                <option value="safari">Safari</option>
+                <option value="opera">Opera</option>
+                <option value="vivaldi">Vivaldi</option>
+              </select>
+              <button
+                onClick={testScCookies}
+                disabled={scCookieBusy || !scCookiesBrowser}
+                className="flex shrink-0 items-center gap-2 rounded-lg border border-[#333] px-4 py-2.5 text-sm text-neutral-400 transition-all duration-200 hover:border-[#555] hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
+                title="Check whether these cookies are signed in to SoundCloud"
+              >
+                {scCookieBusy ? <Loader size={16} className="animate-spin" /> : <CheckCircle size={16} />}
+                Test
+              </button>
+            </div>
+            {scCookieCheck && (
+              <div
+                className={`mt-2 flex items-start gap-2 rounded-lg border px-3 py-2 text-xs ${
+                  scCookieCheck.ok
+                    ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300"
+                    : scCookieCheck.status === "not_logged_in"
+                      ? "border-amber-500/30 bg-amber-500/10 text-amber-300"
+                      : "border-red-500/30 bg-red-500/10 text-red-300"
+                }`}
+              >
+                {scCookieCheck.ok
+                  ? <CheckCircle size={14} className="mt-0.5 shrink-0" />
+                  : <AlertCircle size={14} className="mt-0.5 shrink-0" />}
+                <span>{scCookieCheck.message}</span>
+              </div>
+            )}
             <p className="mt-1.5 text-xs text-neutral-600">
               Pulls SoundCloud cookies from your browser so yt-dlp can grab the
               uploader's original file (often WAV/FLAC/320 MP3) when they enabled
-              the download button. Any free SC account is enough — no Go+ required.
+              the download button, and resolves private / Go+ / region-locked
+              tracks in playlists. Any free SC account is enough — no Go+ required.
+              On Windows, Chrome/Edge cookies are often locked (DPAPI) — Firefox
+              is the most reliable.
             </p>
           </div>
 

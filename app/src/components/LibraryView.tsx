@@ -21,6 +21,7 @@ import {
   Folder,
   ChevronRight,
   Tag,
+  FileCog,
 } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
@@ -38,21 +39,25 @@ import { TrackActionsMenu } from "./library/TrackActionsMenu";
 import {
   applyLibraryMetadata,
   updateLibraryTrack,
+  bulkParseLibraryTracks,
+  fixLibraryExtensions,
   findCoverCandidate,
   embedCoverArt,
   type LibraryTrack,
   type CoverCandidate,
+  type BulkParseEdit,
 } from "../lib/commands";
 
-type SortField = "title" | "artist" | "album" | "duration" | "bitrate" | "added" | "plays" | "lastPlayed" | "random";
+type SortField = "title" | "artist" | "album" | "duration" | "bitrate" | "fileType" | "added" | "plays" | "lastPlayed" | "random";
 type SortDir = "asc" | "desc";
-type ColumnKey = "artist" | "album" | "duration" | "bitrate" | "added" | "plays" | "lastPlayed" | "tags";
+type ColumnKey = "artist" | "album" | "duration" | "bitrate" | "fileType" | "added" | "plays" | "lastPlayed" | "tags";
 
 const DEFAULT_COLUMNS: Record<ColumnKey, boolean> = {
   artist: false,
   album: true,
   duration: true,
   bitrate: false,
+  fileType: true,
   added: true,
   plays: false,
   lastPlayed: false,
@@ -65,6 +70,7 @@ const COLUMN_LABELS: Record<ColumnKey, string> = {
   album: "Album",
   duration: "Length",
   bitrate: "Bitrate",
+  fileType: "Type",
   added: "Added",
   plays: "Play count",
   lastPlayed: "Last played",
@@ -128,6 +134,32 @@ function parseArtistTitle(source: string): { artist: string; title: string } | n
 function pickParseSource(t: LibraryTrack): string {
   if (t.title && t.title.includes(" - ")) return t.title;
   return t.filename || "";
+}
+
+/** Extensions each content type may legitimately carry (mirrors the backend's
+ * type_info map). Used to flag files whose extension lies about their content. */
+const TYPE_EXTENSIONS: Record<string, string[]> = {
+  MP3: ["mp3"],
+  FLAC: ["flac"],
+  M4A: ["m4a", "mp4", "m4b", "m4p"],
+  Opus: ["opus", "ogg"],
+  OGG: ["ogg", "oga"],
+  WAV: ["wav", "wave"],
+  AIFF: ["aiff", "aif", "aifc"],
+  AAC: ["aac"],
+  WavPack: ["wv"],
+  APE: ["ape"],
+  Speex: ["spx", "ogg"],
+};
+
+/** True when the track's real (content-detected) type doesn't match its
+ * filename extension — i.e. a mislabeled file the fix tool would rename. */
+function typeMismatch(t: LibraryTrack): boolean {
+  if (!t.file_type) return false;
+  const ext = t.filename.split(".").pop()?.toLowerCase();
+  const accepted = TYPE_EXTENSIONS[t.file_type];
+  if (!ext || !accepted) return false;
+  return !accepted.includes(ext);
 }
 
 export function LibraryView() {
@@ -240,7 +272,8 @@ export function LibraryView() {
   const [saveError, setSaveError] = useState<string>("");
   const [findingArtFor, setFindingArtFor] = useState<string | null>(null);
   const [bulkArt, setBulkArt] = useState<{ done: number; total: number } | null>(null);
-  const [bulkParse, setBulkParse] = useState<{ done: number; total: number } | null>(null);
+  const [bulkParse, setBulkParse] = useState<{ done: number; total: number; current: string } | null>(null);
+  const [fixExt, setFixExt] = useState<{ done: number; total: number; current: string; fixed: number } | null>(null);
   const [pendingApprovals, setPendingApprovals] = useState<
     Array<{ track: LibraryTrack; candidate: CoverCandidate }>
   >([]);
@@ -319,6 +352,11 @@ export function LibraryView() {
           break;
         case "bitrate":
           cmp = a.bitrate_kbps - b.bitrate_kbps;
+          break;
+        case "fileType":
+          cmp =
+            (a.file_type || "").localeCompare(b.file_type || "") ||
+            (a.title || "").localeCompare(b.title || "");
           break;
         case "added":
           cmp = a.first_scanned_at - b.first_scanned_at;
@@ -499,37 +537,57 @@ export function LibraryView() {
   };
 
   const handleBulkParse = async () => {
-    // A track is actionable if either:
-    //   1. We can parse "Artist - Title" out of its title or filename, OR
-    //   2. Its current title has a stray YT ID we can strip.
-    const targets = displayed.filter((t) => {
-      if (!needsMetadataFix(t)) return false;
-      if (parseArtistTitle(pickParseSource(t))) return true;
-      if (t.title && YT_ID_SUFFIX.test(t.title)) return true;
-      return false;
-    });
-    if (targets.length === 0) return;
-    setBulkParse({ done: 0, total: targets.length });
-    for (let i = 0; i < targets.length; i++) {
-      const track = targets[i];
-      const parsed = parseArtistTitle(pickParseSource(track));
-      try {
-        if (parsed) {
-          await updateLibraryTrack(track.path, parsed.title, parsed.artist, track.album, "");
-        } else if (track.title && YT_ID_SUFFIX.test(track.title)) {
-          // No parseable split — just clean the YT ID from the title.
-          const cleaned = stripYoutubeId(track.title).trim();
-          if (cleaned && cleaned !== track.title) {
-            await updateLibraryTrack(track.path, cleaned, track.artist, track.album, "");
-          }
+    // Compute every edit up front, then hand the whole batch to the backend,
+    // which rewrites tags + renames files concurrently (far faster than one
+    // awaited IPC round-trip per track) and streams progress events back.
+    const edits: BulkParseEdit[] = [];
+    for (const t of displayed) {
+      if (!needsMetadataFix(t)) continue;
+      const parsed = parseArtistTitle(pickParseSource(t));
+      if (parsed) {
+        edits.push({ path: t.path, title: parsed.title, artist: parsed.artist, album: t.album || "" });
+      } else if (t.title && YT_ID_SUFFIX.test(t.title)) {
+        // No parseable split — just clean the YT ID from the title.
+        const cleaned = stripYoutubeId(t.title).trim();
+        if (cleaned && cleaned !== t.title) {
+          edits.push({ path: t.path, title: cleaned, artist: t.artist || "", album: t.album || "" });
         }
-      } catch (e) {
-        console.error("Bulk parse failed for", track.path, e);
       }
-      setBulkParse({ done: i + 1, total: targets.length });
+    }
+    if (edits.length === 0) return;
+
+    setBulkParse({ done: 0, total: edits.length, current: "" });
+    const unlisten = await listen<{ done: number; total: number; current: string }>(
+      "library-bulk-parse-progress",
+      (e) => setBulkParse(e.payload),
+    );
+    try {
+      await bulkParseLibraryTracks(edits);
+    } catch (e) {
+      console.error("Bulk parse failed:", e);
+    } finally {
+      unlisten();
     }
     await refresh();
     setBulkParse(null);
+  };
+
+  const handleFixExtensions = async () => {
+    if (tracks.length === 0) return;
+    setFixExt({ done: 0, total: tracks.length, current: "", fixed: 0 });
+    const unlisten = await listen<{ done: number; total: number; current: string; fixed: number }>(
+      "library-fix-ext-progress",
+      (e) => setFixExt(e.payload),
+    );
+    try {
+      await fixLibraryExtensions();
+    } catch (e) {
+      console.error("Fix extensions failed:", e);
+    } finally {
+      unlisten();
+    }
+    await refresh();
+    setFixExt(null);
   };
 
   const handleSaveManual = async () => {
@@ -537,8 +595,17 @@ export function LibraryView() {
     setSaving(true);
     setSaveError("");
     try {
-      await updateLibraryTrack(manualEdit.path, editTitle, editArtist, editAlbum, editFilename);
-      await refresh();
+      const newPath = await updateLibraryTrack(manualEdit.path, editTitle, editArtist, editAlbum, editFilename);
+      // Patch just this row instead of reloading the whole library (600+ rows of
+      // base64 cover art). The backend renames to "{artist} - {title}.{ext}".
+      const filename = newPath.split(/[/\\]/).pop() || manualEdit.filename;
+      useLibraryStore.getState().patchTrack(manualEdit.path, {
+        path: newPath,
+        filename,
+        title: editTitle,
+        artist: editArtist,
+        album: editAlbum,
+      });
       setManualEdit(null);
     } catch (e: unknown) {
       const raw = e as { message?: string } | string | undefined;
@@ -612,10 +679,27 @@ export function LibraryView() {
           </div>
         )}
         {bulkParse && (
-          <div className="flex items-center gap-1.5 rounded bg-[#222] px-3 py-2 text-xs text-neutral-300" title="Parsing names">
+          <div
+            className="flex items-center gap-1.5 rounded bg-[#222] px-3 py-2 text-xs text-neutral-300"
+            title={bulkParse.current ? `Parsing: ${bulkParse.current}` : "Parsing names"}
+          >
             <Loader size={14} className="animate-spin" />
             <SplitSquareHorizontal size={12} className="text-neutral-500" />
-            {bulkParse.done}/{bulkParse.total}
+            <span className="tabular-nums">{bulkParse.done}/{bulkParse.total}</span>
+            {bulkParse.current && (
+              <span className="max-w-[220px] truncate text-neutral-500">{bulkParse.current}</span>
+            )}
+          </div>
+        )}
+        {fixExt && (
+          <div
+            className="flex items-center gap-1.5 rounded bg-[#222] px-3 py-2 text-xs text-neutral-300"
+            title={fixExt.current ? `Checking: ${fixExt.current}` : "Fixing extensions"}
+          >
+            <Loader size={14} className="animate-spin" />
+            <FileCog size={12} className="text-neutral-500" />
+            <span className="tabular-nums">{fixExt.done}/{fixExt.total}</span>
+            <span className="text-neutral-500">· {fixExt.fixed} fixed</span>
           </div>
         )}
         {tagFetchProgress && (
@@ -669,6 +753,15 @@ export function LibraryView() {
               >
                 <SplitSquareHorizontal size={12} />
                 Parse "Artist - Title" from filenames
+              </button>
+              <button
+                onClick={() => { void handleFixExtensions(); setShowToolsMenu(false); }}
+                disabled={!!fixExt || tracks.length === 0}
+                className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-neutral-300 transition-colors hover:bg-[#1a1a1a] hover:text-white disabled:opacity-40"
+                title="Rename files whose extension doesn't match their real audio format (e.g. AAC saved as .mp3)"
+              >
+                <FileCog size={12} />
+                Fix mislabeled extensions
               </button>
               <button
                 onClick={() => { void startBulkFetchTags(); setShowToolsMenu(false); }}
@@ -1010,6 +1103,7 @@ export function LibraryView() {
                 {columns.album && <SortHeader field="album" label="Album" className="pr-3" />}
                 {columns.duration && <SortHeader field="duration" label="Length" className="w-16 pr-3" />}
                 {columns.bitrate && <SortHeader field="bitrate" label="Bitrate" className="w-20 pr-3" />}
+                {columns.fileType && <SortHeader field="fileType" label="Type" className="w-16 pr-3" />}
                 {columns.added && <SortHeader field="added" label="Added" className="w-24 pr-3" />}
                 {columns.plays && <SortHeader field="plays" label="Plays" className="w-16 pr-3" />}
                 {columns.lastPlayed && <SortHeader field="lastPlayed" label="Last Played" className="w-24 pr-3" />}
@@ -1092,6 +1186,25 @@ export function LibraryView() {
                         {track.bitrate_kbps > 0
                           ? `${track.bitrate_kbps} kbps${track.bitrate_estimated ? " ?" : ""}`
                           : "—"}
+                      </td>
+                    )}
+                    {columns.fileType && (
+                      <td className="whitespace-nowrap py-2 pr-3">
+                        {track.file_type ? (
+                          <span
+                            className={typeMismatch(track) ? "text-amber-400" : "text-neutral-500"}
+                            title={
+                              typeMismatch(track)
+                                ? `Actually ${track.file_type} but named .${track.filename.split(".").pop()} — "Fix mislabeled extensions" will rename it`
+                                : undefined
+                            }
+                          >
+                            {track.file_type}
+                            {typeMismatch(track) ? " ⚠" : ""}
+                          </span>
+                        ) : (
+                          <span className="text-neutral-600">—</span>
+                        )}
                       </td>
                     )}
                     {columns.added && (
