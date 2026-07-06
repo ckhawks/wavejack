@@ -21,6 +21,7 @@ import type {
   MetadataMatch,
   Playlist,
   PlaylistInfo,
+  PlaylistEntry,
   SearchResult,
   SpotifyPlaylist,
   SpotifyUser,
@@ -29,6 +30,9 @@ import type {
   TidalMatch,
   TidalMatchInput,
   TidalUser,
+  ScMatchInput,
+  ScTidalMatch,
+  CookieCheck,
 } from "./types";
 
 /** Start downloading a URL with the given format */
@@ -172,6 +176,16 @@ export async function extractPlaylist(url: string): Promise<PlaylistInfo> {
   return invoke("extract_playlist", { url });
 }
 
+/** Check whether the given browser yields a logged-in SoundCloud session. */
+export async function validateSoundcloudCookies(browser: string): Promise<CookieCheck> {
+  return invoke("validate_soundcloud_cookies", { browser });
+}
+
+/** Resolve a single SoundCloud track URL to its metadata + DRM status. */
+export async function resolveSoundcloudTrack(url: string): Promise<PlaylistEntry> {
+  return invoke("resolve_soundcloud_track", { url });
+}
+
 /** Scan a directory for audio files and return metadata */
 export interface LibraryTrack {
   path: string;
@@ -194,6 +208,9 @@ export interface LibraryTrack {
   last_played_at: number;
   /** Top tags from Last.fm (populated from track_tags table). */
   tags: string[];
+  /** Content-detected container type ("MP3", "M4A", "FLAC", ...). May differ
+   *  from the filename extension for mislabeled files. Empty until scanned. */
+  file_type: string;
 }
 
 export async function recordTrackPlay(path: string): Promise<void> {
@@ -270,6 +287,29 @@ export async function updateLibraryTrack(
   newFilename: string,
 ): Promise<string> {
   return invoke("update_library_track", { path, title, artist, album, newFilename });
+}
+
+/** One parsed track edit for bulkParseLibraryTracks. */
+export interface BulkParseEdit {
+  path: string;
+  title: string;
+  artist: string;
+  album: string;
+}
+
+/** Apply many parsed "Artist - Title" edits at once. The backend rewrites tags
+ * and renames files concurrently and emits `library-bulk-parse-progress`
+ * ({ done, total, current }) events. Returns the count of tracks updated. */
+export async function bulkParseLibraryTracks(edits: BulkParseEdit[]): Promise<number> {
+  return invoke("bulk_parse_library_tracks", { edits });
+}
+
+/** Scan every library track, rename files whose extension doesn't match their
+ * real container (e.g. AAC/MP4 saved as ".mp3"), and refresh cached types.
+ * Emits `library-fix-ext-progress` ({ done, total, current, fixed }) events.
+ * Returns the number of files renamed. */
+export async function fixLibraryExtensions(): Promise<number> {
+  return invoke("fix_library_extensions", {});
 }
 
 /** Read cover art from a single audio file */
@@ -453,6 +493,13 @@ export async function tidalLogout(): Promise<void> {
  *  fallback). Emits "tidal-match-progress" per track. */
 export async function tidalMatchTracks(tracks: TidalMatchInput[]): Promise<TidalMatch[]> {
   return invoke("tidal_match_tracks", { tracks });
+}
+
+/** Fuzzy-match a SoundCloud playlist's entries against Tidal so the user can
+ *  upgrade individual tracks to lossless. Emits "tidal-sc-match-progress" per
+ *  entry. No ISRC path — SoundCloud exposes none. */
+export async function tidalMatchSoundcloud(entries: ScMatchInput[]): Promise<ScTidalMatch[]> {
+  return invoke("tidal_match_soundcloud", { entries });
 }
 
 export interface TidalDownloadJob {

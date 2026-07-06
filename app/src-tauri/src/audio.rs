@@ -23,8 +23,7 @@ use rodio::{ChannelCount, Decoder, Player, SampleRate};
 use rustfft::{num_complex::Complex32, FftPlanner};
 use serde::Serialize;
 use std::collections::VecDeque;
-use std::fs::File;
-use std::io::BufReader;
+use std::io::Cursor;
 use std::num::NonZero;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -277,6 +276,19 @@ impl<S: Source> Source for TapSource<S> {
     fn total_duration(&self) -> Option<Duration> {
         self.inner.total_duration()
     }
+    fn try_seek(&mut self, pos: Duration) -> Result<(), rodio::source::SeekError> {
+        // Forward the seek to the wrapped decoder — the default Source impl
+        // returns NotSupported, which would silently drop every seek. Reset the
+        // frame accumulator and flush the FFT ring so the spectrogram doesn't
+        // paint pre-seek audio after the jump.
+        self.inner.try_seek(pos)?;
+        self.frame_sum = 0.0;
+        self.frame_count = 0;
+        if let Ok(mut r) = self.ring.try_lock() {
+            r.clear();
+        }
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -293,8 +305,13 @@ pub fn audio_load(
     path: String,
     player: tauri::State<'_, AudioPlayer>,
 ) -> Result<LoadResult, String> {
-    let file = File::open(&path).map_err(|e| format!("open {}: {}", path, e))?;
-    let decoder = Decoder::new(BufReader::new(file)).map_err(|e| format!("decode: {}", e))?;
+    // Read the whole (compressed) file into memory and decode from there so we
+    // never keep an OS handle on the track. Holding the file open blocks the
+    // user from editing/renaming the currently-playing track's tags — on
+    // Windows the tag write hangs on our open read handle. A compressed song is
+    // only a few MB, so buffering it is cheap.
+    let bytes = std::fs::read(&path).map_err(|e| format!("read {}: {}", path, e))?;
+    let decoder = Decoder::new(Cursor::new(bytes)).map_err(|e| format!("decode: {}", e))?;
     let total_duration = decoder
         .total_duration()
         .map(|d| d.as_secs_f64())

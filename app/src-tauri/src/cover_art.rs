@@ -16,7 +16,6 @@ use image::ImageFormat;
 use lofty::config::WriteOptions;
 use lofty::file::TaggedFileExt;
 use lofty::picture::{MimeType, Picture, PictureType};
-use lofty::probe::Probe;
 use lofty::tag::{Accessor, Tag, TagExt, TagType};
 use serde::Serialize;
 use std::io::Cursor;
@@ -145,23 +144,51 @@ fn tag_type_for(path: &Path) -> TagType {
     }
 }
 
+/// Load a tag ready to write back to `path`, guaranteeing its `TagType` is one
+/// the container actually supports. Reusing whatever tag the file happens to
+/// carry is unsafe: e.g. a FLAC with a stray ID3v2 tag makes lofty reject the
+/// save with "format does not support it". So we only reuse an existing tag
+/// when its type matches the container's native type; otherwise we start a
+/// fresh native tag and salvage the basic fields from whatever was there.
+fn load_writable_tag(path: &Path) -> Tag {
+    // Content-based read (guess_file_type) so a misnamed file resolves to its
+    // real container. Trust that over the extension: writing the extension's
+    // tag type — ID3v2 — into an actual MP4 fails with "format does not support
+    // it". Fall back to the extension only if the file can't be read.
+    let tagged = crate::library::read_tagged(path);
+    let tag_type = tagged
+        .as_ref()
+        .map(|t| t.file_type().primary_tag_type())
+        .unwrap_or_else(|| tag_type_for(path));
+
+    // Reuse the file's native-type tag wholesale (preserves every field).
+    if let Some(existing) = tagged.as_ref().and_then(|t| {
+        t.primary_tag()
+            .filter(|pt| pt.tag_type() == tag_type)
+            .or_else(|| t.first_tag().filter(|ft| ft.tag_type() == tag_type))
+    }) {
+        return existing.clone();
+    }
+
+    // No native-type tag present — seed a fresh one, salvaging the basics
+    // from any foreign tag so we don't silently drop title/artist/album/art.
+    let mut fresh = Tag::new(tag_type);
+    if let Some(src) = tagged.as_ref().and_then(|t| t.first_tag()) {
+        if let Some(v) = src.title() { fresh.set_title(v.to_string()); }
+        if let Some(v) = src.artist() { fresh.set_artist(v.to_string()); }
+        if let Some(v) = src.album() { fresh.set_album(v.to_string()); }
+        if let Some(pic) = src.pictures().first() { fresh.push_picture(pic.clone()); }
+    }
+    fresh
+}
+
 /// Write JPEG bytes as the front-cover picture on any supported audio
 /// file via lofty. Preserves existing title/artist/album tags by editing
 /// the file's primary tag in place rather than overwriting it.
 pub fn write_cover_to_file(path: &Path, jpeg_bytes: &[u8]) -> Result<(), AppError> {
-    let tag_type = tag_type_for(path);
-
-    // Try to read existing tags so we don't clobber title/artist/album.
-    // If the file has no tags yet (fresh download), start a new tag of
-    // the correct type for the container.
-    let mut tag = match Probe::open(path).and_then(|p| p.read()) {
-        Ok(tagged) => tagged
-            .primary_tag()
-            .cloned()
-            .or_else(|| tagged.first_tag().cloned())
-            .unwrap_or_else(|| Tag::new(tag_type)),
-        Err(_) => Tag::new(tag_type),
-    };
+    // Load a native-type tag (preserving title/artist/album) so the cover
+    // write can't fail on a container/tag-type mismatch.
+    let mut tag = load_writable_tag(path);
 
     // Drop any existing front-cover pictures so we don't accumulate
     // duplicates on repeated embeds.
@@ -184,7 +211,7 @@ pub fn write_cover_to_file(path: &Path, jpeg_bytes: &[u8]) -> Result<(), AppErro
 /// file via lofty. Returns `None` for files without embedded art or
 /// formats lofty can't parse.
 pub fn read_cover_from_file(path: &Path) -> Option<Vec<u8>> {
-    let tagged = Probe::open(path).ok()?.read().ok()?;
+    let tagged = crate::library::read_tagged(path)?;
     let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
     tag.pictures().first().map(|p| p.data().to_vec())
 }
@@ -199,16 +226,7 @@ pub fn write_tags_to_file(
     album: Option<&str>,
     cover_jpeg: Option<&[u8]>,
 ) -> Result<(), AppError> {
-    let tag_type = tag_type_for(path);
-
-    let mut tag = match Probe::open(path).and_then(|p| p.read()) {
-        Ok(tagged) => tagged
-            .primary_tag()
-            .cloned()
-            .or_else(|| tagged.first_tag().cloned())
-            .unwrap_or_else(|| Tag::new(tag_type)),
-        Err(_) => Tag::new(tag_type),
-    };
+    let mut tag = load_writable_tag(path);
 
     if let Some(t) = title {
         if !t.is_empty() {

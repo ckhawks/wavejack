@@ -62,12 +62,14 @@ export function DownloadItem({ item }: Props) {
 
   const isComplete = item.status === "complete" && item.filePath;
   const isFileMissing = item.status === "file_missing";
-  const isMp3Complete = isComplete && item.format === "mp3";
   // Formats HTML5 audio can play inline (everything but video containers).
   // Prefer the post-download ground truth; fall back to the intent field.
   const audioFmt = (item.audioFormat || item.format || "").toLowerCase();
   const PLAYABLE_AUDIO = ["mp3", "flac", "m4a", "mp4a", "aac", "wav", "ogg", "opus"];
   const isAudioPlayable = isComplete && PLAYABLE_AUDIO.includes(audioFmt);
+  // Formats lofty can write tags to (backend update_mp3_metadata / apply_metadata).
+  const TAGGABLE_AUDIO = ["mp3", "flac", "m4a", "mp4a", "aac", "wav", "ogg", "opus"];
+  const isTaggableComplete = isComplete && TAGGABLE_AUDIO.includes(audioFmt);
 
   const [editing, setEditing] = useState(false);
   const [editTitle, setEditTitle] = useState("");
@@ -106,9 +108,10 @@ export function DownloadItem({ item }: Props) {
   useEffect(() => {
     if (!editing || filenameManuallyEdited.current) return;
     if (editArtist && editTitle) {
-      setEditFilename(`${editArtist} - ${editTitle}.mp3`);
+      const ext = item.filePath?.match(/\.[^.]+$/)?.[0] || ".mp3";
+      setEditFilename(`${editArtist} - ${editTitle}${ext}`);
     }
-  }, [editing, editArtist, editTitle]);
+  }, [editing, editArtist, editTitle, item.filePath]);
 
   async function handleSave() {
     if (!item.filePath) return;
@@ -166,7 +169,7 @@ export function DownloadItem({ item }: Props) {
             <img
               src={`data:image/jpeg;base64,${item.coverArtBase64}`}
               alt=""
-              className="mt-0.5 h-6 w-6 shrink-0 rounded object-cover"
+              className="mt-0.5 h-[42px] w-[42px] shrink-0 rounded object-cover"
             />
           )}
 
@@ -245,8 +248,8 @@ export function DownloadItem({ item }: Props) {
                 </button>
               )}
 
-              {/* Auto-tag button for MP3s */}
-              {isMp3Complete && (
+              {/* Auto-tag button for taggable audio */}
+              {isTaggableComplete && (
                 <button
                   onClick={() => setShowMetadata(!showMetadata)}
                   className={`rounded-md p-1 transition-all duration-200 hover:bg-[#222] hover:text-white ${
@@ -257,8 +260,8 @@ export function DownloadItem({ item }: Props) {
                   <Wand2 size={14} />
                 </button>
               )}
-              {/* Edit button for MP3s */}
-              {isMp3Complete && (
+              {/* Edit button for taggable audio */}
+              {isTaggableComplete && (
                 <button
                   onClick={startEditing}
                   className="rounded-md p-1 text-neutral-400 transition-all duration-200 hover:bg-[#222] hover:text-white"

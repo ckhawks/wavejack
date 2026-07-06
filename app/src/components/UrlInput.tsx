@@ -8,7 +8,7 @@ import { usePlayerStore } from "../stores/playerStore";
 import {
   startDownload, extractPlaylist, extractAudio, searchSources, searchPreview,
   discoverKeep, discoverTrash, spotifyFetchPlaylist, spotifyFetchTrack, formatErr,
-  tidalDownloadMatched, tidalAuthStatus, spotifyAuthStatus,
+  tidalDownloadMatched, tidalAuthStatus, spotifyAuthStatus, resolveSoundcloudTrack,
 } from "../lib/commands";
 import { PlaylistPreview } from "./PlaylistPreview";
 import { SpotifyPlaylistPreview } from "./SpotifyPlaylistPreview";
@@ -20,13 +20,33 @@ function isUrl(input: string): boolean {
   return trimmed.startsWith("http://") || trimmed.startsWith("https://");
 }
 
+/** Path portion of a URL, without query/hash. A SoundCloud track copied from
+ *  inside a set looks like `.../track?in=user/sets/name` — the `/sets/` is in
+ *  the query, so we must not treat it as a playlist. */
+function urlPath(url: string): string {
+  try {
+    return new URL(url).pathname;
+  } catch {
+    return url.split("?")[0].split("#")[0];
+  }
+}
+
 function isPlaylistUrl(url: string): boolean {
+  const path = urlPath(url);
   return (
-    url.includes("list=") ||
-    url.includes("/playlist") ||
-    url.includes("/sets/") ||
+    url.includes("list=") || // YouTube playlist — query param, check full URL
+    path.includes("/playlist") ||
+    path.includes("/sets/") || // SoundCloud set — path only, not ?in=
     /spotify\.com\/(playlist|album)\//.test(url)
   );
+}
+
+/** A URL that unambiguously refers to a playlist/set (not a single item that
+ *  merely carries a `?list=` context). Used to decide whether a failed
+ *  extraction should error out or fall through to a single download. */
+function isDefinitePlaylistUrl(url: string): boolean {
+  const path = urlPath(url);
+  return path.includes("/sets/") || /\/playlist(\/|$)/.test(path);
 }
 
 function isSpotifyPlaylistUrlClient(url: string): boolean {
@@ -37,12 +57,23 @@ function isSpotifyTrackUrlClient(url: string): boolean {
   return /(^https?:\/\/open\.spotify\.com\/track\/|^spotify:track:)/.test(url);
 }
 
+/** A single SoundCloud track link (not a /sets/ playlist). */
+function isSoundCloudTrackUrl(url: string): boolean {
+  if (!/soundcloud\.com|snd\.sc/i.test(url)) return false;
+  const path = urlPath(url);
+  // A track is /user/track; a set is /user/sets/name; /you, /discover etc. are
+  // not single tracks. Require exactly two non-empty path segments.
+  const segs = path.split("/").filter(Boolean);
+  return segs.length === 2 && segs[0] !== "sets";
+}
+
 export function UrlInput() {
   const [url, setUrl] = useState("");
   const [extracting, setExtracting] = useState(false);
   const [playlist, setPlaylist] = useState<PlaylistInfo | null>(null);
   const [spotifyPlaylist, setSpotifyPlaylist] = useState<SpotifyPlaylist | null>(null);
   const [spotifyError, setSpotifyError] = useState<string | null>(null);
+  const [urlError, setUrlError] = useState<string | null>(null);
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [searching, setSearching] = useState(false);
   const [hasSearched, setHasSearched] = useState(false);
@@ -112,6 +143,7 @@ export function UrlInput() {
       setSearchResults([]);
       setHasSearched(false);
       setSpotifyError(null);
+      setUrlError(null);
 
       // Spotify playlists and single tracks both route through the Web API
       // → Tidal pipeline, not yt-dlp. The backend returns a 1-track synthetic
@@ -140,8 +172,44 @@ export function UrlInput() {
           const info = await extractPlaylist(trimmed);
           setPlaylist(info);
           setUrl("");
+        } catch (e) {
+          // For a clear playlist URL (e.g. a SoundCloud /sets/ link), silently
+          // falling through to a single download would make yt-dlp bulk-grab
+          // the whole set with no preview — surprising. Surface the error and
+          // stop. Ambiguous URLs (a video that merely carries ?list=) still
+          // fall through to a normal single download.
+          if (isDefinitePlaylistUrl(trimmed)) {
+            setUrlError(`Couldn't read that playlist: ${formatErr(e)}`);
+          } else {
+            doSingleDownload(trimmed);
+          }
+        } finally {
+          setExtracting(false);
+        }
+        return;
+      }
+
+      // Single SoundCloud track: resolve it first so we know if it's DRM
+      // (monetized → SoundCloud serves it encrypted, can't be downloaded). If so,
+      // open the 1-track preview so the user can grab the Tidal version instead.
+      // Normal tracks download directly with no extra friction.
+      if (isSoundCloudTrackUrl(trimmed)) {
+        setExtracting(true);
+        try {
+          const entry = await resolveSoundcloudTrack(trimmed);
+          if (entry.drm) {
+            setPlaylist({
+              title: entry.title,
+              uploader: entry.uploader,
+              entries: [entry],
+              playlist_url: trimmed,
+            });
+            setUrl("");
+          } else {
+            doSingleDownload(trimmed);
+          }
         } catch {
-          // Not a playlist or extraction failed — fall through to normal download
+          // Resolution failed — fall back to a normal download attempt.
           doSingleDownload(trimmed);
         } finally {
           setExtracting(false);
@@ -668,6 +736,12 @@ export function UrlInput() {
       {spotifyError && (
         <div className="mt-3 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-xs text-red-300">
           Spotify fetch failed: {spotifyError}
+        </div>
+      )}
+
+      {urlError && (
+        <div className="mt-3 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-xs text-red-300">
+          {urlError}
         </div>
       )}
 

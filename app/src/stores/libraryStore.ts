@@ -27,6 +27,9 @@ interface LibraryStore {
   removeFolder: (path: string) => Promise<void>;
   rescan: () => Promise<void>;
   refresh: () => Promise<void>;
+  /** Patch a single cached track in place (by path) without reloading the whole
+   *  library — avoids re-fetching 600+ rows of base64 cover art after one edit. */
+  patchTrack: (oldPath: string, updates: Partial<LibraryTrack>) => void;
   setSearchQuery: (query: string) => void;
   setTagFilter: (tag: string | null) => void;
   loadTags: () => Promise<void>;
@@ -122,6 +125,11 @@ export const useLibraryStore = create<LibraryStore>((set, get) => ({
   refresh: async () => {
     await refreshTracks(set);
   },
+
+  patchTrack: (oldPath, updates) =>
+    set((state) => ({
+      tracks: state.tracks.map((t) => (t.path === oldPath ? { ...t, ...updates } : t)),
+    })),
 
   setSearchQuery: (query) => set({ searchQuery: query }),
 
