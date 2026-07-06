@@ -29,3 +29,6 @@ Thumbs.db
 # Local notes / tooling
 .claude/
 my ideas.txt
+
+# Standalone experiment crate (own sandbox, holds burner creds — keep out of the repo)
+spotify-poc/
