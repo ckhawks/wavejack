@@ -5,6 +5,7 @@ import { usePlayerStore } from "../stores/playerStore";
 import { useDiscoverStore } from "../stores/discoverStore";
 import {
   recordTrackPlay,
+  recordPlayStart,
   audioLoad,
   audioPlay,
   audioPause,
@@ -13,6 +14,7 @@ import {
   audioSetVolume,
 } from "../lib/commands";
 import { useLibraryStore } from "../stores/libraryStore";
+import { SILENT_AUDIO_DATA_URI } from "../lib/silentAudio";
 import { WaveformBar } from "./WaveformBar";
 import { SpectrogramBar } from "./SpectrogramBar";
 import { ImmersivePlayer } from "./ImmersivePlayer";
@@ -92,6 +94,11 @@ function Slider({
 
 export function AudioPlayer() {
   const [showImmersive, setShowImmersive] = useState(false);
+  // Near-silent looping element that keeps Chromium's MediaSession active.
+  // Real audio plays in the Rust process (rodio), which the webview can't feed
+  // to MediaSession — without a playing media element in the DOM, the OS media
+  // transport (Windows SMTC / hardware media keys) never routes to our handlers.
+  const keepAliveRef = useRef<HTMLAudioElement>(null);
   const currentTrack = usePlayerStore((s) => s.currentTrack);
   const isPlaying = usePlayerStore((s) => s.isPlaying);
   const volume = usePlayerStore((s) => s.volume);
@@ -112,6 +119,24 @@ export function AudioPlayer() {
   useEffect(() => {
     if (!currentTrack) return;
     let cancelled = false;
+    // Seed the end-time from the library's scanned duration so the seek bar is
+    // usable immediately — the playback engine can't determine duration for
+    // some files (e.g. headerless VBR MP3), and progress ticks only ever raise
+    // it when the engine does know it.
+    if (currentTrack.durationSecs && currentTrack.durationSecs > 0) {
+      setDuration(currentTrack.durationSecs);
+    }
+    // Log the play start for the Recent view. Only library tracks have a stable
+    // path we can join back to metadata (their id IS the path); download-only
+    // tracks use a UUID and are skipped. Mirrors the onEnded gate below.
+    const isLibraryTrack = useLibraryStore
+      .getState()
+      .tracks.some((t) => t.path === currentTrack.filePath);
+    if (isLibraryTrack) {
+      recordPlayStart(currentTrack.filePath).catch((e) =>
+        console.error("record_play_start failed:", e),
+      );
+    }
     audioLoad(currentTrack.filePath)
       .then((result) => {
         if (cancelled) return;
@@ -129,13 +154,24 @@ export function AudioPlayer() {
     };
   }, [currentTrack?.id, currentTrack?.filePath, setDuration]);
 
-  // Sync play/pause state with the Rust player.
+  // Sync play/pause state with the Rust player, and mirror it onto the
+  // keep-alive element + MediaSession so the OS transport stays live and shows
+  // the correct play/pause state. The keep-alive element must be playing for
+  // Chromium to expose the system controls at all.
   useEffect(() => {
     if (!currentTrack) return;
+    const keepAlive = keepAliveRef.current;
     if (isPlaying) {
       void audioPlay();
+      // play() may reject before a user gesture; the click that started
+      // playback satisfies the gesture requirement in practice.
+      keepAlive?.play().catch(() => {});
     } else {
       void audioPause();
+      keepAlive?.pause();
+    }
+    if ("mediaSession" in navigator) {
+      navigator.mediaSession.playbackState = isPlaying ? "playing" : "paused";
     }
   }, [isPlaying, currentTrack]);
 
@@ -154,7 +190,10 @@ export function AudioPlayer() {
       const { currentTime, duration } = e.payload;
       const store = usePlayerStore.getState();
       if (!store.currentTrack) return;
-      // Avoid bumping store.duration on every tick if it's already set.
+      // Only ever raise duration from the engine when it actually knows it
+      // (>0). Many files report no engine duration, in which case the scanned
+      // library duration set on load stands. `audio_load` zeroes duration_secs
+      // during a track swap, so a stale end-time can't leak in here.
       if (duration > 0 && store.duration !== duration) setDuration(duration);
       setCurrentTime(currentTime);
     }).then((u) => {
@@ -279,6 +318,12 @@ export function AudioPlayer() {
 
   return (
     <>
+      {/* Keep-alive: a looping near-silent clip that holds the OS MediaSession
+          active. Not muted (muted elements don't activate SMTC); its content is
+          silence, so nothing is audible. Playback state is driven by the
+          play/pause sync effect above. */}
+      <audio ref={keepAliveRef} src={SILENT_AUDIO_DATA_URI} loop preload="auto" />
+
       {/* Immersive (full-screen now playing) mode */}
       {showImmersive && <ImmersivePlayer onClose={() => setShowImmersive(false)} />}
 
