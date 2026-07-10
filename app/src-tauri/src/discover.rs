@@ -767,3 +767,29 @@ pub fn cleanup_previews(app: &AppHandle) -> Result<(), AppError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::split_artists;
+
+    #[test]
+    fn splits_on_comma_and_ampersand() {
+        assert_eq!(split_artists("A, B & C"), vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn splits_on_feat_and_ft_variants() {
+        assert_eq!(split_artists("Artist feat. Guest"), vec!["Artist", "Guest"]);
+        assert_eq!(split_artists("Artist ft Guest"), vec!["Artist", "Guest"]);
+    }
+
+    #[test]
+    fn passes_through_a_single_artist() {
+        assert_eq!(split_artists("Solo"), vec!["Solo"]);
+    }
+
+    #[test]
+    fn drops_empty_segments_and_trims() {
+        assert_eq!(split_artists("A,,  B "), vec!["A", "B"]);
+    }
+}

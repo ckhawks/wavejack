@@ -163,6 +163,18 @@ impl Database {
             [],
         ).ok();
 
+        // Play history: one row per playback start, powering the "Recent" view.
+        // Distinct from library_tracks.play_count (which only counts natural
+        // finishes) — this logs every track you start, skips included.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS play_history (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                track_path TEXT NOT NULL,
+                played_at  INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_play_history_played_at ON play_history(played_at DESC);",
+        )?;
+
         // Playlists
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS playlists (
@@ -380,6 +392,91 @@ impl Database {
             params![now, path],
         )?;
         Ok(())
+    }
+
+    /// Append a playback-start event to the history log. Called when a track
+    /// begins playing (skips included) — see `get_recently_played`.
+    pub fn record_play_start(&self, path: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        conn.execute(
+            "INSERT INTO play_history (track_path, played_at) VALUES (?1, ?2)",
+            params![path, now],
+        )?;
+        Ok(())
+    }
+
+    /// Load the most recent play events (newest first, repeats included),
+    /// joined to their library track metadata. Events for tracks no longer in
+    /// the library are omitted.
+    pub fn get_recently_played(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<crate::library::PlayHistoryEntry>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+
+        // Bulk load tags once (avoids N+1), matching get_all_library_tracks.
+        let tag_map = {
+            let mut stmt = conn.prepare(
+                "SELECT tt.track_path, t.name, tt.weight
+                 FROM track_tags tt JOIN tags t ON tt.tag_id = t.id
+                 ORDER BY tt.track_path, tt.weight DESC",
+            )?;
+            let mut map: HashMap<String, Vec<String>> = HashMap::new();
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (path, tag) = row?;
+                let entry = map.entry(path).or_default();
+                if entry.len() < 5 {
+                    entry.push(tag);
+                }
+            }
+            map
+        };
+
+        let mut stmt = conn.prepare(
+            "SELECT ph.id, ph.played_at,
+                    lt.path, lt.filename, lt.title, lt.artist, lt.album, lt.duration_secs,
+                    lt.cover_art, lt.first_scanned_at, lt.bitrate_kbps, lt.play_count,
+                    lt.last_played_at, lt.bitrate_estimated, lt.file_type
+             FROM play_history ph
+             JOIN library_tracks lt ON lt.path = ph.track_path
+             ORDER BY ph.played_at DESC, ph.id DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            let path: String = row.get(2)?;
+            let cover: Option<Vec<u8>> = row.get(8)?;
+            let cover_b64 = cover
+                .map(|b| base64::engine::general_purpose::STANDARD.encode(&b))
+                .unwrap_or_default();
+            Ok(crate::library::PlayHistoryEntry {
+                id: row.get(0)?,
+                played_at: row.get(1)?,
+                track: crate::library::LibraryTrack {
+                    tags: tag_map.get(&path).cloned().unwrap_or_default(),
+                    path,
+                    filename: row.get(3)?,
+                    title: row.get(4)?,
+                    artist: row.get(5)?,
+                    album: row.get(6)?,
+                    duration_secs: row.get::<_, i64>(7)? as u32,
+                    cover_art_base64: cover_b64,
+                    first_scanned_at: row.get::<_, i64>(9)?,
+                    bitrate_kbps: row.get::<_, i64>(10)? as u32,
+                    play_count: row.get::<_, i64>(11)? as u32,
+                    last_played_at: row.get::<_, i64>(12)?,
+                    bitrate_estimated: row.get::<_, i64>(13)? != 0,
+                    file_type: row.get::<_, String>(14)?,
+                },
+            })
+        })?;
+        rows.collect()
     }
 
     pub fn get_library_waveform(&self, path: &str) -> Result<Option<Vec<u8>>, rusqlite::Error> {

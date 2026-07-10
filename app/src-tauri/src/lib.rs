@@ -164,6 +164,7 @@ async fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, AppErr
         .unwrap_or_else(|| "downloads".to_string());
     let library_columns = get_store_value(&app, "libraryColumns").unwrap_or_default();
     let library_sort = get_store_value(&app, "librarySort").unwrap_or_default();
+    let library_view_mode = get_store_value(&app, "libraryViewMode").unwrap_or_default();
     let shuffle = get_store_value(&app, "shuffle").unwrap_or_else(|| "0".to_string());
     let spotify_client_id = get_store_value(&app, "spotifyClientId").unwrap_or_default();
     let spotify_client_secret = get_store_value(&app, "spotifyClientSecret").unwrap_or_default();
@@ -182,6 +183,7 @@ async fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, AppErr
         "lastDestination": last_destination,
         "libraryColumns": library_columns,
         "librarySort": library_sort,
+        "libraryViewMode": library_view_mode,
         "shuffle": shuffle,
         "spotifyClientId": spotify_client_id,
         "spotifyClientSecret": spotify_client_secret,
@@ -297,7 +299,10 @@ async fn update_mp3_metadata(
 
     // Rename file if needed
     let final_path = if target_filename != current_filename {
-        let new_path = file_path.with_file_name(&target_filename);
+        let new_path = library::non_clobbering_path(
+            &file_path,
+            &file_path.with_file_name(&target_filename),
+        );
         tokio::fs::rename(&file_path, &new_path)
             .await
             .map_err(|e| AppError::Io(format!("Failed to rename file: {}", e)))?;
@@ -1066,7 +1071,10 @@ async fn discover_keep(
     let filename = source
         .file_name()
         .ok_or_else(|| AppError::Io("Invalid file path".into()))?;
-    let dest = std::path::PathBuf::from(&output_dir).join(filename);
+    let dest = library::non_clobbering_path(
+        &source,
+        &std::path::PathBuf::from(&output_dir).join(filename),
+    );
     let dest_str = dest.to_string_lossy().to_string();
 
     tokio::fs::rename(&source, &dest)
@@ -1290,7 +1298,10 @@ async fn update_library_track(
     };
 
     let final_path = if target_filename != current_filename {
-        let new_path = file_path.with_file_name(&target_filename);
+        let new_path = library::non_clobbering_path(
+            &file_path,
+            &file_path.with_file_name(&target_filename),
+        );
         tokio::fs::rename(&file_path, &new_path)
             .await
             .map_err(|e| AppError::Io(format!("Failed to rename file: {}", e)))?;
@@ -1361,7 +1372,10 @@ fn apply_bulk_parse_edit(app: &tauri::AppHandle, edit: &BulkParseEdit) -> Result
     };
 
     let final_path = if target_filename != current_filename {
-        let new_path = file_path.with_file_name(&target_filename);
+        let new_path = library::non_clobbering_path(
+            &file_path,
+            &file_path.with_file_name(&target_filename),
+        );
         std::fs::rename(&file_path, &new_path)
             .map_err(|e| AppError::Io(format!("Failed to rename file: {}", e)))?;
         new_path.to_string_lossy().to_string()
@@ -1537,6 +1551,27 @@ async fn fix_library_extensions(app: tauri::AppHandle) -> Result<usize, AppError
 async fn record_track_play(app: tauri::AppHandle, path: String) -> Result<(), AppError> {
     let db = app.state::<Database>();
     db.record_library_play(&path).map_err(|e| AppError::Io(e.to_string()))
+}
+
+/// Append a playback-start event to the history log. Called from the frontend
+/// when a library track begins playing (skips included), powering the "Recent"
+/// view. Independent of `record_track_play`, which counts natural finishes.
+#[tauri::command]
+async fn record_play_start(app: tauri::AppHandle, path: String) -> Result<(), AppError> {
+    let db = app.state::<Database>();
+    db.record_play_start(&path).map_err(|e| AppError::Io(e.to_string()))
+}
+
+/// Load the most recent plays (newest first, repeats included) for the "Recent"
+/// view. `limit` caps the number of events returned (defaults to 200).
+#[tauri::command]
+async fn get_recently_played(
+    app: tauri::AppHandle,
+    limit: Option<u32>,
+) -> Result<Vec<library::PlayHistoryEntry>, AppError> {
+    let db = app.state::<Database>();
+    db.get_recently_played(limit.unwrap_or(200) as i64)
+        .map_err(|e| AppError::Io(e.to_string()))
 }
 
 /// Get a cached waveform for the given file path, computing + caching it
@@ -2449,6 +2484,8 @@ pub fn run() {
             audio::audio_seek,
             audio::audio_set_volume,
             record_track_play,
+            record_play_start,
+            get_recently_played,
             get_track_cover_art,
             get_remote_info,
             create_playlist,

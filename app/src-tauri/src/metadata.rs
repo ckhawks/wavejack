@@ -243,7 +243,10 @@ pub async fn apply_metadata_to_file(
     };
 
     let final_path = if new_filename != current_filename {
-        let new_path = file_path.with_file_name(&new_filename);
+        let new_path = crate::library::non_clobbering_path(
+            &file_path,
+            &file_path.with_file_name(&new_filename),
+        );
         tokio::fs::rename(&file_path, &new_path)
             .await
             .map_err(|e| AppError::MetadataFailed(format!("Failed to rename file: {}", e)))?;
@@ -265,4 +268,21 @@ fn sanitize_filename(s: &str) -> String {
     s.chars()
         .map(|c| if "<>:\"/\\|?*".contains(c) { '_' } else { c })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_filename;
+
+    #[test]
+    fn replaces_every_windows_reserved_char() {
+        let out = sanitize_filename(r#"a<b>c:d"e/f\g|h?i*j"#);
+        assert!(!out.chars().any(|c| "<>:\"/\\|?*".contains(c)));
+        assert_eq!(out, "a_b_c_d_e_f_g_h_i_j");
+    }
+
+    #[test]
+    fn leaves_a_clean_name_untouched() {
+        assert_eq!(sanitize_filename("Artist - Title"), "Artist - Title");
+    }
 }

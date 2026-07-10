@@ -105,6 +105,13 @@ fn run_emitter_loop(
     let fft = planner.plan_fft_forward(FFT_WINDOW);
     let mut scratch = vec![Complex32::default(); FFT_WINDOW];
     let interval = Duration::from_millis(16);
+    // The spectrum drives a rAF canvas at 60Hz and only writes a JS ref (no
+    // React re-render), so it stays on the 16ms tick. Progress, by contrast,
+    // writes the player store and re-renders every subscriber, so emit it every
+    // Nth tick (~15Hz) — plenty for a seek bar, and it slashes main-thread IPC
+    // deserialization + React reconciliation by ~75%.
+    const PROGRESS_EVERY: u32 = 4;
+    let mut tick: u32 = 0;
     // Hann window precomputed once.
     let window: Vec<f32> = (0..FFT_WINDOW)
         .map(|i| {
@@ -115,7 +122,10 @@ fn run_emitter_loop(
 
     loop {
         std::thread::sleep(interval);
+        tick = tick.wrapping_add(1);
 
+        // Read state (and detect end-of-track) every tick so track-end latency
+        // stays ~1 frame; only the store-touching progress emit is throttled.
         let (current_time, duration, ended_path) = {
             let mut s = state.lock().unwrap();
             let duration = s.duration_secs;
@@ -137,13 +147,15 @@ fn run_emitter_loop(
             (current_time, duration, ended_path)
         };
 
-        let _ = app.emit(
-            "audio://progress",
-            ProgressPayload {
-                current_time,
-                duration,
-            },
-        );
+        if tick % PROGRESS_EVERY == 0 {
+            let _ = app.emit(
+                "audio://progress",
+                ProgressPayload {
+                    current_time,
+                    duration,
+                },
+            );
+        }
 
         if let Some(path) = ended_path {
             let _ = app.emit("audio://ended", path);
@@ -305,13 +317,40 @@ pub fn audio_load(
     path: String,
     player: tauri::State<'_, AudioPlayer>,
 ) -> Result<LoadResult, String> {
+    // Tear down the previous track up front so the progress emitter reports a
+    // zeroed duration/position during the (potentially slow) decode below,
+    // rather than the outgoing track's values — otherwise the old end-time
+    // would briefly leak onto the newly-selected track in the UI.
+    {
+        let mut state = player.state.lock().unwrap();
+        state.expecting_end = false;
+        if let Some(p) = state.player.take() {
+            p.stop();
+        }
+        state._device_sink = None;
+        state.current_path = None;
+        state.duration_secs = 0.0;
+    }
+
     // Read the whole (compressed) file into memory and decode from there so we
     // never keep an OS handle on the track. Holding the file open blocks the
     // user from editing/renaming the currently-playing track's tags — on
     // Windows the tag write hangs on our open read handle. A compressed song is
     // only a few MB, so buffering it is cheap.
     let bytes = std::fs::read(&path).map_err(|e| format!("read {}: {}", path, e))?;
-    let decoder = Decoder::new(Cursor::new(bytes)).map_err(|e| format!("decode: {}", e))?;
+    // Build the decoder as seekable. The default `Decoder::new` leaves the
+    // stream marked non-seekable (`Settings::is_seekable = false`), which makes
+    // symphonia reject any *backward* seek with `ForwardOnly` — the seek bar
+    // could only ever scrub forward. We hold the whole file in memory, so the
+    // byte length is known; setting it (and the explicit seekable flag) enables
+    // true random-access seeking in both directions.
+    let byte_len = bytes.len() as u64;
+    let decoder = Decoder::builder()
+        .with_data(Cursor::new(bytes))
+        .with_byte_len(byte_len)
+        .with_seekable(true)
+        .build()
+        .map_err(|e| format!("decode: {}", e))?;
     let total_duration = decoder
         .total_duration()
         .map(|d| d.as_secs_f64())
@@ -398,4 +437,31 @@ pub fn audio_set_volume(volume: f32, player: tauri::State<'_, AudioPlayer>) -> R
         p.set_volume(v);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::log_bucket;
+
+    #[test]
+    fn empty_input_yields_zeroed_bands() {
+        assert_eq!(log_bucket(&[], 8, 44_100), vec![0.0; 8]);
+    }
+
+    #[test]
+    fn output_length_always_equals_band_count() {
+        let mags: Vec<f32> = (0..512).map(|i| i as f32).collect();
+        for bands in [1, 8, 16, 64] {
+            assert_eq!(log_bucket(&mags, bands, 44_100).len(), bands);
+        }
+    }
+
+    #[test]
+    fn values_stay_within_unit_range() {
+        // Includes a huge magnitude to prove the clamp holds at the top end.
+        let mags = vec![0.0, 1.0, 100.0, 1e9, 3.5, 42.0];
+        for v in log_bucket(&mags, 16, 44_100) {
+            assert!((0.0..=1.0).contains(&v), "value {v} out of range");
+        }
+    }
 }

@@ -180,8 +180,15 @@ fn extract_filename(response: &reqwest::Response, format: &str) -> String {
         if let Ok(cd_str) = cd.to_str() {
             if let Some(start) = cd_str.find("filename=") {
                 let name = cd_str[start + 9..].trim_matches('"').trim_matches('\'');
-                if !name.is_empty() {
-                    return name.to_string();
+                // Clamp to a bare filename: a malicious/compromised cobalt instance
+                // could return `../../…` or an absolute path to escape output_dir.
+                if let Some(base) = std::path::Path::new(name)
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                {
+                    if !base.is_empty() {
+                        return base.to_string();
+                    }
                 }
             }
         }

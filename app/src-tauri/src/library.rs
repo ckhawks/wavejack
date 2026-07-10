@@ -97,26 +97,54 @@ pub fn fix_extension(path: &Path) -> std::io::Result<(PathBuf, bool)> {
     let Some(correct) = corrected_extension(path) else {
         return Ok((path.to_path_buf(), false));
     };
-    let mut target = path.with_extension(correct);
+    let target = path.with_extension(correct);
     if target == path {
         return Ok((path.to_path_buf(), false));
     }
     // Never overwrite an unrelated file already sitting at the target name.
-    if target.exists() {
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("track");
-        let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-        let mut n = 1;
-        loop {
-            let candidate = dir.join(format!("{} ({}).{}", stem, n, correct));
-            if !candidate.exists() {
-                target = candidate;
-                break;
-            }
-            n += 1;
-        }
-    }
+    let target = non_clobbering_path(path, &target);
     std::fs::rename(path, &target)?;
     Ok((target, true))
+}
+
+/// Resolve `desired` to a path that will not clobber a *different* existing file.
+///
+/// Renaming `A.mp3` → `B.mp3` with `std::fs`/`tokio::fs` silently replaces an
+/// existing `B.mp3`. When two tracks share an artist+title (e.g. a clean rip and
+/// a live version), an edit/normalize of one would destroy the other. This appends
+/// a ` (n)` suffix until a free name is found so the rename is always non-destructive.
+///
+/// If `desired` already exists but refers to the *same* file as `source` — a
+/// case-only rename on a case-insensitive filesystem (Windows, default macOS APFS) —
+/// `desired` is returned unchanged so we don't spuriously suffix it.
+pub fn non_clobbering_path(source: &Path, desired: &Path) -> PathBuf {
+    if !desired.exists() {
+        return desired.to_path_buf();
+    }
+    // Same underlying file (case-only rename)? Allow it through untouched.
+    if let (Ok(a), Ok(b)) = (
+        std::fs::canonicalize(source),
+        std::fs::canonicalize(desired),
+    ) {
+        if a == b {
+            return desired.to_path_buf();
+        }
+    }
+    let ext = desired.extension().and_then(|e| e.to_str());
+    let stem = desired.file_stem().and_then(|s| s.to_str()).unwrap_or("track");
+    let dir = desired.parent().map(Path::to_path_buf).unwrap_or_default();
+    let mut n = 1;
+    loop {
+        let name = match ext {
+            Some(e) => format!("{} ({}).{}", stem, n, e),
+            None => format!("{} ({})", stem, n),
+        };
+        let candidate = dir.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -156,6 +184,18 @@ pub struct LibraryTrack {
     /// from the filename's extension for mislabeled files.
     #[serde(default)]
     pub file_type: String,
+}
+
+/// One playback-start event joined to its library track, for the "Recent" view.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlayHistoryEntry {
+    /// play_history row id — a stable, unique key for the UI (a track can appear
+    /// many times in the list).
+    pub id: i64,
+    /// Unix seconds when playback started.
+    pub played_at: i64,
+    /// The library track that was played.
+    pub track: LibraryTrack,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -403,4 +443,81 @@ fn stem_from_filename(filename: &str) -> String {
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| filename.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// A unique, freshly-created temp dir per test (parallel-safe via distinct tags).
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("wavejack_lib_test_{}_{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn returns_desired_when_target_is_free() {
+        let dir = temp_dir("free");
+        let src = dir.join("a.mp3");
+        fs::write(&src, b"x").unwrap();
+        let desired = dir.join("b.mp3");
+        assert_eq!(non_clobbering_path(&src, &desired), desired);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn suffixes_rather_than_clobbering_a_different_file() {
+        // The C1 data-loss scenario: a clean rip and a live version normalize to the
+        // same "Artist - Title.mp3". Renaming one must NOT overwrite the other.
+        let dir = temp_dir("clobber");
+        let src = dir.join("live.mp3");
+        fs::write(&src, b"live").unwrap();
+        let desired = dir.join("Artist - Title.mp3");
+        fs::write(&desired, b"clean").unwrap(); // a different file already sits here
+        let got = non_clobbering_path(&src, &desired);
+        assert_eq!(got, dir.join("Artist - Title (1).mp3"));
+        assert_ne!(got, desired);
+        // the pre-existing file is untouched
+        assert_eq!(fs::read(&desired).unwrap(), b"clean");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn increments_suffix_until_free() {
+        let dir = temp_dir("incr");
+        let src = dir.join("src.mp3");
+        fs::write(&src, b"s").unwrap();
+        let desired = dir.join("t.mp3");
+        fs::write(&desired, b"0").unwrap();
+        fs::write(dir.join("t (1).mp3"), b"1").unwrap();
+        assert_eq!(non_clobbering_path(&src, &desired), dir.join("t (2).mp3"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn allows_case_only_rename_of_the_same_file() {
+        // On a case-insensitive FS (Windows/macOS) `desired` "exists" but is the same
+        // underlying file — must pass through without a spurious "(1)" suffix. On a
+        // case-sensitive FS `desired` simply doesn't exist, so it also passes through.
+        let dir = temp_dir("case");
+        let src = dir.join("artist - title.mp3");
+        fs::write(&src, b"x").unwrap();
+        let desired = dir.join("Artist - Title.mp3");
+        assert_eq!(non_clobbering_path(&src, &desired), desired);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn suffixes_extensionless_targets() {
+        let dir = temp_dir("noext");
+        let src = dir.join("s");
+        fs::write(&src, b"s").unwrap();
+        let desired = dir.join("name");
+        fs::write(&desired, b"0").unwrap();
+        assert_eq!(non_clobbering_path(&src, &desired), dir.join("name (1)"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }

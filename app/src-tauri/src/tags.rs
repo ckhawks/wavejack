@@ -239,3 +239,33 @@ async fn fetch_lastfm_tags(
 
     Ok(results)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_tag;
+
+    #[test]
+    fn maps_known_aliases() {
+        assert_eq!(normalize_tag("nu disco"), "Nu-Disco");
+        assert_eq!(normalize_tag("ost"), "Soundtrack");
+        assert_eq!(normalize_tag("chill"), "Chillout");
+    }
+
+    #[test]
+    fn title_cases_unknown_tags() {
+        assert_eq!(normalize_tag("some weird tag"), "Some Weird Tag");
+    }
+
+    #[test]
+    fn trims_and_lowercases_before_matching() {
+        assert_eq!(normalize_tag("  Nu Disco  "), "Nu-Disco");
+    }
+
+    #[test]
+    fn is_idempotent() {
+        for raw in ["nu disco", "OST", "chill", "some weird tag", "  Techno  "] {
+            let once = normalize_tag(raw);
+            assert_eq!(normalize_tag(&once), once, "not idempotent for {raw:?}");
+        }
+    }
+}
