@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Settings as SettingsIcon, Minus, Square, X, Download, Radio, Library, Compass, Rss, Home } from "lucide-react";
+import { Settings as SettingsIcon, Minus, Square, X, Download, Radio, Library, Compass, Rss, Home, Clock, Gamepad2 } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { UrlInput } from "./UrlInput";
 import { DownloadQueue } from "./DownloadQueue";
@@ -12,9 +12,11 @@ import { useNavStore, type Tab } from "../stores/navStore";
 import { RoomBrowser } from "./rooms/RoomBrowser";
 import { RoomView } from "./rooms/RoomView";
 import { LibraryView } from "./LibraryView";
+import { RecentlyPlayedView } from "./RecentlyPlayedView";
 import { DiscoverView } from "./discover/DiscoverView";
 import { FeedView } from "./FeedView";
 import { HomeView } from "./HomeView";
+import { GuessGameView } from "./GuessGameView";
 
 function WindowControls() {
   const appWindow = getCurrentWindow();
@@ -43,7 +45,7 @@ function WindowControls() {
   );
 }
 
-const VALID_TABS: Tab[] = ["home", "downloads", "library", "discover", "feed", "rooms"];
+const VALID_TABS: Tab[] = ["home", "downloads", "library", "recent", "discover", "feed", "rooms", "extras"];
 
 export function Layout() {
   const [showSettings, setShowSettings] = useState(false);
@@ -77,9 +79,11 @@ export function Layout() {
     { id: "home", label: "Home", icon: Home },
     { id: "downloads", label: "Downloads", icon: Download },
     { id: "library", label: "Library", icon: Library },
+    { id: "recent", label: "Recent", icon: Clock },
     { id: "discover", label: "Discover", icon: Compass },
     { id: "feed", label: "Feed", icon: Rss },
     { id: "rooms", label: "Rooms", icon: Radio },
+    { id: "extras", label: "Extras", icon: Gamepad2 },
   ];
 
   return (
@@ -145,6 +149,10 @@ export function Layout() {
           <main className={`flex flex-1 flex-col overflow-hidden ${hasPlayer ? "pb-36" : ""}`}>
             <LibraryView />
           </main>
+        ) : activeTab === "recent" ? (
+          <main className={`flex flex-1 flex-col overflow-hidden ${hasPlayer ? "pb-36" : ""}`}>
+            <RecentlyPlayedView />
+          </main>
         ) : activeTab === "discover" ? (
           <main className={`flex flex-1 flex-col overflow-hidden p-6 ${hasPlayer ? "pb-36" : ""}`}>
             <DiscoverView />
@@ -152,6 +160,10 @@ export function Layout() {
         ) : activeTab === "feed" ? (
           <main className={`flex flex-1 flex-col overflow-hidden p-6 ${hasPlayer ? "pb-36" : ""}`}>
             <FeedView />
+          </main>
+        ) : activeTab === "extras" ? (
+          <main className="flex flex-1 flex-col overflow-hidden">
+            <GuessGameView />
           </main>
         ) : currentRoomId ? (
           <RoomView />
@@ -164,8 +176,9 @@ export function Layout() {
         {/* Settings modal */}
         {showSettings && <Settings onClose={() => setShowSettings(false)} />}
 
-        {/* Audio player footer (on downloads + library tabs) */}
-        {activeTab !== "rooms" && <AudioPlayer />}
+        {/* Audio player footer. Hidden on rooms (own transport) and extras (the
+            guessing game drives the player itself and wants a clean stage). */}
+        {activeTab !== "rooms" && activeTab !== "extras" && <AudioPlayer />}
       </div>
     </div>
   );
