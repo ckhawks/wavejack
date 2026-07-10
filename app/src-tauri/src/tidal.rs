@@ -444,6 +444,33 @@ struct SearchResponse {
     items: Vec<SearchTrack>,
 }
 
+// --- HTTP retry helpers --------------------------------------------------
+//
+// Tidal doesn't publish rate limits for either the openapi or the private v1
+// surface, but it does return 429 with a `Retry-After` header under load. These
+// helpers let every GET honor that header instead of hammering blindly.
+
+/// Total attempts for a retryable (429/5xx) Tidal GET before giving up.
+const TIDAL_MAX_RETRIES: u32 = 4;
+
+/// Parse a `Retry-After` header (delta-seconds form) into a Duration. Tidal
+/// returns integer seconds; we ignore the RFC HTTP-date form since Tidal
+/// doesn't use it. Capped at 60s so a hostile/huge value can't wedge the match
+/// loop while the preview modal is open.
+fn retry_after_delay(resp: &reqwest::Response) -> Option<Duration> {
+    resp.headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|secs| Duration::from_secs(secs.min(60)))
+}
+
+/// How long to wait before retrying a 429/5xx: honor Tidal's `Retry-After`
+/// header when present, otherwise exponential backoff (500ms, 1s, 2s, 4s).
+fn backoff_delay(resp: &reqwest::Response, attempt: u32) -> Duration {
+    retry_after_delay(resp).unwrap_or_else(|| Duration::from_millis(500 * (1 << attempt)))
+}
+
 // --- ISRC lookup via openapi.tidal.com/v2 (JSON:API) ---------------------
 
 #[derive(Debug, Deserialize)]
@@ -469,31 +496,40 @@ async fn isrc_via_openapi(token: &CachedToken, isrc: &str) -> Result<Option<u64>
         urlencoding::encode(isrc),
         token.country_code,
     );
-    let resp = reqwest::Client::new()
-        .get(&url)
-        .bearer_auth(&token.access_token)
-        .header("Accept", "application/vnd.api+json")
-        .send()
-        .await
-        .map_err(|e| AppError::Settings(format!("openapi ISRC call failed: {}", e)))?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        eprintln!("[tidal] openapi byisrc {} -> HTTP {}: {}", isrc, status,
-            body.chars().take(200).collect::<String>());
-        return Err(AppError::Settings(format!("openapi HTTP {}", status)));
+    for attempt in 0..TIDAL_MAX_RETRIES {
+        let resp = reqwest::Client::new()
+            .get(&url)
+            .bearer_auth(&token.access_token)
+            .header("Accept", "application/vnd.api+json")
+            .send()
+            .await
+            .map_err(|e| AppError::Settings(format!("openapi ISRC call failed: {}", e)))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+            let delay = backoff_delay(&resp, attempt);
+            eprintln!("[tidal] openapi byisrc {} -> HTTP {}, retry in {:?}", isrc, status, delay);
+            tokio::time::sleep(delay).await;
+            continue;
+        }
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            eprintln!("[tidal] openapi byisrc {} -> HTTP {}: {}", isrc, status,
+                body.chars().take(200).collect::<String>());
+            return Err(AppError::Settings(format!("openapi HTTP {}", status)));
+        }
+        let parsed: OpenApiResponse = serde_json::from_str(&body).map_err(|e| {
+            AppError::Settings(format!("openapi parse: {} (body: {})", e,
+                body.chars().take(200).collect::<String>()))
+        })?;
+        let hit = parsed.data.first().and_then(|i| i.id.parse::<u64>().ok());
+        eprintln!("[tidal] openapi byisrc {} -> {} hit(s){}",
+            isrc,
+            parsed.data.len(),
+            hit.map(|id| format!(" (id={})", id)).unwrap_or_default(),
+        );
+        return Ok(hit);
     }
-    let parsed: OpenApiResponse = serde_json::from_str(&body).map_err(|e| {
-        AppError::Settings(format!("openapi parse: {} (body: {})", e,
-            body.chars().take(200).collect::<String>()))
-    })?;
-    let hit = parsed.data.first().and_then(|i| i.id.parse::<u64>().ok());
-    eprintln!("[tidal] openapi byisrc {} -> {} hit(s){}",
-        isrc,
-        parsed.data.len(),
-        hit.map(|id| format!(" (id={})", id)).unwrap_or_default(),
-    );
-    Ok(hit)
+    Err(AppError::Settings(format!("openapi ISRC {} exhausted retries", isrc)))
 }
 
 // --- ISRC lookup fallback: v1 search + per-track detail ------------------
@@ -501,20 +537,30 @@ async fn isrc_via_openapi(token: &CachedToken, isrc: &str) -> Result<Option<u64>
 /// Fetch full track detail (includes `isrc` field) from v1.
 async fn v1_track_detail(token: &CachedToken, id: u64) -> Result<Option<SearchTrack>, AppError> {
     let url = format!("{}/tracks/{}?countryCode={}", API_BASE, id, token.country_code);
-    let resp = reqwest::Client::new()
-        .get(&url)
-        .bearer_auth(&token.access_token)
-        .send()
-        .await
-        .map_err(|e| AppError::Settings(format!("v1 track detail failed: {}", e)))?;
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(None);
+    for attempt in 0..TIDAL_MAX_RETRIES {
+        let resp = reqwest::Client::new()
+            .get(&url)
+            .bearer_auth(&token.access_token)
+            .send()
+            .await
+            .map_err(|e| AppError::Settings(format!("v1 track detail failed: {}", e)))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+            let delay = backoff_delay(&resp, attempt);
+            eprintln!("[tidal] v1 detail id={} -> HTTP {}, retry in {:?}", id, status, delay);
+            tokio::time::sleep(delay).await;
+            continue;
+        }
+        if !status.is_success() {
+            return Err(AppError::Settings(format!("v1 track detail HTTP {}", status)));
+        }
+        let t: SearchTrack = resp.json().await.map_err(|e| AppError::Settings(e.to_string()))?;
+        return Ok(Some(t));
     }
-    if !resp.status().is_success() {
-        return Err(AppError::Settings(format!("v1 track detail HTTP {}", resp.status())));
-    }
-    let t: SearchTrack = resp.json().await.map_err(|e| AppError::Settings(e.to_string()))?;
-    Ok(Some(t))
+    Err(AppError::Settings(format!("v1 track detail id={} exhausted retries", id)))
 }
 
 /// Resolve an ISRC to a Tidal track using v1 search: the search endpoint
@@ -559,7 +605,7 @@ async fn search_tracks(
         limit,
         token.country_code,
     );
-    for attempt in 0..4u32 {
+    for attempt in 0..TIDAL_MAX_RETRIES {
         let resp = reqwest::Client::new()
             .get(&url)
             .bearer_auth(&token.access_token)
@@ -568,7 +614,9 @@ async fn search_tracks(
             .map_err(|e| AppError::Settings(format!("Tidal search failed: {}", e)))?;
         let status = resp.status();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-            tokio::time::sleep(Duration::from_millis(500 * (1 << attempt))).await;
+            let delay = backoff_delay(&resp, attempt);
+            eprintln!("[tidal] search {:?} -> HTTP {}, retry in {:?}", q, status, delay);
+            tokio::time::sleep(delay).await;
             continue;
         }
         if !status.is_success() {
