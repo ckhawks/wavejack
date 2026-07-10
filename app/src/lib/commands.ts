@@ -514,6 +514,12 @@ export async function tidalMatchTracks(tracks: TidalMatchInput[]): Promise<Tidal
   return invoke("tidal_match_tracks", { tracks });
 }
 
+/** Cancel an in-flight tidalMatchTracks run so the backend stops hitting Tidal.
+ *  Called when the Spotify preview modal closes mid-match. */
+export async function tidalCancelMatch(): Promise<void> {
+  return invoke("tidal_cancel_match");
+}
+
 /** Fuzzy-match a SoundCloud playlist's entries against Tidal so the user can
  *  upgrade individual tracks to lossless. Emits "tidal-sc-match-progress" per
  *  entry. No ISRC path — SoundCloud exposes none. */

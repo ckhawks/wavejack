@@ -394,6 +394,37 @@ pub struct TidalMatch {
     pub reason: Option<String>,
 }
 
+/// Cancellation control for the sequential match loop, held in Tauri managed
+/// state. Each run claims a fresh generation; a cancel — or a newer run —
+/// bumps the counter, and the in-flight loop notices its generation is stale
+/// and stops. A monotonic counter (rather than a bool) makes re-match and
+/// cancel race-free: a cancel meant for an old run can't stop a newer one.
+#[derive(Default)]
+pub struct MatchControl {
+    generation: std::sync::atomic::AtomicU64,
+}
+
+impl MatchControl {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Claim a new generation for a starting run, invalidating any in-flight one.
+    fn begin(&self) -> u64 {
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+    }
+
+    /// Whether `my_gen` is still the active generation.
+    fn is_active(&self, my_gen: u64) -> bool {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst) == my_gen
+    }
+
+    /// Cancel whatever run is currently active.
+    pub fn cancel(&self) {
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 // ------- search ------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -1031,12 +1062,40 @@ pub fn tidal_logout_cmd(app: AppHandle) -> Result<(), AppError> {
 
 pub async fn tidal_match_tracks_cmd(
     app: AppHandle,
+    control: &MatchControl,
     tracks: Vec<MatchInput>,
 ) -> Result<Vec<TidalMatch>, AppError> {
     let token = ensure_token(&app).await?;
+    let my_gen = control.begin();
     let mut out = Vec::with_capacity(tracks.len());
+    // Within one batch, identical ISRCs resolve to the same Tidal track, so a
+    // playlist with duplicates queries Tidal once and reuses the result.
+    let mut isrc_cache: HashMap<String, TidalMatch> = HashMap::new();
     for (i, t) in tracks.iter().enumerate() {
-        let m = match_one(&token, t).await;
+        // Stop early if the preview modal closed or a newer match superseded us.
+        if !control.is_active(my_gen) {
+            eprintln!("[tidal] match cancelled at {}/{}", i, tracks.len());
+            break;
+        }
+
+        let valid_isrc = t.isrc.as_ref().filter(|s| is_valid_isrc(s)).cloned();
+        let (m, hit_network) = match valid_isrc.as_ref().and_then(|isrc| isrc_cache.get(isrc)) {
+            Some(cached) => {
+                // Reuse a prior result, rekeyed to this track's Spotify id.
+                let mut m = cached.clone();
+                m.spotify_id = t.spotify_id.clone();
+                (m, false)
+            }
+            None => {
+                let m = match_one(&token, t).await;
+                // Don't cache transient errors — a later dupe may still succeed.
+                if let Some(isrc) = valid_isrc.filter(|_| !matches!(m.status, MatchStatus::Error)) {
+                    isrc_cache.insert(isrc, m.clone());
+                }
+                (m, true)
+            }
+        };
+
         // Emit progress so the UI can update a counter. Per-track events are
         // cheap and let us show "matching 42/100" without re-rendering the
         // whole list.
@@ -1049,8 +1108,11 @@ pub async fn tidal_match_tracks_cmd(
         out.push(m);
         // Rate-limit: ~3.3 tracks/sec. Each track can fire 1–3 Tidal API
         // calls (openapi, v1 search, v1 detail), so actual request rate is
-        // up to ~10/sec peak — well under anything Tidal rate-limits.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // up to ~10/sec peak — well under anything Tidal rate-limits. Cache
+        // hits skip the network, so they skip the pace too.
+        if hit_network {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
     }
     Ok(out)
 }

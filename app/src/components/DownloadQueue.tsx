@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { ChevronDown, ChevronRight, ListMusic } from "lucide-react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { useDownloadStore } from "../stores/downloadStore";
 import { DownloadItem } from "./DownloadItem";
 import type { DownloadItem as DLItem } from "../lib/types";
@@ -10,8 +11,44 @@ interface PlaylistGroup {
   items: DLItem[];
 }
 
+// Groups larger than this start collapsed and render virtualized when opened,
+// so a thousand-track playlist import doesn't mount a thousand animated rows.
+const GROUP_VIRTUALIZE_THRESHOLD = 60;
+
+/** Virtualized item list for large groups: a bounded-height scroll region that
+ *  mounts only the visible rows. Rows self-measure (DownloadItem grows when its
+ *  edit form or metadata picker opens), so heights stay accurate. */
+function VirtualizedItems({ items }: { items: DLItem[] }) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const virtualizer = useVirtualizer({
+    count: items.length,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: () => 92,
+    overscan: 6,
+  });
+  return (
+    <div ref={scrollRef} className="max-h-[60vh] overflow-y-auto pr-1">
+      <div className="relative w-full" style={{ height: virtualizer.getTotalSize() }}>
+        {virtualizer.getVirtualItems().map((vi) => (
+          <div
+            key={items[vi.index].id}
+            data-index={vi.index}
+            ref={virtualizer.measureElement}
+            className="absolute left-0 top-0 w-full pb-2"
+            style={{ transform: `translateY(${vi.start}px)` }}
+          >
+            <DownloadItem item={items[vi.index]} />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function CollapsibleGroup({ group }: { group: PlaylistGroup }) {
-  const [collapsed, setCollapsed] = useState(false);
+  const large = group.items.length > GROUP_VIRTUALIZE_THRESHOLD;
+  // Large groups start collapsed — opening a thousand-row list is opt-in.
+  const [collapsed, setCollapsed] = useState(large);
   const completed = group.items.filter((d) => d.status === "complete").length;
 
   return (
@@ -31,21 +68,24 @@ function CollapsibleGroup({ group }: { group: PlaylistGroup }) {
           {completed}/{group.items.length} complete
         </span>
       </button>
-      {!collapsed && (
-        <AnimatePresence>
-          {group.items.map((item) => (
-            <motion.div
-              key={item.id}
-              initial={{ opacity: 0, y: -10 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, x: -20 }}
-              transition={{ duration: 0.2 }}
-            >
-              <DownloadItem item={item} />
-            </motion.div>
-          ))}
-        </AnimatePresence>
-      )}
+      {!collapsed &&
+        (large ? (
+          <VirtualizedItems items={group.items} />
+        ) : (
+          <AnimatePresence>
+            {group.items.map((item) => (
+              <motion.div
+                key={item.id}
+                initial={{ opacity: 0, y: -10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, x: -20 }}
+                transition={{ duration: 0.2 }}
+              >
+                <DownloadItem item={item} />
+              </motion.div>
+            ))}
+          </AnimatePresence>
+        ))}
     </div>
   );
 }

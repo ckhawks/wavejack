@@ -2117,9 +2117,17 @@ fn tidal_logout(app: tauri::AppHandle) -> Result<(), AppError> {
 #[tauri::command]
 async fn tidal_match_tracks(
     app: tauri::AppHandle,
+    control: tauri::State<'_, tidal::MatchControl>,
     tracks: Vec<tidal::MatchInput>,
 ) -> Result<Vec<tidal::TidalMatch>, AppError> {
-    tidal::tidal_match_tracks_cmd(app, tracks).await
+    tidal::tidal_match_tracks_cmd(app, control.inner(), tracks).await
+}
+
+/// Cancel an in-flight `tidal_match_tracks` run — the frontend calls this when
+/// the Spotify preview modal closes so the sequential loop stops hitting Tidal.
+#[tauri::command]
+fn tidal_cancel_match(control: tauri::State<'_, tidal::MatchControl>) {
+    control.cancel();
 }
 
 /// Fuzzy-match a SoundCloud playlist's entries against Tidal so the user can
@@ -2407,6 +2415,7 @@ pub fn run() {
                 .expect("Failed to initialize download history database");
             app.manage(db);
             app.manage(RateLimiter::new());
+            app.manage(tidal::MatchControl::new());
             app.manage(tags::TagRateLimiter::new());
 
             let audio_player = audio::AudioPlayer::new();
@@ -2517,6 +2526,7 @@ pub fn run() {
             tidal_auth_status,
             tidal_logout,
             tidal_match_tracks,
+            tidal_cancel_match,
             tidal_match_soundcloud,
             tidal_download_matched,
         ])
