@@ -41,6 +41,8 @@ export interface AppSettings {
   libraryColumns: string;
   /** JSON-encoded { field, dir } sort state for the library table. */
   librarySort: string;
+  /** Library layout: "table" | "compact" | "grid". Empty = "table". */
+  libraryViewMode: string;
   /** Last active tab so we can restore on relaunch. */
   lastTab: string;
   /** Spotify Web API client credentials (user-provided via Spotify Dev Dashboard). */

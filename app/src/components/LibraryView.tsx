@@ -4,17 +4,12 @@ import {
   RefreshCw,
   Search,
   Music,
-  Play,
   X,
-  Save,
   Image as ImageIcon,
   Loader,
   Check,
   AlertTriangle,
-  ArrowUp,
-  ArrowDown,
   SplitSquareHorizontal,
-  Dices,
   ListMusic,
   Wrench,
   PanelLeftOpen,
@@ -32,13 +27,28 @@ import { useDiscoverStore } from "../stores/discoverStore";
 import { usePlaylistStore } from "../stores/playlistStore";
 import { useNavStore } from "../stores/navStore";
 import { MetadataPicker } from "./MetadataPicker";
+import { ManualEditModal } from "./ManualEditModal";
+import { parseArtistTitle, stripYoutubeId, YT_ID_SUFFIX } from "../lib/metadataParse";
 import { PlaylistSidebar } from "./library/PlaylistSidebar";
 import { TagFilterBar } from "./library/TagFilterBar";
-import { AddToPlaylistMenu } from "./library/AddToPlaylistMenu";
-import { TrackActionsMenu } from "./library/TrackActionsMenu";
+import { SortControl } from "./library/SortControl";
+import { ViewModeToggle } from "./library/ViewModeToggle";
+import { LibraryTableView } from "./library/LibraryTableView";
+import { LibraryCompactView } from "./library/LibraryCompactView";
+import { LibraryGridView } from "./library/LibraryGridView";
+import {
+  DEFAULT_COLUMNS,
+  DEFAULT_SORT,
+  COLUMN_LABELS,
+  type ColumnKey,
+  type SortField,
+  type SortDir,
+  type SortState,
+  type ViewMode,
+  type LibraryListProps,
+} from "./library/libraryShared";
 import {
   applyLibraryMetadata,
-  updateLibraryTrack,
   bulkParseLibraryTracks,
   fixLibraryExtensions,
   findCoverCandidate,
@@ -48,67 +58,8 @@ import {
   type BulkParseEdit,
 } from "../lib/commands";
 
-type SortField = "title" | "artist" | "album" | "duration" | "bitrate" | "fileType" | "added" | "plays" | "lastPlayed" | "random";
-type SortDir = "asc" | "desc";
-type ColumnKey = "artist" | "album" | "duration" | "bitrate" | "fileType" | "added" | "plays" | "lastPlayed" | "tags";
-
-const DEFAULT_COLUMNS: Record<ColumnKey, boolean> = {
-  artist: false,
-  album: true,
-  duration: true,
-  bitrate: false,
-  fileType: true,
-  added: true,
-  plays: false,
-  lastPlayed: false,
-  tags: true,
-};
-const DEFAULT_SORT: { field: SortField; dir: SortDir } = { field: "artist", dir: "asc" };
-
-const COLUMN_LABELS: Record<ColumnKey, string> = {
-  artist: "Artist (separate column)",
-  album: "Album",
-  duration: "Length",
-  bitrate: "Bitrate",
-  fileType: "Type",
-  added: "Added",
-  plays: "Play count",
-  lastPlayed: "Last played",
-  tags: "Tags",
-};
-
-function relativeTime(unixSecs: number): string {
-  if (!unixSecs) return "—";
-  const diff = Math.floor(Date.now() / 1000) - unixSecs;
-  if (diff < 60) return "just now";
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-  if (diff < 86400 * 30) return `${Math.floor(diff / 86400)}d ago`;
-  if (diff < 86400 * 365) return `${Math.floor(diff / (86400 * 30))}mo ago`;
-  return `${Math.floor(diff / (86400 * 365))}y ago`;
-}
-
-function absoluteDate(unixSecs: number): string {
-  if (!unixSecs) return "";
-  return new Date(unixSecs * 1000).toLocaleString();
-}
-
-function formatDuration(secs: number): string {
-  if (!secs) return "—";
-  const m = Math.floor(secs / 60);
-  const s = Math.floor(secs % 60);
-  return `${m}:${s.toString().padStart(2, "0")}`;
-}
-
 /** Heuristic for "metadata needs fixing": empty artist OR title contains " - "
  * (almost always an unparsed "Artist - Title" filename). */
-/** Strip a yt-dlp-style YouTube ID suffix (" [11 chars]"), optionally followed
- * by a file extension. YT IDs are exactly 11 chars from [A-Za-z0-9_-]. */
-const YT_ID_SUFFIX = /\s*\[[A-Za-z0-9_-]{11}\](?=\.[^.]+$|$)/;
-function stripYoutubeId(s: string): string {
-  return s.replace(YT_ID_SUFFIX, "");
-}
-
 function needsMetadataFix(t: LibraryTrack): boolean {
   if (!t.artist?.trim()) return true;
   if (t.title && t.title.includes(" - ")) return true;
@@ -116,50 +67,11 @@ function needsMetadataFix(t: LibraryTrack): boolean {
   return false;
 }
 
-/** Split "Artist - Title" into parts. Returns null if no clean " - " split exists. */
-function parseArtistTitle(source: string): { artist: string; title: string } | null {
-  // Strip extension and any trailing YT ID before splitting.
-  const noExt = source.replace(/\.[^./\\]+$/, "");
-  const stem = stripYoutubeId(noExt).trim();
-  const idx = stem.indexOf(" - ");
-  if (idx <= 0 || idx >= stem.length - 3) return null;
-  const artist = stem.slice(0, idx).trim();
-  const title = stem.slice(idx + 3).trim();
-  if (!artist || !title) return null;
-  return { artist, title };
-}
-
 /** Pick the best source string to parse for a track — prefer a title that
  * already contains " - " (that's what's wrong), else fall back to the filename. */
 function pickParseSource(t: LibraryTrack): string {
   if (t.title && t.title.includes(" - ")) return t.title;
   return t.filename || "";
-}
-
-/** Extensions each content type may legitimately carry (mirrors the backend's
- * type_info map). Used to flag files whose extension lies about their content. */
-const TYPE_EXTENSIONS: Record<string, string[]> = {
-  MP3: ["mp3"],
-  FLAC: ["flac"],
-  M4A: ["m4a", "mp4", "m4b", "m4p"],
-  Opus: ["opus", "ogg"],
-  OGG: ["ogg", "oga"],
-  WAV: ["wav", "wave"],
-  AIFF: ["aiff", "aif", "aifc"],
-  AAC: ["aac"],
-  WavPack: ["wv"],
-  APE: ["ape"],
-  Speex: ["spx", "ogg"],
-};
-
-/** True when the track's real (content-detected) type doesn't match its
- * filename extension — i.e. a mislabeled file the fix tool would rename. */
-function typeMismatch(t: LibraryTrack): boolean {
-  if (!t.file_type) return false;
-  const ext = t.filename.split(".").pop()?.toLowerCase();
-  const accepted = TYPE_EXTENSIONS[t.file_type];
-  if (!ext || !accepted) return false;
-  return !accepted.includes(ext);
 }
 
 export function LibraryView() {
@@ -264,12 +176,6 @@ export function LibraryView() {
   const [needsFixOnly, setNeedsFixOnly] = useState(false);
   const [editing, setEditing] = useState<LibraryTrack | null>(null);
   const [manualEdit, setManualEdit] = useState<LibraryTrack | null>(null);
-  const [editTitle, setEditTitle] = useState("");
-  const [editArtist, setEditArtist] = useState("");
-  const [editAlbum, setEditAlbum] = useState("");
-  const [editFilename, setEditFilename] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [saveError, setSaveError] = useState<string>("");
   const [findingArtFor, setFindingArtFor] = useState<string | null>(null);
   const [bulkArt, setBulkArt] = useState<{ done: number; total: number } | null>(null);
   const [bulkParse, setBulkParse] = useState<{ done: number; total: number; current: string } | null>(null);
@@ -286,13 +192,22 @@ export function LibraryView() {
     }
   }, [settings.libraryColumns]);
 
-  const sort = useMemo<{ field: SortField; dir: SortDir; seed?: number }>(() => {
+  const sort = useMemo<SortState>(() => {
     try {
       return { ...DEFAULT_SORT, ...JSON.parse(settings.librarySort || "{}") };
     } catch {
       return DEFAULT_SORT;
     }
   }, [settings.librarySort]);
+
+  const viewMode = useMemo<ViewMode>(() => {
+    const v = settings.libraryViewMode;
+    return v === "compact" || v === "grid" ? v : "table";
+  }, [settings.libraryViewMode]);
+
+  const setViewMode = (mode: ViewMode) => {
+    void updateSetting("libraryViewMode", mode);
+  };
 
   /** Cheap deterministic 32-bit hash so a (path, seed) pair maps to a stable
    * pseudo-random number. Used to keep the random-sort order stable across
@@ -487,6 +402,7 @@ export function LibraryView() {
         artist: t.artist,
         filePath: t.path,
         coverArtBase64: t.cover_art_base64 || undefined,
+        durationSecs: t.duration_secs || undefined,
       }))
     );
     playTrack({
@@ -495,6 +411,7 @@ export function LibraryView() {
       artist: track.artist,
       filePath: track.path,
       coverArtBase64: track.cover_art_base64 || undefined,
+      durationSecs: track.duration_secs || undefined,
     });
   };
 
@@ -508,32 +425,6 @@ export function LibraryView() {
 
   const startManualEdit = (track: LibraryTrack) => {
     setManualEdit(track);
-    setEditTitle(track.title || "");
-    setEditArtist(track.artist || "");
-    setEditAlbum(track.album || "");
-    setEditFilename(track.filename || "");
-  };
-
-  // Derived, read-only filename preview in the modal.
-  const sanitizeForFilename = (s: string) =>
-    s.replace(/[<>:"/\\|?*]/g, "_");
-  const previewFilename = (() => {
-    if (!manualEdit) return "";
-    const ext = (manualEdit.filename.match(/\.[^./\\]+$/) || [""])[0];
-    if (!editArtist.trim() || !editTitle.trim()) return manualEdit.filename;
-    return `${sanitizeForFilename(editArtist.trim())} - ${sanitizeForFilename(editTitle.trim())}${ext}`;
-  })();
-
-  const handleParseInModal = () => {
-    const candidates = [editFilename, manualEdit?.title || "", manualEdit?.filename || ""];
-    for (const c of candidates) {
-      const parsed = parseArtistTitle(c);
-      if (parsed) {
-        setEditArtist(parsed.artist);
-        setEditTitle(parsed.title);
-        return;
-      }
-    }
   };
 
   const handleBulkParse = async () => {
@@ -590,51 +481,20 @@ export function LibraryView() {
     setFixExt(null);
   };
 
-  const handleSaveManual = async () => {
-    if (!manualEdit) return;
-    setSaving(true);
-    setSaveError("");
-    try {
-      const newPath = await updateLibraryTrack(manualEdit.path, editTitle, editArtist, editAlbum, editFilename);
-      // Patch just this row instead of reloading the whole library (600+ rows of
-      // base64 cover art). The backend renames to "{artist} - {title}.{ext}".
-      const filename = newPath.split(/[/\\]/).pop() || manualEdit.filename;
-      useLibraryStore.getState().patchTrack(manualEdit.path, {
-        path: newPath,
-        filename,
-        title: editTitle,
-        artist: editArtist,
-        album: editAlbum,
-      });
-      setManualEdit(null);
-    } catch (e: unknown) {
-      const raw = e as { message?: string } | string | undefined;
-      const msg = typeof raw === "string" ? raw : raw?.message ?? JSON.stringify(e);
-      console.error("Failed to save metadata:", e);
-      const hint = msg.toLowerCase().includes("file not found")
-        ? " — the cached row is stale. Click Rescan to clean it up."
-        : "";
-      setSaveError(msg + hint);
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const SortHeader = ({ field, label, className = "" }: { field: SortField; label: string; className?: string }) => {
-    const active = sort.field === field;
-    return (
-      <th className={`py-2 ${className}`}>
-        <button
-          onClick={() => handleSortClick(field)}
-          className={`flex items-center gap-1 text-[10px] uppercase tracking-wider transition-colors ${
-            active ? "text-neutral-300" : "text-neutral-600 hover:text-neutral-400"
-          }`}
-        >
-          {label}
-          {active && (sort.dir === "asc" ? <ArrowUp size={10} /> : <ArrowDown size={10} />)}
-        </button>
-      </th>
-    );
+  // Shared props every layout needs to render rows and wire up interactions.
+  const listProps: LibraryListProps = {
+    tracks: displayed,
+    currentTrackId,
+    selectedPaths,
+    onRowClick: handleRowClick,
+    onPlay: handlePlay,
+    tagFilter,
+    onTagClick: setTagFilter,
+    findingArtFor,
+    onFindArt: handleFindArt,
+    onAutoTag: (t) => setEditing(t),
+    onEdit: startManualEdit,
+    onDiscoverSimilar: handleDiscoverSimilar,
   };
 
   return (
@@ -663,7 +523,18 @@ export function LibraryView() {
             placeholder="Search library..."
             className="flex-1 bg-transparent text-xs text-white outline-none"
           />
+          {searchQuery && (
+            <button
+              onClick={() => setSearchQuery("")}
+              className="text-neutral-500 hover:text-white"
+              title="Clear search"
+            >
+              <X size={14} />
+            </button>
+          )}
         </div>
+        <ViewModeToggle mode={viewMode} onChange={setViewMode} />
+        <SortControl sort={sort} onSortClick={handleSortClick} onReshuffle={reshuffle} />
         <button
           onClick={handleAddFolder}
           className="flex items-center gap-1.5 rounded bg-violet-600 px-3 py-2 text-xs font-medium text-white hover:bg-violet-500"
@@ -786,23 +657,27 @@ export function LibraryView() {
                 {needsFixOnly && <Check size={12} className="text-yellow-400" />}
               </button>
 
-              <div className="mx-2 my-1 border-t border-[#222]" />
-              <div className="px-3 pb-1 pt-1 text-[10px] font-medium uppercase tracking-wider text-neutral-600">
-                Columns
-              </div>
-              {(Object.keys(COLUMN_LABELS) as ColumnKey[]).map((key) => (
-                <label
-                  key={key}
-                  className="flex cursor-pointer items-center gap-2 px-3 py-1 text-xs text-neutral-300 hover:bg-[#1a1a1a]"
-                >
-                  <input
-                    type="checkbox"
-                    checked={columns[key]}
-                    onChange={(e) => setColumn(key, e.target.checked)}
-                  />
-                  {COLUMN_LABELS[key]}
-                </label>
-              ))}
+              {viewMode === "table" && (
+                <>
+                  <div className="mx-2 my-1 border-t border-[#222]" />
+                  <div className="px-3 pb-1 pt-1 text-[10px] font-medium uppercase tracking-wider text-neutral-600">
+                    Columns
+                  </div>
+                  {(Object.keys(COLUMN_LABELS) as ColumnKey[]).map((key) => (
+                    <label
+                      key={key}
+                      className="flex cursor-pointer items-center gap-2 px-3 py-1 text-xs text-neutral-300 hover:bg-[#1a1a1a]"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={columns[key]}
+                        onChange={(e) => setColumn(key, e.target.checked)}
+                      />
+                      {COLUMN_LABELS[key]}
+                    </label>
+                  ))}
+                </>
+              )}
 
               <div className="mx-2 my-1 border-t border-[#222]" />
               <button
@@ -958,79 +833,10 @@ export function LibraryView() {
         </div>
       )}
 
-      {/* Manual metadata edit modal */}
+      {/* Manual metadata edit modal — its own component so keystrokes don't
+          re-render the whole track table. */}
       {manualEdit && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6">
-          <div className="w-full max-w-lg space-y-3 rounded-lg border border-[#333] bg-[#0a0a0a] p-4">
-            <div className="flex items-center justify-between">
-              <p className="text-sm font-medium text-white">Edit metadata</p>
-              <button onClick={() => { setManualEdit(null); setSaveError(""); }} className="text-neutral-500 hover:text-white">
-                <X size={14} />
-              </button>
-            </div>
-            <p className="truncate text-xs text-neutral-500" title={manualEdit.path}>
-              {manualEdit.path}
-            </p>
-            <input
-              type="text"
-              value={editTitle}
-              onChange={(e) => setEditTitle(e.target.value)}
-              placeholder="Title"
-              className="w-full rounded border border-[#333] bg-[#111] px-2 py-1.5 text-sm text-white placeholder-neutral-600 outline-none focus:border-neutral-500"
-            />
-            <input
-              type="text"
-              value={editArtist}
-              onChange={(e) => setEditArtist(e.target.value)}
-              placeholder="Artist"
-              className="w-full rounded border border-[#333] bg-[#111] px-2 py-1.5 text-sm text-white placeholder-neutral-600 outline-none focus:border-neutral-500"
-            />
-            <input
-              type="text"
-              value={editAlbum}
-              onChange={(e) => setEditAlbum(e.target.value)}
-              placeholder="Album"
-              className="w-full rounded border border-[#333] bg-[#111] px-2 py-1.5 text-sm text-white placeholder-neutral-600 outline-none focus:border-neutral-500"
-            />
-            <div>
-              <p className="mb-1 text-[10px] uppercase tracking-wider text-neutral-600">Filename (auto)</p>
-              <div className="w-full truncate rounded border border-[#222] bg-[#0a0a0a] px-2 py-1.5 text-sm text-neutral-500" title={previewFilename}>
-                {previewFilename || "—"}
-              </div>
-            </div>
-            {saveError && (
-              <p className="rounded border border-red-500/40 bg-red-500/10 px-2 py-1.5 text-xs text-red-400">
-                {saveError}
-              </p>
-            )}
-            <div className="flex justify-end gap-2 pt-1">
-              <button
-                onClick={handleParseInModal}
-                disabled={saving}
-                className="flex items-center gap-1 rounded-md border border-[#333] px-3 py-1.5 text-xs font-medium text-neutral-400 transition-colors hover:border-[#555] hover:text-white disabled:opacity-50"
-                title="Split 'Artist - Title' from the filename"
-              >
-                <SplitSquareHorizontal size={12} />
-                Parse
-              </button>
-              <button
-                onClick={() => setManualEdit(null)}
-                disabled={saving}
-                className="rounded-md px-3 py-1.5 text-xs font-medium text-neutral-400 transition-colors hover:bg-[#222] hover:text-white disabled:opacity-50"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleSaveManual}
-                disabled={saving}
-                className="flex items-center gap-1 rounded-md bg-white px-3 py-1.5 text-xs font-medium text-black transition-colors hover:bg-neutral-200 disabled:opacity-50"
-              >
-                <Save size={12} />
-                {saving ? "Saving..." : "Save"}
-              </button>
-            </div>
-          </div>
-        </div>
+        <ManualEditModal track={manualEdit} onClose={() => setManualEdit(null)} />
       )}
 
       {/* Metadata editor modal */}
@@ -1062,209 +868,12 @@ export function LibraryView() {
             <Music size={32} />
             <p className="text-sm">{tracks.length === 0 ? "Add a folder to get started" : "No matches"}</p>
           </div>
+        ) : viewMode === "grid" ? (
+          <LibraryGridView {...listProps} />
+        ) : viewMode === "compact" ? (
+          <LibraryCompactView {...listProps} />
         ) : (
-          <table className="w-full table-fixed border-separate border-spacing-0">
-            <thead className="[&_th]:sticky [&_th]:top-0 [&_th]:z-10 [&_th]:bg-black [&_th]:shadow-[inset_0_-1px_0_#222]">
-              <tr className="text-left text-[10px] uppercase tracking-wider text-neutral-600">
-                <th className="w-16 py-2" />
-                <th className="py-2 pl-4 pr-3">
-                  <div className="flex items-center gap-3">
-                    <button
-                      onClick={() => handleSortClick("title")}
-                      className={`flex items-center gap-1 text-[10px] uppercase tracking-wider transition-colors ${
-                        sort.field === "title" ? "text-neutral-300" : "text-neutral-600 hover:text-neutral-400"
-                      }`}
-                    >
-                      Track
-                      {sort.field === "title" && (sort.dir === "asc" ? <ArrowUp size={10} /> : <ArrowDown size={10} />)}
-                    </button>
-                    <button
-                      onClick={() => handleSortClick("artist")}
-                      className={`flex items-center gap-1 text-[10px] uppercase tracking-wider transition-colors ${
-                        sort.field === "artist" ? "text-neutral-300" : "text-neutral-600 hover:text-neutral-400"
-                      }`}
-                    >
-                      Artist
-                      {sort.field === "artist" && (sort.dir === "asc" ? <ArrowUp size={10} /> : <ArrowDown size={10} />)}
-                    </button>
-                    <button
-                      onClick={reshuffle}
-                      className={`flex items-center gap-1 text-[10px] uppercase tracking-wider transition-colors ${
-                        sort.field === "random" ? "text-violet-300" : "text-neutral-600 hover:text-neutral-400"
-                      }`}
-                      title={sort.field === "random" ? "Reshuffle" : "Random sort"}
-                    >
-                      <Dices size={11} />
-                      {sort.field === "random" ? "Reshuffle" : "Random"}
-                    </button>
-                  </div>
-                </th>
-                {columns.artist && <SortHeader field="artist" label="Artist" className="pr-3" />}
-                {columns.album && <SortHeader field="album" label="Album" className="pr-3" />}
-                {columns.duration && <SortHeader field="duration" label="Length" className="w-16 pr-3" />}
-                {columns.bitrate && <SortHeader field="bitrate" label="Bitrate" className="w-20 pr-3" />}
-                {columns.fileType && <SortHeader field="fileType" label="Type" className="w-16 pr-3" />}
-                {columns.added && <SortHeader field="added" label="Added" className="w-24 pr-3" />}
-                {columns.plays && <SortHeader field="plays" label="Plays" className="w-16 pr-3" />}
-                {columns.lastPlayed && <SortHeader field="lastPlayed" label="Last Played" className="w-24 pr-3" />}
-                {columns.tags && (
-                  <th className="py-2 pr-3">
-                    <span className="text-[10px] uppercase tracking-wider text-neutral-600">Tags</span>
-                  </th>
-                )}
-                <th className="w-28 py-2" />
-              </tr>
-            </thead>
-            <tbody className="[&_td]:border-b [&_td]:border-[#111]">
-              {displayed.map((track) => {
-                const isActive = currentTrackId === track.path;
-                const isSelected = selectedPaths.has(track.path);
-                return (
-                  <tr
-                    key={track.path}
-                    onClick={(e) => handleRowClick(track.path, e)}
-                    onMouseDown={(e) => { if (e.shiftKey) e.preventDefault(); }}
-                    onDragStart={(e) => e.preventDefault()}
-                    className={`group cursor-default select-none text-xs hover:bg-[#111] ${
-                      isSelected
-                        ? "bg-violet-600/10 ring-1 ring-inset ring-violet-500/20"
-                        : isActive ? "bg-[#111]" : ""
-                    }`}
-                  >
-                    <td className="py-2 pl-6 pr-2">
-                      <div className="relative h-10 w-10">
-                        {track.cover_art_base64 ? (
-                          <img
-                            src={`data:image/jpeg;base64,${track.cover_art_base64}`}
-                            alt=""
-                            className="h-10 w-10 rounded object-cover transition-opacity group-hover:opacity-50"
-                          />
-                        ) : (
-                          <div className="flex h-10 w-10 items-center justify-center rounded bg-[#1a1a1a] transition-opacity group-hover:opacity-50">
-                            <Music size={14} className="text-neutral-700" />
-                          </div>
-                        )}
-                        <button
-                          onClick={() => handlePlay(track)}
-                          className="absolute inset-0 flex items-center justify-center rounded text-white opacity-0 transition-opacity hover:bg-black/30 group-hover:opacity-100"
-                          title="Play"
-                        >
-                          <Play size={16} fill="currentColor" />
-                        </button>
-                      </div>
-                    </td>
-                    <td className="py-2 pl-4 pr-3">
-                      <div className="min-w-0 tracking-wide">
-                        <div className={`truncate ${isActive ? "text-violet-400" : "text-white"}`}>
-                          {track.title}
-                        </div>
-                        <div className="truncate text-[11px] text-neutral-500">
-                          {track.artist || "—"}
-                        </div>
-                      </div>
-                    </td>
-                    {columns.artist && (
-                      <td className="truncate py-2 pr-3 text-neutral-400">{track.artist || "—"}</td>
-                    )}
-                    {columns.album && (
-                      <td className="truncate py-2 pr-3 text-neutral-500">{track.album || "—"}</td>
-                    )}
-                    {columns.duration && (
-                      <td className="whitespace-nowrap py-2 pr-3 text-neutral-500">
-                        {formatDuration(track.duration_secs)}
-                      </td>
-                    )}
-                    {columns.bitrate && (
-                      <td
-                        className="whitespace-nowrap py-2 pr-3 text-neutral-500"
-                        title={
-                          track.bitrate_kbps > 0 && track.bitrate_estimated
-                            ? "Estimated from file size and duration; not read from audio headers"
-                            : undefined
-                        }
-                      >
-                        {track.bitrate_kbps > 0
-                          ? `${track.bitrate_kbps} kbps${track.bitrate_estimated ? " ?" : ""}`
-                          : "—"}
-                      </td>
-                    )}
-                    {columns.fileType && (
-                      <td className="whitespace-nowrap py-2 pr-3">
-                        {track.file_type ? (
-                          <span
-                            className={typeMismatch(track) ? "text-amber-400" : "text-neutral-500"}
-                            title={
-                              typeMismatch(track)
-                                ? `Actually ${track.file_type} but named .${track.filename.split(".").pop()} — "Fix mislabeled extensions" will rename it`
-                                : undefined
-                            }
-                          >
-                            {track.file_type}
-                            {typeMismatch(track) ? " ⚠" : ""}
-                          </span>
-                        ) : (
-                          <span className="text-neutral-600">—</span>
-                        )}
-                      </td>
-                    )}
-                    {columns.added && (
-                      <td
-                        className="whitespace-nowrap py-2 pr-3 text-neutral-500"
-                        title={absoluteDate(track.first_scanned_at)}
-                      >
-                        {relativeTime(track.first_scanned_at)}
-                      </td>
-                    )}
-                    {columns.plays && (
-                      <td className="whitespace-nowrap py-2 pr-3 text-neutral-500">
-                        {track.play_count > 0 ? track.play_count : "—"}
-                      </td>
-                    )}
-                    {columns.lastPlayed && (
-                      <td
-                        className="whitespace-nowrap py-2 pr-3 text-neutral-500"
-                        title={absoluteDate(track.last_played_at)}
-                      >
-                        {track.last_played_at > 0 ? relativeTime(track.last_played_at) : "—"}
-                      </td>
-                    )}
-                    {columns.tags && (
-                      <td className="py-2 pr-3">
-                        <div className="flex flex-wrap gap-1">
-                          {track.tags.slice(0, 3).map((tag) => (
-                            <button
-                              key={tag}
-                              onClick={() => setTagFilter(tag)}
-                              className={`rounded-full px-2 py-0.5 text-[10px] transition-colors ${
-                                tagFilter === tag
-                                  ? "bg-violet-600/20 text-violet-300 ring-1 ring-violet-500/40"
-                                  : "bg-[#1a1a1a] text-neutral-500 hover:bg-violet-600/10 hover:text-violet-300"
-                              }`}
-                            >
-                              {tag}
-                            </button>
-                          ))}
-                        </div>
-                      </td>
-                    )}
-                    <td className="py-2 pr-3">
-                      <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100">
-                        <AddToPlaylistMenu trackPath={track.path} />
-                        <TrackActionsMenu
-                          track={track}
-                          isFindingArt={findingArtFor === track.path}
-                          onFindArt={() => handleFindArt(track)}
-                          onAutoTag={() => setEditing(track)}
-                          onEdit={() => startManualEdit(track)}
-                          onDiscoverSimilar={() => handleDiscoverSimilar(track)}
-                        />
-                      </div>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+          <LibraryTableView {...listProps} columns={columns} sort={sort} />
         )}
       </div>
       </div>
