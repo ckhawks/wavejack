@@ -260,8 +260,14 @@ export function AudioPlayer() {
   }, [togglePlayPause, playPrev, playNext, setCurrentTime, stop]);
 
   // Keep OS media session position state in sync for seek bar overlays.
+  // Throttled to ~4Hz: the OS overlay only needs a coarse position, and
+  // calling into the media transport on every progress tick is pure overhead.
+  const lastPositionSyncRef = useRef(0);
   useEffect(() => {
     if (!("mediaSession" in navigator) || !duration) return;
+    const now = performance.now();
+    if (now - lastPositionSyncRef.current < 250) return;
+    lastPositionSyncRef.current = now;
     navigator.mediaSession.setPositionState({
       duration,
       playbackRate: 1,
@@ -304,7 +310,7 @@ export function AudioPlayer() {
 
   const handleSeek = (val: number) => {
     setCurrentTime(val);
-    void audioSeek(val);
+    audioSeek(val).catch((e) => console.error("audio_seek failed:", e));
   };
 
   // When the user explicitly stops, also tear down the native player so the

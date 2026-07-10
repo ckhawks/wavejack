@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { usePlayerStore } from "../stores/playerStore";
 import { getOrComputeWaveform, audioSeek } from "../lib/commands";
 
@@ -113,43 +113,19 @@ export function WaveformBar({
     return () => obs.disconnect();
   }, []);
 
-  // Draw
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas || width === 0) return;
-
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = Math.floor(width * dpr);
-    canvas.height = Math.floor(HEIGHT * dpr);
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.scale(dpr, dpr);
-    ctx.clearRect(0, 0, width, HEIGHT);
-
-    // Loading state — flat dim line so the bar doesn't feel broken.
-    if (!profile) {
-      ctx.fillStyle = "#222";
-      ctx.fillRect(0, HEIGHT / 2 - 1, width, 2);
-      return;
-    }
-
+  // Bar geometry as a single Path2D. Depends only on the profile, width, and
+  // the cascade-in progress — NOT the playhead — so once the 600ms cascade
+  // settles (appearProgress === 1) this memo is stable and the per-frame redraw
+  // below is just a clear + gradient fill, not 500 rect() calls every frame.
+  const barPath = useMemo(() => {
+    if (!profile || width === 0) return null;
     const buckets = profile.length;
-    const totalBarPx = width;
-    const barWidth = Math.max(1, (totalBarPx - (buckets - 1) * BAR_GAP) / buckets);
-    // Prefer the rAF-driven smooth time; fall back to the store value
-    // (e.g. just after a seek before the next frame).
-    const t = smoothTime || currentTime;
-    const playedRatio = duration > 0 ? Math.min(1, t / duration) : 0;
-
+    const barWidth = Math.max(1, (width - (buckets - 1) * BAR_GAP) / buckets);
     // Cascade-in: each bar grows from a flat line to its full amplitude as
     // a wave sweeps left-to-right. CASCADE_SPAN controls how many bars are
     // mid-animation at any instant (lower = sharper, higher = softer).
     const CASCADE_SPAN = 0.25;
     const easeOut = (t: number) => 1 - Math.pow(1 - t, 3);
-
-    // Build one path with all bars, then fill once with a horizontal gradient
-    // so the played/unplayed edge can fall mid-bar instead of snapping to bar
-    // boundaries.
     const path = new Path2D();
     for (let i = 0; i < buckets; i++) {
       const x = i * (barWidth + BAR_GAP);
@@ -162,7 +138,43 @@ export function WaveformBar({
       const y = (HEIGHT - h) / 2;
       path.rect(x, y, barWidth, h);
     }
+    return path;
+  }, [profile, width, appearProgress, HEIGHT]);
 
+  // Size the backing store only when the dimensions change. Setting canvas.width
+  // resets the context transform, so re-apply the DPR scale here — doing this in
+  // the per-frame draw would needlessly clear and rescale 60x/sec.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || width === 0) return;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.floor(width * dpr);
+    canvas.height = Math.floor(HEIGHT * dpr);
+    const ctx = canvas.getContext("2d");
+    if (ctx) ctx.scale(dpr, dpr);
+  }, [width, HEIGHT]);
+
+  // Per-frame redraw: clear, then fill the precomputed path with a horizontal
+  // gradient whose seam sits at the playhead. Driven by smoothTime (rAF), so it
+  // only re-runs while the playhead actually moves — never off currentTime.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || width === 0) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.clearRect(0, 0, width, HEIGHT);
+
+    // Loading state — flat dim line so the bar doesn't feel broken.
+    if (!barPath) {
+      ctx.fillStyle = "#222";
+      ctx.fillRect(0, HEIGHT / 2 - 1, width, 2);
+      return;
+    }
+
+    // Prefer the rAF-driven smooth time; fall back to the store value
+    // (e.g. just after a seek before the next frame).
+    const t = smoothTime || currentTime;
+    const playedRatio = duration > 0 ? Math.min(1, t / duration) : 0;
     const gradient = ctx.createLinearGradient(0, 0, width, 0);
     const seamPx = 2;
     const seamRatio = width > 0 ? seamPx / width : 0;
@@ -173,8 +185,10 @@ export function WaveformBar({
     gradient.addColorStop(right, unplayedColor);
     gradient.addColorStop(1, unplayedColor);
     ctx.fillStyle = gradient;
-    ctx.fill(path);
-  }, [profile, width, currentTime, smoothTime, duration, appearProgress, playedColor, unplayedColor]);
+    ctx.fill(barPath);
+    // currentTime is read only as a pre-first-frame fallback; the rAF smoothTime
+    // is the real driver, so it is intentionally omitted from the deps.
+  }, [barPath, width, smoothTime, duration, playedColor, unplayedColor, HEIGHT]);
 
   const onClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (!canvasRef.current || duration <= 0) return;
@@ -182,7 +196,7 @@ export function WaveformBar({
     const ratio = (e.clientX - rect.left) / rect.width;
     const t = Math.max(0, Math.min(duration, ratio * duration));
     setCurrentTime(t);
-    void audioSeek(t);
+    audioSeek(t).catch((e) => console.error("audio_seek failed:", e));
   };
 
   if (!currentTrack) return null;
