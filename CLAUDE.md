@@ -7,6 +7,7 @@ Desktop media app: (1) download/organize music+video via yt-dlp/Cobalt, (2) plug
 - `app/` — Tauri v2 (Rust + React/TS), `cd app && pnpm tauri dev`
 - `api/` — Room server (TS + WebSockets), `cd api && pnpm dev`
 - pnpm workspaces; packages stay independent; duplicate shared types until a shared pkg is justified
+- **One lockfile, at the repo root.** Install from root with `pnpm --filter @wavejack/app add -D <pkg>` — never `cd app && pnpm add` (a stray nested `app/pnpm-lock.yaml` makes pnpm resolve a conflicting dep tree and breaks the dev server). If an install desyncs `node_modules`, `pnpm install` at root reconciles it; clear `app/node_modules/.vite` and restart the dev server.
 
 ## TypeScript
 
@@ -45,5 +46,8 @@ Desktop media app: (1) download/organize music+video via yt-dlp/Cobalt, (2) plug
 
 ## Testing
 
-- Rust: `#[cfg(test)]` + `tests/`; TS: Vitest + Playwright
+- Rust: `#[cfg(test)]` + `tests/` — run `cargo test` in `app/src-tauri`
+- TS: Vitest — `pnpm test` in `app/` and `api/` (`test:watch` for watch mode). Playwright not set up yet
+- Frontend store tests run in a node env (`app/vitest.config.ts`, no React/Tailwind plugins); mock the Tauri IPC boundary (`../lib/commands`) and cross-store deps at the module level so importing a store never hits `invoke`
+- Prefer pure, exported helpers as test seams (e.g. `resolveAdjacent`, `non_clobbering_path`, `normalize_tag`)
 - Test behavior not implementation; mock external services only
