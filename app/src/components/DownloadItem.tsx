@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, memo } from "react";
 import {
   X,
   CheckCircle,
@@ -55,7 +55,7 @@ function getFilename(filePath: string): string {
   return parts[parts.length - 1] || filePath;
 }
 
-export function DownloadItem({ item }: Props) {
+function DownloadItemImpl({ item }: Props) {
   const removeDownload = useDownloadStore((s) => s.removeDownload);
   const updateDownload = useDownloadStore((s) => s.updateDownload);
   const playTrack = usePlayerStore((s) => s.playTrack);
@@ -294,7 +294,7 @@ export function DownloadItem({ item }: Props) {
       {(item.status === "downloading" || item.status === "converting") && (
         <div className="mt-3 h-1 overflow-hidden rounded-full bg-[#222]">
           <div
-            className="h-full rounded-full bg-white transition-all duration-300"
+            className="h-full rounded-full bg-white transition-[width] duration-300"
             style={{ width: `${Math.min(item.progress, 100)}%` }}
           />
         </div>
@@ -382,3 +382,8 @@ export function DownloadItem({ item }: Props) {
     </div>
   );
 }
+
+/** Memoized: `updateDownload` preserves the object identity of items it doesn't
+ * touch, so a high-frequency progress tick on one download re-renders only that
+ * row — not the entire list through framer-motion. */
+export const DownloadItem = memo(DownloadItemImpl);
