@@ -217,6 +217,25 @@ export async function recordTrackPlay(path: string): Promise<void> {
   return invoke("record_track_play", { path });
 }
 
+/** Log that a library track started playing (skips included), for the Recent view. */
+export async function recordPlayStart(path: string): Promise<void> {
+  return invoke("record_play_start", { path });
+}
+
+/** A single playback-start event joined to its library track. */
+export interface PlayHistoryEntry {
+  /** play_history row id — a stable, unique key (a track can repeat in the list). */
+  id: number;
+  /** Unix seconds when playback started. */
+  played_at: number;
+  track: LibraryTrack;
+}
+
+/** Most recent plays, newest first, repeats included. */
+export async function getRecentlyPlayed(limit?: number): Promise<PlayHistoryEntry[]> {
+  return invoke("get_recently_played", { limit });
+}
+
 export interface LibraryScanResult {
   added: number;
   updated: number;

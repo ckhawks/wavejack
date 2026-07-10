@@ -8,6 +8,9 @@ export interface PlayerTrack {
   artist?: string;
   filePath: string;
   coverArtBase64?: string;
+  /** Scanned track length in seconds, when known. Used as the authoritative
+   *  seek-bar end-time since the playback engine can't always determine it. */
+  durationSecs?: number;
 }
 
 interface PlayerStore {
@@ -62,8 +65,9 @@ function trackFromDownloadId(id: string): PlayerTrack | null {
 }
 
 /** Resolve the next/previous track relative to `current`. `direction` = +1
- *  for forward, -1 for back. Returns null if there's nowhere to go. */
-function resolveAdjacent(
+ *  for forward, -1 for back. Returns null if there's nowhere to go.
+ *  Exported for unit tests; not part of the store's public surface. */
+export function resolveAdjacent(
   current: PlayerTrack,
   queue: PlayerTrack[],
   shuffle: boolean,
