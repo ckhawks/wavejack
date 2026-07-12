@@ -82,12 +82,21 @@ export function QueuePanel({ onClose }: { onClose: () => void }) {
             <div
               key={`${track.id}:${index}`}
               draggable
-              onDragStart={() => setDragIndex(index)}
+              onDragStart={(e) => {
+                // Chromium only fires `drop` when a drag payload is set.
+                e.dataTransfer.effectAllowed = "move";
+                e.dataTransfer.setData("text/plain", String(index));
+                setDragIndex(index);
+              }}
               onDragOver={(e) => {
                 e.preventDefault();
+                e.dataTransfer.dropEffect = "move";
                 setOverIndex(index);
               }}
-              onDrop={() => handleDrop(index)}
+              onDrop={(e) => {
+                e.preventDefault();
+                handleDrop(index);
+              }}
               onDragEnd={() => {
                 setDragIndex(null);
                 setOverIndex(null);
@@ -137,6 +146,7 @@ function Thumb({ base64 }: { base64?: string }) {
     <img
       src={`data:image/jpeg;base64,${base64}`}
       alt=""
+      draggable={false}
       className="h-8 w-8 shrink-0 rounded object-cover"
     />
   );

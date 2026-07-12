@@ -22,7 +22,11 @@ export function TrackActionsMenu({
   onDiscoverSimilar,
 }: TrackActionsMenuProps) {
   const [open, setOpen] = useState(false);
+  // Flip the popover above the trigger when there isn't room below (bottom rows
+  // would otherwise render behind the fixed player bar and swallow clicks).
+  const [openUp, setOpenUp] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
   const queueNext = usePlayerStore((s) => s.queueNext);
   const addToQueue = usePlayerStore((s) => s.addToQueue);
 
@@ -36,15 +40,25 @@ export function TrackActionsMenu({
     return () => document.removeEventListener("mousedown", handleClick);
   }, []);
 
-  const run = (action: () => void) => () => {
+  const run = (action: () => void) => (e: React.MouseEvent) => {
+    // Don't let the click bubble to the row (select/play) handlers.
+    e.stopPropagation();
     action();
     setOpen(false);
+  };
+
+  const toggleOpen = () => {
+    // ~200px menu height; the player bar + waveform reserve ~120px at the bottom.
+    const rect = triggerRef.current?.getBoundingClientRect();
+    if (rect) setOpenUp(rect.bottom + 200 > window.innerHeight - 120);
+    setOpen((v) => !v);
   };
 
   return (
     <div className="relative" ref={ref}>
       <button
-        onClick={() => setOpen((v) => !v)}
+        ref={triggerRef}
+        onClick={toggleOpen}
         className="flex h-6 w-6 items-center justify-center rounded text-neutral-600 transition-colors hover:text-white"
         title="More actions"
       >
@@ -52,7 +66,11 @@ export function TrackActionsMenu({
       </button>
 
       {open && (
-        <div className="absolute right-0 top-full z-30 mt-1 min-w-[180px] rounded border border-[#333] bg-[#0a0a0a] py-1 shadow-xl">
+        <div
+          className={`absolute right-0 z-[60] min-w-[180px] rounded border border-[#333] bg-[#0a0a0a] py-1 shadow-xl ${
+            openUp ? "bottom-full mb-1" : "top-full mt-1"
+          }`}
+        >
           <button
             onClick={run(() => queueNext(playerTrackFromLibrary(track)))}
             className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-neutral-300 transition-colors hover:bg-[#1a1a1a] hover:text-white"
