@@ -20,10 +20,17 @@ interface PlayerStore {
   volumeLoaded: boolean;
   currentTime: number;
   duration: number;
-  /** Optional ordered playback queue. When set, playNext/playPrev walk this
-   * list before falling back to download adjacency. Callers (e.g. LibraryView)
-   * pass it to control the listening order. */
+  /** The playback *context* — the ordered list playback walks by default (e.g.
+   * the library list you started from). playNext/playPrev advance through this
+   * once the explicit `upNext` queue is empty. */
   queue: PlayerTrack[];
+  /** Explicit user queue ("Play next" / "Add to queue"). Always played first,
+   * in order, regardless of shuffle. Draining it resumes the context `queue`
+   * from wherever it left off. This is what the Up Next panel shows. */
+  upNext: PlayerTrack[];
+  /** Id of the current position within the context `queue`. Held steady while
+   * `upNext` tracks play so the context resumes from the right spot afterward. */
+  contextId: string | null;
   /** Stack of previously played tracks. Pushed each time playNext advances. */
   history: PlayerTrack[];
   /** Stack of tracks "rewound from" — populated when playPrev pops history,
@@ -33,15 +40,18 @@ interface PlayerStore {
   shuffle: boolean;
   playTrack: (track: PlayerTrack) => void;
   setQueue: (tracks: PlayerTrack[]) => void;
-  /** Insert a track to play immediately after the current one. */
+  /** Put a track at the front of the explicit queue (plays next). */
   queueNext: (track: PlayerTrack) => void;
-  /** Append a track to the end of the current playback queue. */
+  /** Append a track to the end of the explicit queue. */
   addToQueue: (track: PlayerTrack) => void;
-  /** Drop a queued track by id (used by the Up Next panel). */
+  /** Jump to a track in the explicit queue by index: play it and drop it plus
+   * everything above it, preserving the context anchor for when the rest drains. */
+  playQueued: (index: number) => void;
+  /** Drop a track from the explicit queue by id. */
   removeFromQueue: (id: string) => void;
-  /** Move a queued track between absolute queue positions (drag-to-reorder). */
+  /** Reorder within the explicit queue (drag-to-reorder in the Up Next panel). */
   reorderQueue: (from: number, to: number) => void;
-  /** Empty the whole playback queue without stopping the current track. */
+  /** Empty the explicit queue without stopping the current track. */
   clearQueue: () => void;
   toggleShuffle: () => void;
   togglePlayPause: () => void;
@@ -106,30 +116,6 @@ export function resolveAdjacent(
   return trackFromDownloadId(ids[nextIdx]);
 }
 
-/** Insert `track` into `queue` relative to `current`.
- *  - "next": immediately after the current track (Spotify "Play next").
- *  - "end":  at the tail (Spotify "Add to queue").
- *  Any existing occurrence of `track` is removed first so a song can't appear
- *  twice. When `current` isn't already in the queue (e.g. playback came from
- *  download adjacency, not an explicit queue), the queue is seeded with it so
- *  playNext has a defined anchor to resume from. Exported for unit tests. */
-export function insertIntoQueue(
-  queue: PlayerTrack[],
-  current: PlayerTrack,
-  track: PlayerTrack,
-  mode: "next" | "end",
-): PlayerTrack[] {
-  // Queueing the currently-playing track relative to itself is a no-op.
-  if (track.id === current.id) return queue;
-
-  const base = queue.some((t) => t.id === current.id) ? queue : [current];
-  const next = base.filter((t) => t.id !== track.id);
-  const anchor = next.findIndex((t) => t.id === current.id);
-  if (mode === "next") next.splice(anchor + 1, 0, track);
-  else next.push(track);
-  return next;
-}
-
 /** Move the element at `from` to `to`, clamping out-of-range indices. Returns a
  *  new array (or the same reference when the move is a no-op). Exported for tests. */
 export function reorder<T>(arr: T[], from: number, to: number): T[] {
@@ -150,42 +136,67 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
   currentTime: 0,
   duration: 0,
   queue: [],
+  upNext: [],
+  contextId: null,
   history: [],
   forward: [],
   shuffle: false,
 
-  // Manually selecting a track wipes the forward stack — you've branched.
+  // Manually selecting a track wipes the forward stack — you've branched — and
+  // re-anchors the context on this track. The explicit queue is left intact.
   playTrack: (track) =>
-    set({ currentTrack: track, isPlaying: true, currentTime: 0, duration: 0, forward: [] }),
+    set({
+      currentTrack: track,
+      contextId: track.id,
+      isPlaying: true,
+      currentTime: 0,
+      duration: 0,
+      forward: [],
+    }),
 
   setQueue: (tracks) => set({ queue: tracks }),
 
-  // With nothing playing there's no "next" to queue against — just start it.
+  // "Play next": front of the explicit queue. With nothing playing there's no
+  // "next" to queue against, so just start it.
   queueNext: (track) => {
-    const { currentTrack, queue } = get();
-    if (!currentTrack) {
+    if (!get().currentTrack) {
       get().playTrack(track);
-      set({ queue: [track] });
       return;
     }
-    set({ queue: insertIntoQueue(queue, currentTrack, track, "next") });
+    set((s) => ({ upNext: [track, ...s.upNext.filter((t) => t.id !== track.id)] }));
   },
 
+  // "Add to queue": tail of the explicit queue.
   addToQueue: (track) => {
-    const { currentTrack, queue } = get();
-    if (!currentTrack) {
+    if (!get().currentTrack) {
       get().playTrack(track);
-      set({ queue: [track] });
       return;
     }
-    set({ queue: insertIntoQueue(queue, currentTrack, track, "end") });
+    set((s) => ({ upNext: [...s.upNext.filter((t) => t.id !== track.id), track] }));
   },
 
-  removeFromQueue: (id) => set((s) => ({ queue: s.queue.filter((t) => t.id !== id) })),
+  playQueued: (index) =>
+    set((s) => {
+      const track = s.upNext[index];
+      if (!track) return {};
+      return {
+        currentTrack: track,
+        // Drop the clicked track and any queued ahead of it (they were skipped).
+        upNext: s.upNext.slice(index + 1),
+        isPlaying: true,
+        currentTime: 0,
+        duration: 0,
+        forward: [],
+        history: s.currentTrack ? [...s.history, s.currentTrack] : s.history,
+        // contextId is intentionally preserved so the context resumes correctly.
+      };
+    }),
 
-  reorderQueue: (from, to) => set((s) => ({ queue: reorder(s.queue, from, to) })),
+  removeFromQueue: (id) => set((s) => ({ upNext: s.upNext.filter((t) => t.id !== id) })),
 
-  clearQueue: () => set({ queue: [] }),
+  reorderQueue: (from, to) => set((s) => ({ upNext: reorder(s.upNext, from, to) })),
+
+  clearQueue: () => set({ upNext: [] }),
 
   toggleShuffle: () => {
     const next = !get().shuffle;
@@ -224,7 +235,7 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
   },
 
   playNext: () => {
-    const { currentTrack, queue, shuffle, history, forward } = get();
+    const { currentTrack, queue, upNext, contextId, shuffle, history, forward } = get();
     if (!currentTrack) return;
 
     // Retrace the forward stack first if we just rewound.
@@ -241,27 +252,46 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
       return;
     }
 
-    const next = resolveAdjacent(currentTrack, queue, shuffle, 1);
+    // The explicit queue always wins, in order, ignoring shuffle. The context
+    // anchor (`contextId`) is held so playback resumes there once it drains.
+    if (upNext.length > 0) {
+      const [next, ...rest] = upNext;
+      set({
+        currentTrack: next,
+        upNext: rest,
+        isPlaying: true,
+        currentTime: 0,
+        duration: 0,
+        history: [...history, currentTrack],
+      });
+      return;
+    }
+
+    // Resume the context from where we left off (which may be behind the
+    // just-finished explicit-queue track).
+    const anchor = queue.find((t) => t.id === contextId) ?? currentTrack;
+    const next = resolveAdjacent(anchor, queue, shuffle, 1);
     if (!next) {
       set({ isPlaying: false });
       return;
     }
     set({
       currentTrack: next,
+      contextId: next.id,
       isPlaying: true,
       currentTime: 0,
       duration: 0,
-      // Only push to history when we walked an explicit queue (so back actually
+      // Only push to history when we walked an explicit context (so back
       // returns somewhere meaningful). Download-adjacency advances stay
       // historyless to match the prior behavior.
-      history: queue.some((t) => t.id === currentTrack.id)
+      history: queue.some((t) => t.id === anchor.id)
         ? [...history, currentTrack]
         : history,
     });
   },
 
   playPrev: () => {
-    const { currentTrack, queue, history, forward, currentTime } = get();
+    const { currentTrack, queue, contextId, history, forward, currentTime } = get();
     if (!currentTrack) return;
 
     // Mid-song "back" restarts the current track; near the start it goes to
@@ -273,8 +303,9 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
       return;
     }
 
-    // Prefer the history stack so shuffle "back" returns to the previously
-    // played track. Current goes onto forward so next can retrace.
+    // Prefer the history stack so back retraces the actual played sequence
+    // (including explicit-queue tracks). Current goes onto forward so next can
+    // retrace.
     if (history.length > 0) {
       const prev = history[history.length - 1];
       set({
@@ -288,14 +319,16 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
       return;
     }
 
-    const prev = resolveAdjacent(currentTrack, queue, false, -1);
+    const anchor = queue.find((t) => t.id === contextId) ?? currentTrack;
+    const prev = resolveAdjacent(anchor, queue, false, -1);
     if (!prev) return;
     set({
       currentTrack: prev,
+      contextId: prev.id,
       isPlaying: true,
       currentTime: 0,
       duration: 0,
-      forward: queue.some((t) => t.id === currentTrack.id)
+      forward: queue.some((t) => t.id === anchor.id)
         ? [...forward, currentTrack]
         : forward,
     });

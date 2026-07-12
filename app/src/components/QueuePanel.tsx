@@ -6,26 +6,18 @@ import { usePlayerStore } from "../stores/playerStore";
  * tracks after the current one; supports click-to-jump, remove, and
  * drag-to-reorder. Indices passed to the store are absolute queue positions. */
 export function QueuePanel({ onClose }: { onClose: () => void }) {
-  const queue = usePlayerStore((s) => s.queue);
+  const upNext = usePlayerStore((s) => s.upNext);
   const currentTrack = usePlayerStore((s) => s.currentTrack);
-  const playTrack = usePlayerStore((s) => s.playTrack);
+  const playQueued = usePlayerStore((s) => s.playQueued);
   const removeFromQueue = usePlayerStore((s) => s.removeFromQueue);
   const reorderQueue = usePlayerStore((s) => s.reorderQueue);
   const clearQueue = usePlayerStore((s) => s.clearQueue);
 
-  // Track the row being dragged (absolute queue index) so drop knows the source.
+  // Track the row being dragged (index within upNext) so drop knows the source.
   const [dragIndex, setDragIndex] = useState<number | null>(null);
   const [overIndex, setOverIndex] = useState<number | null>(null);
 
-  const currentIndex = currentTrack
-    ? queue.findIndex((t) => t.id === currentTrack.id)
-    : -1;
-  // Everything after the current track. If current isn't in the queue there's
-  // nothing meaningful queued ahead.
-  const upcoming =
-    currentIndex >= 0
-      ? queue.slice(currentIndex + 1).map((t, i) => ({ track: t, index: currentIndex + 1 + i }))
-      : [];
+  const upcoming = upNext.map((track, index) => ({ track, index }));
 
   const handleDrop = (targetIndex: number) => {
     if (dragIndex !== null && dragIndex !== targetIndex) {
@@ -36,7 +28,7 @@ export function QueuePanel({ onClose }: { onClose: () => void }) {
   };
 
   return (
-    <div className="fixed bottom-24 right-4 z-50 flex max-h-[60vh] w-80 flex-col rounded-lg border border-[#333] bg-[#0a0a0a] shadow-2xl">
+    <div className="fixed bottom-28 right-4 z-[60] flex max-h-[60vh] w-80 flex-col rounded-lg border border-[#333] bg-[#0a0a0a] shadow-2xl">
       <div className="flex items-center justify-between border-b border-[#222] px-3 py-2">
         <div className="flex items-center gap-2 text-xs font-medium text-white">
           <ListMusic size={13} className="text-violet-400" />
@@ -110,7 +102,7 @@ export function QueuePanel({ onClose }: { onClose: () => void }) {
                 className="shrink-0 cursor-grab text-neutral-700 group-hover:text-neutral-500"
               />
               <button
-                onClick={() => playTrack(track)}
+                onClick={() => playQueued(index)}
                 className="relative flex h-8 w-8 shrink-0 items-center justify-center overflow-hidden rounded bg-[#222]"
                 title="Play now"
               >

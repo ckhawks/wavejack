@@ -13,7 +13,7 @@ vi.mock("./downloadStore", () => ({
   useDownloadStore: { getState: () => ({ downloads: [] }) },
 }));
 
-import { insertIntoQueue, reorder, resolveAdjacent, usePlayerStore, type PlayerTrack } from "./playerStore";
+import { reorder, resolveAdjacent, usePlayerStore, type PlayerTrack } from "./playerStore";
 
 const track = (id: string): PlayerTrack => ({ id, title: id, filePath: `/music/${id}.mp3` });
 
@@ -29,6 +29,8 @@ function resetStore(patch: Partial<ReturnType<typeof usePlayerStore.getState>>) 
     currentTime: 0,
     duration: 0,
     queue: [],
+    upNext: [],
+    contextId: null,
     history: [],
     forward: [],
     shuffle: false,
@@ -76,54 +78,58 @@ describe("resolveAdjacent (queue navigation)", () => {
   });
 });
 
-describe("insertIntoQueue", () => {
-  it("inserts a play-next track immediately after the current one", () => {
-    expect(insertIntoQueue([a, b, c], a, d, "next")).toEqual([a, d, b, c]);
+describe("explicit queue (upNext)", () => {
+  it("queueNext puts the track at the front of the explicit queue", () => {
+    resetStore({ currentTrack: a, queue: [a, b], contextId: a.id, upNext: [c] });
+    usePlayerStore.getState().queueNext(d);
+    expect(usePlayerStore.getState().upNext.map((t) => t.id)).toEqual(["d", "c"]);
   });
 
-  it("appends an add-to-queue track to the tail", () => {
-    expect(insertIntoQueue([a, b, c], a, d, "end")).toEqual([a, b, c, d]);
+  it("addToQueue appends to the end of the explicit queue", () => {
+    resetStore({ currentTrack: a, queue: [a, b], contextId: a.id, upNext: [c] });
+    usePlayerStore.getState().addToQueue(d);
+    expect(usePlayerStore.getState().upNext.map((t) => t.id)).toEqual(["c", "d"]);
   });
 
-  it("moves an already-queued track rather than duplicating it (play next)", () => {
-    expect(insertIntoQueue([a, b, c], a, c, "next")).toEqual([a, c, b]);
+  it("de-dupes when re-queueing an already-queued track", () => {
+    resetStore({ currentTrack: a, upNext: [c, d] });
+    usePlayerStore.getState().queueNext(d);
+    expect(usePlayerStore.getState().upNext.map((t) => t.id)).toEqual(["d", "c"]);
   });
 
-  it("seeds the queue with current when current isn't in it", () => {
-    expect(insertIntoQueue([b, c], a, d, "next")).toEqual([a, d]);
-  });
-
-  it("is a no-op when queueing the currently-playing track", () => {
-    const q = [a, b, c];
-    expect(insertIntoQueue(q, a, a, "next")).toBe(q);
-  });
-});
-
-describe("queueNext / addToQueue", () => {
-  it("queueNext resumes the original order after the injected track", () => {
-    resetStore({ currentTrack: a, queue: [a, b, c] });
-    usePlayerStore.getState().queueNext(d); // -> [a, d, b, c]
-
+  it("plays the explicit queue in order, ignoring shuffle, before the context", () => {
+    // Shuffle ON must NOT scramble explicit-queue order.
+    resetStore({ currentTrack: a, queue: [a, b], contextId: a.id, shuffle: true, upNext: [d, c] });
     usePlayerStore.getState().playNext();
     expect(usePlayerStore.getState().currentTrack).toEqual(d);
     usePlayerStore.getState().playNext();
-    expect(usePlayerStore.getState().currentTrack).toEqual(b); // back on track
+    expect(usePlayerStore.getState().currentTrack).toEqual(c);
   });
 
-  it("addToQueue plays after the queue is exhausted", () => {
-    resetStore({ currentTrack: b, queue: [a, b] });
-    usePlayerStore.getState().addToQueue(d); // -> [a, b, d]
-    usePlayerStore.getState().playNext();
+  it("resumes the context from where it left off after the queue drains", () => {
+    resetStore({ currentTrack: a, queue: [a, b, c], contextId: a.id, upNext: [d] });
+    usePlayerStore.getState().playNext(); // -> d (from queue), context still at a
     expect(usePlayerStore.getState().currentTrack).toEqual(d);
+    usePlayerStore.getState().playNext(); // queue empty -> context resumes at b
+    expect(usePlayerStore.getState().currentTrack).toEqual(b);
   });
 
-  it("queueNext with nothing playing starts the track", () => {
-    resetStore({ currentTrack: null, queue: [] });
+  it("queueNext with nothing playing starts the track immediately", () => {
+    resetStore({ currentTrack: null });
     usePlayerStore.getState().queueNext(d);
     const s = usePlayerStore.getState();
     expect(s.currentTrack).toEqual(d);
     expect(s.isPlaying).toBe(true);
-    expect(s.queue).toEqual([d]);
+    expect(s.upNext).toEqual([]);
+  });
+
+  it("playQueued jumps to a queued track and drops it plus everything above it", () => {
+    resetStore({ currentTrack: a, queue: [a, b], contextId: a.id, upNext: [c, d] });
+    usePlayerStore.getState().playQueued(1); // jump to d
+    const s = usePlayerStore.getState();
+    expect(s.currentTrack).toEqual(d);
+    expect(s.upNext).toEqual([]); // c (above d) is dropped too
+    expect(s.contextId).toBe(a.id); // context anchor preserved
   });
 });
 
@@ -147,17 +153,26 @@ describe("reorder", () => {
   });
 });
 
-describe("removeFromQueue / reorderQueue", () => {
+describe("removeFromQueue / reorderQueue / clearQueue", () => {
   it("removes a queued track by id", () => {
-    resetStore({ currentTrack: a, queue: [a, b, c] });
-    usePlayerStore.getState().removeFromQueue(b.id);
-    expect(usePlayerStore.getState().queue).toEqual([a, c]);
+    resetStore({ currentTrack: a, upNext: [b, c, d] });
+    usePlayerStore.getState().removeFromQueue(c.id);
+    expect(usePlayerStore.getState().upNext).toEqual([b, d]);
   });
 
-  it("reorders the queue by absolute index", () => {
-    resetStore({ currentTrack: a, queue: [a, b, c, d] });
-    usePlayerStore.getState().reorderQueue(3, 1);
-    expect(usePlayerStore.getState().queue).toEqual([a, d, b, c]);
+  it("reorders within the explicit queue", () => {
+    resetStore({ currentTrack: a, upNext: [b, c, d] });
+    usePlayerStore.getState().reorderQueue(2, 0);
+    expect(usePlayerStore.getState().upNext).toEqual([d, b, c]);
+  });
+
+  it("clearQueue empties the explicit queue without stopping playback", () => {
+    resetStore({ currentTrack: a, upNext: [b, c], isPlaying: true });
+    usePlayerStore.getState().clearQueue();
+    const s = usePlayerStore.getState();
+    expect(s.upNext).toEqual([]);
+    expect(s.currentTrack).toEqual(a);
+    expect(s.isPlaying).toBe(true);
   });
 });
 

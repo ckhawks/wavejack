@@ -96,7 +96,7 @@ function Slider({
 export function AudioPlayer() {
   const [showImmersive, setShowImmersive] = useState(false);
   const [showQueue, setShowQueue] = useState(false);
-  const queueCount = usePlayerStore((s) => s.queue.length);
+  const queueCount = usePlayerStore((s) => s.upNext.length);
   // Near-silent looping element that keeps Chromium's MediaSession active.
   // Real audio plays in the Rust process (rodio), which the webview can't feed
   // to MediaSession — without a playing media element in the DOM, the OS media
@@ -409,7 +409,7 @@ export function AudioPlayer() {
           title="Up next"
         >
           <ListMusic size={16} />
-          {queueCount > 1 && (
+          {queueCount > 0 && (
             <span className="absolute -right-0.5 -top-0.5 h-1.5 w-1.5 rounded-full bg-violet-400" />
           )}
         </button>
