@@ -1,5 +1,51 @@
 # Wavejack download & ingest paths
 
+## 0. Routing overview
+
+How a pasted URL or search result is dispatched to a backend. Client-side routing
+lives in `UrlInput.tsx` (`handleSubmit` / `handleDirectDownload`); backend selection
+for the yt-dlp path is in `downloader.rs`.
+
+```mermaid
+flowchart TD
+    IN([User submits input]) --> ISURL{"starts with http?"}
+
+    ISURL -- no --> SEARCH["searchSources:<br/>YouTube / SoundCloud / Tidal / Spotify<br/>in parallel"] --> RESULTS["Search results"]
+    RESULTS --> DIRECT{"result.source?"}
+    DIRECT -- "youtube / soundcloud" --> YTDLP
+    DIRECT -- tidal --> TMATCHED["tidalDownloadMatched"]
+    DIRECT -- spotify --> SPMODAL
+
+    ISURL -- yes --> SPOTIFY{"Spotify<br/>playlist / album / track?"}
+    SPOTIFY -- yes --> SPFETCH["spotifyFetchPlaylist / Album / Track<br/>Web API: title, artist, ISRC"]
+    SPFETCH --> SPMODAL["SpotifyPlaylistPreview modal"]
+    SPMODAL --> TMATCH["tidalMatchTracks<br/>ISRC-first, fuzzy fallback"]
+    TMATCH --> MATCHED{"matched?"}
+    MATCHED -- yes --> TMATCHED
+    MATCHED -- no --> NOTFOUND["status: not_found<br/>non-selectable"]
+    TMATCHED --> TIDALDL["tidal-dl-ng<br/>HI_RES_LOSSLESS FLAC"]
+
+    SPOTIFY -- no --> PLAYLIST{"Playlist URL?<br/>list= / /playlist / /sets/"}
+    PLAYLIST -- yes --> EXTRACT["extractPlaylist<br/>yt-dlp"] --> PLPREVIEW["PlaylistPreview modal"] --> YTDLP
+
+    PLAYLIST -- no --> SC{"SoundCloud<br/>single track?"}
+    SC -- yes --> SCRESOLVE["resolveSoundcloudTrack"] --> DRM{"DRM?"}
+    DRM -- yes --> DRMPREVIEW["1-track preview<br/>grab Tidal version instead"] --> TMATCH
+    DRM -- no --> YTDLP
+
+    SC -- no --> YTDLP["startDownload"]
+    YTDLP --> DOWNLOADER["downloader::download"]
+    DOWNLOADER --> TRYYT["yt-dlp"] --> OK{"ok?"}
+    OK -- "no, cobaltUrl set" --> COBALT["Cobalt fallback"]
+    OK -- yes --> DONE([File + cover + tags in library])
+    COBALT --> DONE
+    TIDALDL --> DONE
+```
+
+> **Note:** unmatched Spotify/Tidal tracks currently end at `not_found` and are
+> non-selectable — there is **no** automatic yt-dlp/YouTube fallback in code today.
+> Adding one would go after `tidalMatchTracks` in `SpotifyPlaylistPreview.tsx`.
+
 ## 1. URL / search box (the main input)
 
 **Primary backend: yt-dlp.** Supports 1000+ sites. The format selection flips based on site and requested format:
@@ -19,17 +65,17 @@
 - Rust side reads the sidecar jpg, base64-encodes it for the DB (`cover_art_base64`), then deletes the sidecar
 - MP3-only: legacy id3 crate also writes the picture frame if it's missing — belt-and-suspenders, effectively a no-op for m4a
 
-## 2. Spotify playlist import
+## 2. Spotify playlist / album / track import
 
 - Auth: PKCE via user's own Spotify Web API app (`spotifyClientId` / `spotifyClientSecret`)
-- Wavejack fetches playlist track metadata (title/artist/album/ISRC) from Spotify
-- Each track is then resolved externally — Spotify gives us identity, not audio. Resolution flow: look up ISRC on Tidal → if found, use Tidal download path (below); else fall back to yt-dlp YouTube search
+- Playlist, album, and single-track URLs all route here (not yt-dlp). Wavejack fetches track metadata (title/artist/album/ISRC) from the Spotify Web API. Albums use the `/albums/{id}/tracks` endpoint, which omits ISRC, so IDs are re-hydrated via batched `/tracks?ids=` calls to recover ISRCs.
+- Each track is then resolved externally — Spotify gives us identity, not audio. Resolution: look up ISRC on Tidal → if found, use the Tidal download path (below). If Tidal has no match, the track is marked `not_found` and left non-selectable — there is currently **no** automatic yt-dlp/YouTube fallback.
 - So Spotify is an **ingest list**, not a download source
 
-## 3. Tidal (direct + as Spotify fallback)
+## 3. Tidal (direct + as Spotify resolver)
 
 - Auth: Tidal device-code login (user logs in once via browser)
-- Matching: Spotify → Tidal by ISRC lookup; fuzzy title/artist search if ISRC misses
+- Matching: Spotify → Tidal by ISRC lookup; fuzzy title/artist search (duration ±3s) if ISRC misses; unmatched tracks stay `not_found`
 - Download: shells out to `tidal-dl-ng` (`tidal_download.rs`)
 - Quality: `quality_audio = HI_RES_LOSSLESS` — gives 24-bit FLAC where available, 16-bit FLAC for lossless-only tracks, AAC `.m4a` for HIGH-only tracks. tidal-dl-ng handles Tidal's MPEG-DASH + DRM — we don't reimplement that
 - Metadata/cover: tidal-dl-ng embeds natively (`metadata_cover_embed`, `metadata_write`, `metadata_lyrics_embed` all `True`). Wavejack doesn't touch the file after

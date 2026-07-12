@@ -7,7 +7,7 @@ import { useSettingsStore } from "../stores/settingsStore";
 import { usePlayerStore } from "../stores/playerStore";
 import {
   startDownload, extractPlaylist, extractAudio, searchSources, searchPreview,
-  discoverKeep, discoverTrash, spotifyFetchPlaylist, spotifyFetchTrack, formatErr,
+  discoverKeep, discoverTrash, spotifyFetchPlaylist, spotifyFetchTrack, spotifyFetchAlbum, formatErr,
   tidalDownloadMatched, tidalAuthStatus, spotifyAuthStatus, resolveSoundcloudTrack,
 } from "../lib/commands";
 import { PlaylistPreview } from "./PlaylistPreview";
@@ -55,6 +55,10 @@ function isSpotifyPlaylistUrlClient(url: string): boolean {
 
 function isSpotifyTrackUrlClient(url: string): boolean {
   return /(^https?:\/\/open\.spotify\.com\/track\/|^spotify:track:)/.test(url);
+}
+
+function isSpotifyAlbumUrlClient(url: string): boolean {
+  return /(^https?:\/\/open\.spotify\.com\/album\/|^spotify:album:)/.test(url);
 }
 
 /** A single SoundCloud track link (not a /sets/ playlist). */
@@ -145,16 +149,21 @@ export function UrlInput() {
       setSpotifyError(null);
       setUrlError(null);
 
-      // Spotify playlists and single tracks both route through the Web API
-      // → Tidal pipeline, not yt-dlp. The backend returns a 1-track synthetic
-      // playlist for track URLs so the preview UI is uniform.
-      if (isSpotifyPlaylistUrlClient(trimmed) || isSpotifyTrackUrlClient(trimmed)) {
-        const isTrack = isSpotifyTrackUrlClient(trimmed);
+      // Spotify playlists, albums, and single tracks all route through the Web
+      // API → Tidal pipeline, not yt-dlp. The backend returns a synthetic
+      // playlist (1-track for a track URL) so the preview UI is uniform.
+      if (
+        isSpotifyPlaylistUrlClient(trimmed) ||
+        isSpotifyTrackUrlClient(trimmed) ||
+        isSpotifyAlbumUrlClient(trimmed)
+      ) {
         setExtracting(true);
         try {
-          const pl = isTrack
+          const pl = isSpotifyTrackUrlClient(trimmed)
             ? await spotifyFetchTrack(trimmed)
-            : await spotifyFetchPlaylist(trimmed);
+            : isSpotifyAlbumUrlClient(trimmed)
+              ? await spotifyFetchAlbum(trimmed)
+              : await spotifyFetchPlaylist(trimmed);
           setSpotifyPlaylist(pl);
           setUrl("");
         } catch (e) {
@@ -397,8 +406,7 @@ export function UrlInput() {
   //  - youtube / soundcloud → yt-dlp via `startDownload`
   //  - tidal → tidal-dl-ng via `tidalDownloadMatched`
   //  - spotify → open the Spotify single-track modal so the user can confirm
-  //    the Tidal match (may fall back to YouTube) before we kick off the
-  //    resolve+download pipeline.
+  //    the Tidal match before we kick off the resolve+download pipeline.
   const handleDirectDownload = useCallback((result: SearchResult) => {
     if (result.source === "tidal") {
       const id = crypto.randomUUID();
@@ -680,7 +688,7 @@ export function UrlInput() {
                   ? "border-green-500/40 bg-green-500/10 text-green-200"
                   : "border-[#333] bg-transparent text-neutral-500 hover:text-neutral-300"
               }`}
-              title="Toggle Spotify as a search source (resolves via Tidal → YouTube)"
+              title="Toggle Spotify as a search source (matched to Tidal by ISRC, downloads FLAC via tidal-dl-ng)"
             >
               <Disc size={12} />
               Spotify

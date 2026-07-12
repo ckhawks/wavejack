@@ -2081,6 +2081,14 @@ async fn spotify_fetch_track(
 }
 
 #[tauri::command]
+async fn spotify_fetch_album(
+    app: tauri::AppHandle,
+    url: String,
+) -> Result<spotify::SpotifyPlaylist, AppError> {
+    spotify::spotify_fetch_album_cmd(app, url).await
+}
+
+#[tauri::command]
 fn is_spotify_playlist_url(url: String) -> bool {
     spotify::is_spotify_playlist_url(&url)
 }
@@ -2519,6 +2527,7 @@ pub fn run() {
             spotify_logout,
             spotify_fetch_playlist,
             spotify_fetch_track,
+            spotify_fetch_album,
             is_spotify_playlist_url,
             is_spotify_track_url,
             tidal_login_start,

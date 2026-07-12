@@ -491,6 +491,22 @@ fn parse_track_id(raw: &str) -> Option<String> {
     None
 }
 
+/// Same shape as `parse_playlist_id` but for album URLs.
+fn parse_album_id(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    for prefix in [
+        "https://open.spotify.com/album/",
+        "http://open.spotify.com/album/",
+        "spotify:album:",
+    ] {
+        if let Some(rest) = raw.strip_prefix(prefix) {
+            let id = rest.split(['?', '/']).next()?.to_string();
+            return (!id.is_empty()).then_some(id);
+        }
+    }
+    None
+}
+
 fn flatten_track(item: &serde_json::Value) -> Option<SpotifyTrack> {
     let t = item.get("track").unwrap_or(item);
     let id = t.get("id")?.as_str()?.to_string();
@@ -608,6 +624,87 @@ pub async fn fetch_playlist(app: &AppHandle, raw_url: &str) -> Result<SpotifyPla
     Ok(SpotifyPlaylist { id, name, owner, playlist_url, tracks })
 }
 
+/// Fetch a Spotify album's tracks. Wrapped in the same `SpotifyPlaylist` shape
+/// so the frontend preview + Tidal-match + download pipeline consumes it exactly
+/// like a playlist.
+///
+/// The `/albums/{id}/tracks` endpoint returns *simplified* track objects with no
+/// ISRC — and ISRC is what drives the accurate Tidal match — so we collect the
+/// track IDs in order, then re-hydrate full objects (which carry `external_ids`)
+/// via batched `/tracks?ids=` calls (50 IDs max per call).
+pub async fn fetch_album(app: &AppHandle, raw_url: &str) -> Result<SpotifyPlaylist, AppError> {
+    let id = parse_album_id(raw_url)
+        .ok_or_else(|| AppError::InvalidUrl(format!("Not a Spotify album URL: {}", raw_url)))?;
+
+    let token = ensure_token(app).await?;
+
+    // Album metadata — name and primary artist for the preview header.
+    let meta = api_get(
+        &token,
+        &format!("{}/albums/{}?market=from_token", API_BASE, id),
+    )
+    .await?;
+
+    let name = meta.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let owner = meta
+        .get("artists")
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|a| a.get("name").and_then(|v| v.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    let playlist_url = meta
+        .get("external_urls")
+        .and_then(|u| u.get("spotify"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(raw_url)
+        .to_string();
+
+    // Paginate the simplified track list, preserving album order — we only need
+    // the IDs here; full objects (with ISRC) are hydrated below.
+    let mut ids: Vec<String> = Vec::new();
+    let mut next_url = format!("{}/albums/{}/tracks?limit=50", API_BASE, id);
+    loop {
+        let page = api_get(&token, &next_url).await?;
+        if let Some(items) = page.get("items").and_then(|v| v.as_array()) {
+            for it in items {
+                if let Some(tid) = it.get("id").and_then(|v| v.as_str()) {
+                    ids.push(tid.to_string());
+                }
+            }
+        }
+        match page.get("next").and_then(|v| v.as_str()) {
+            Some(n) if !n.is_empty() => next_url = n.to_string(),
+            _ => break,
+        }
+    }
+
+    // Hydrate full track objects (50 per batch) to pick up ISRCs.
+    let mut tracks: Vec<SpotifyTrack> = Vec::with_capacity(ids.len());
+    for chunk in ids.chunks(50) {
+        let url = format!("{}/tracks?ids={}", API_BASE, chunk.join(","));
+        let data = api_get(&token, &url).await?;
+        if let Some(arr) = data.get("tracks").and_then(|v| v.as_array()) {
+            for t in arr {
+                if let Some(track) = flatten_track(t) {
+                    tracks.push(track);
+                }
+            }
+        }
+    }
+
+    Ok(SpotifyPlaylist {
+        id: format!("album:{}", id),
+        name,
+        owner,
+        playlist_url,
+        tracks,
+    })
+}
+
 // ------- command entry points (called from lib.rs) -------------------------
 
 pub async fn spotify_login_cmd(app: AppHandle) -> Result<SpotifyUser, AppError> {
@@ -673,6 +770,13 @@ pub async fn spotify_fetch_track_cmd(
     fetch_track(&app, &url).await
 }
 
+pub async fn spotify_fetch_album_cmd(
+    app: AppHandle,
+    url: String,
+) -> Result<SpotifyPlaylist, AppError> {
+    fetch_album(&app, &url).await
+}
+
 /// Detect whether a URL looks like a Spotify playlist — used so the frontend
 /// can branch before invoking the full fetch command.
 pub fn is_spotify_playlist_url(url: &str) -> bool {
@@ -683,4 +787,58 @@ pub fn is_spotify_playlist_url(url: &str) -> bool {
 pub fn is_spotify_track_url(url: &str) -> bool {
     (url.contains("spotify.com/track/") || url.starts_with("spotify:track:"))
         && parse_track_id(url).is_some()
+}
+
+pub fn is_spotify_album_url(url: &str) -> bool {
+    (url.contains("spotify.com/album/") || url.starts_with("spotify:album:"))
+        && parse_album_id(url).is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_album_id_from_web_url() {
+        assert_eq!(
+            parse_album_id("https://open.spotify.com/album/4aawyAB9vmqN3uQ7FjRGTy"),
+            Some("4aawyAB9vmqN3uQ7FjRGTy".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_album_id_strips_query_and_path() {
+        assert_eq!(
+            parse_album_id("https://open.spotify.com/album/4aawyAB9vmqN3uQ7FjRGTy?si=abc123"),
+            Some("4aawyAB9vmqN3uQ7FjRGTy".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_album_id_from_uri() {
+        assert_eq!(
+            parse_album_id("spotify:album:4aawyAB9vmqN3uQ7FjRGTy"),
+            Some("4aawyAB9vmqN3uQ7FjRGTy".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_album_id_rejects_non_album() {
+        assert_eq!(parse_album_id("https://open.spotify.com/playlist/abc"), None);
+        assert_eq!(parse_album_id("https://open.spotify.com/track/abc"), None);
+    }
+
+    #[test]
+    fn is_spotify_album_url_matches_only_albums() {
+        assert!(is_spotify_album_url(
+            "https://open.spotify.com/album/4aawyAB9vmqN3uQ7FjRGTy"
+        ));
+        assert!(is_spotify_album_url("spotify:album:4aawyAB9vmqN3uQ7FjRGTy"));
+        assert!(!is_spotify_album_url(
+            "https://open.spotify.com/playlist/4aawyAB9vmqN3uQ7FjRGTy"
+        ));
+        assert!(!is_spotify_album_url(
+            "https://open.spotify.com/track/4aawyAB9vmqN3uQ7FjRGTy"
+        ));
+    }
 }

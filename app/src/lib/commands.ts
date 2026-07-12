@@ -481,6 +481,12 @@ export async function spotifyFetchTrack(url: string): Promise<SpotifyPlaylist> {
   return invoke("spotify_fetch_track", { url });
 }
 
+/** Fetch a Spotify album's tracks (with ISRCs) as a playlist — routes through
+ *  the same Web API → Tidal pipeline as playlists. */
+export async function spotifyFetchAlbum(url: string): Promise<SpotifyPlaylist> {
+  return invoke("spotify_fetch_album", { url });
+}
+
 /** Cheap server-side check — used by UrlInput to branch before fetching. */
 export async function isSpotifyPlaylistUrl(url: string): Promise<boolean> {
   return invoke("is_spotify_playlist_url", { url });
