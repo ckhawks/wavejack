@@ -1,4 +1,18 @@
 import type { LibraryTrack } from "../../lib/commands";
+import type { PlayerTrack } from "../../stores/playerStore";
+
+/** Map a library row to the shape the player/queue consumes. The DB path is the
+ * stable identity, so it doubles as both `id` and `filePath`. */
+export function playerTrackFromLibrary(t: LibraryTrack): PlayerTrack {
+  return {
+    id: t.path,
+    title: t.title,
+    artist: t.artist,
+    filePath: t.path,
+    coverArtBase64: t.cover_art_base64 || undefined,
+    durationSecs: t.duration_secs || undefined,
+  };
+}
 
 export type SortField =
   | "title"

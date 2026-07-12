@@ -13,13 +13,14 @@ vi.mock("./downloadStore", () => ({
   useDownloadStore: { getState: () => ({ downloads: [] }) },
 }));
 
-import { resolveAdjacent, usePlayerStore, type PlayerTrack } from "./playerStore";
+import { insertIntoQueue, resolveAdjacent, usePlayerStore, type PlayerTrack } from "./playerStore";
 
 const track = (id: string): PlayerTrack => ({ id, title: id, filePath: `/music/${id}.mp3` });
 
 const a = track("a");
 const b = track("b");
 const c = track("c");
+const d = track("d");
 
 function resetStore(patch: Partial<ReturnType<typeof usePlayerStore.getState>>) {
   usePlayerStore.setState({
@@ -72,6 +73,57 @@ describe("resolveAdjacent (queue navigation)", () => {
     const rand = vi.spyOn(Math, "random").mockReturnValue(0.99);
     expect(resolveAdjacent(b, [a, b, c], true, -1)).toEqual(a);
     rand.mockRestore();
+  });
+});
+
+describe("insertIntoQueue", () => {
+  it("inserts a play-next track immediately after the current one", () => {
+    expect(insertIntoQueue([a, b, c], a, d, "next")).toEqual([a, d, b, c]);
+  });
+
+  it("appends an add-to-queue track to the tail", () => {
+    expect(insertIntoQueue([a, b, c], a, d, "end")).toEqual([a, b, c, d]);
+  });
+
+  it("moves an already-queued track rather than duplicating it (play next)", () => {
+    expect(insertIntoQueue([a, b, c], a, c, "next")).toEqual([a, c, b]);
+  });
+
+  it("seeds the queue with current when current isn't in it", () => {
+    expect(insertIntoQueue([b, c], a, d, "next")).toEqual([a, d]);
+  });
+
+  it("is a no-op when queueing the currently-playing track", () => {
+    const q = [a, b, c];
+    expect(insertIntoQueue(q, a, a, "next")).toBe(q);
+  });
+});
+
+describe("queueNext / addToQueue", () => {
+  it("queueNext resumes the original order after the injected track", () => {
+    resetStore({ currentTrack: a, queue: [a, b, c] });
+    usePlayerStore.getState().queueNext(d); // -> [a, d, b, c]
+
+    usePlayerStore.getState().playNext();
+    expect(usePlayerStore.getState().currentTrack).toEqual(d);
+    usePlayerStore.getState().playNext();
+    expect(usePlayerStore.getState().currentTrack).toEqual(b); // back on track
+  });
+
+  it("addToQueue plays after the queue is exhausted", () => {
+    resetStore({ currentTrack: b, queue: [a, b] });
+    usePlayerStore.getState().addToQueue(d); // -> [a, b, d]
+    usePlayerStore.getState().playNext();
+    expect(usePlayerStore.getState().currentTrack).toEqual(d);
+  });
+
+  it("queueNext with nothing playing starts the track", () => {
+    resetStore({ currentTrack: null, queue: [] });
+    usePlayerStore.getState().queueNext(d);
+    const s = usePlayerStore.getState();
+    expect(s.currentTrack).toEqual(d);
+    expect(s.isPlaying).toBe(true);
+    expect(s.queue).toEqual([d]);
   });
 });
 

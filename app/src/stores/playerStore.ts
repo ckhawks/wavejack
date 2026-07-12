@@ -33,6 +33,10 @@ interface PlayerStore {
   shuffle: boolean;
   playTrack: (track: PlayerTrack) => void;
   setQueue: (tracks: PlayerTrack[]) => void;
+  /** Insert a track to play immediately after the current one. */
+  queueNext: (track: PlayerTrack) => void;
+  /** Append a track to the end of the current playback queue. */
+  addToQueue: (track: PlayerTrack) => void;
   toggleShuffle: () => void;
   togglePlayPause: () => void;
   setPlaying: (playing: boolean) => void;
@@ -96,6 +100,30 @@ export function resolveAdjacent(
   return trackFromDownloadId(ids[nextIdx]);
 }
 
+/** Insert `track` into `queue` relative to `current`.
+ *  - "next": immediately after the current track (Spotify "Play next").
+ *  - "end":  at the tail (Spotify "Add to queue").
+ *  Any existing occurrence of `track` is removed first so a song can't appear
+ *  twice. When `current` isn't already in the queue (e.g. playback came from
+ *  download adjacency, not an explicit queue), the queue is seeded with it so
+ *  playNext has a defined anchor to resume from. Exported for unit tests. */
+export function insertIntoQueue(
+  queue: PlayerTrack[],
+  current: PlayerTrack,
+  track: PlayerTrack,
+  mode: "next" | "end",
+): PlayerTrack[] {
+  // Queueing the currently-playing track relative to itself is a no-op.
+  if (track.id === current.id) return queue;
+
+  const base = queue.some((t) => t.id === current.id) ? queue : [current];
+  const next = base.filter((t) => t.id !== track.id);
+  const anchor = next.findIndex((t) => t.id === current.id);
+  if (mode === "next") next.splice(anchor + 1, 0, track);
+  else next.push(track);
+  return next;
+}
+
 export const usePlayerStore = create<PlayerStore>((set, get) => ({
   currentTrack: null,
   isPlaying: false,
@@ -113,6 +141,27 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
     set({ currentTrack: track, isPlaying: true, currentTime: 0, duration: 0, forward: [] }),
 
   setQueue: (tracks) => set({ queue: tracks }),
+
+  // With nothing playing there's no "next" to queue against — just start it.
+  queueNext: (track) => {
+    const { currentTrack, queue } = get();
+    if (!currentTrack) {
+      get().playTrack(track);
+      set({ queue: [track] });
+      return;
+    }
+    set({ queue: insertIntoQueue(queue, currentTrack, track, "next") });
+  },
+
+  addToQueue: (track) => {
+    const { currentTrack, queue } = get();
+    if (!currentTrack) {
+      get().playTrack(track);
+      set({ queue: [track] });
+      return;
+    }
+    set({ queue: insertIntoQueue(queue, currentTrack, track, "end") });
+  },
 
   toggleShuffle: () => {
     const next = !get().shuffle;

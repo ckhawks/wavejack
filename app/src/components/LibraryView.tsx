@@ -46,6 +46,7 @@ import {
   type SortState,
   type ViewMode,
   type LibraryListProps,
+  playerTrackFromLibrary,
 } from "./library/libraryShared";
 import {
   applyLibraryMetadata,
@@ -395,24 +396,8 @@ export function LibraryView() {
     // Push the current displayed order into the player as the queue, so when
     // the track ends the player can advance to whatever's next in the user's
     // sorted/filtered list.
-    usePlayerStore.getState().setQueue(
-      displayed.map((t) => ({
-        id: t.path,
-        title: t.title,
-        artist: t.artist,
-        filePath: t.path,
-        coverArtBase64: t.cover_art_base64 || undefined,
-        durationSecs: t.duration_secs || undefined,
-      }))
-    );
-    playTrack({
-      id: track.path,
-      title: track.title,
-      artist: track.artist,
-      filePath: track.path,
-      coverArtBase64: track.cover_art_base64 || undefined,
-      durationSecs: track.duration_secs || undefined,
-    });
+    usePlayerStore.getState().setQueue(displayed.map(playerTrackFromLibrary));
+    playTrack(playerTrackFromLibrary(track));
   };
 
   const handleDiscoverSimilar = (track: LibraryTrack) => {
