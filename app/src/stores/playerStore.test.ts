@@ -13,7 +13,7 @@ vi.mock("./downloadStore", () => ({
   useDownloadStore: { getState: () => ({ downloads: [] }) },
 }));
 
-import { insertIntoQueue, resolveAdjacent, usePlayerStore, type PlayerTrack } from "./playerStore";
+import { insertIntoQueue, reorder, resolveAdjacent, usePlayerStore, type PlayerTrack } from "./playerStore";
 
 const track = (id: string): PlayerTrack => ({ id, title: id, filePath: `/music/${id}.mp3` });
 
@@ -124,6 +124,40 @@ describe("queueNext / addToQueue", () => {
     expect(s.currentTrack).toEqual(d);
     expect(s.isPlaying).toBe(true);
     expect(s.queue).toEqual([d]);
+  });
+});
+
+describe("reorder", () => {
+  it("moves an element forward", () => {
+    expect(reorder([a, b, c, d], 0, 2)).toEqual([b, c, a, d]);
+  });
+
+  it("moves an element backward", () => {
+    expect(reorder([a, b, c, d], 3, 1)).toEqual([a, d, b, c]);
+  });
+
+  it("clamps an out-of-range target to the end", () => {
+    expect(reorder([a, b, c], 0, 99)).toEqual([b, c, a]);
+  });
+
+  it("returns the same reference for a no-op move", () => {
+    const q = [a, b, c];
+    expect(reorder(q, 1, 1)).toBe(q);
+    expect(reorder(q, 5, 0)).toBe(q);
+  });
+});
+
+describe("removeFromQueue / reorderQueue", () => {
+  it("removes a queued track by id", () => {
+    resetStore({ currentTrack: a, queue: [a, b, c] });
+    usePlayerStore.getState().removeFromQueue(b.id);
+    expect(usePlayerStore.getState().queue).toEqual([a, c]);
+  });
+
+  it("reorders the queue by absolute index", () => {
+    resetStore({ currentTrack: a, queue: [a, b, c, d] });
+    usePlayerStore.getState().reorderQueue(3, 1);
+    expect(usePlayerStore.getState().queue).toEqual([a, d, b, c]);
   });
 });
 

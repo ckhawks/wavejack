@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { Volume2, VolumeX, X, Shuffle, Maximize2 } from "lucide-react";
+import { Volume2, VolumeX, X, Shuffle, Maximize2, ListMusic } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { usePlayerStore } from "../stores/playerStore";
 import { useDiscoverStore } from "../stores/discoverStore";
@@ -18,6 +18,7 @@ import { SILENT_AUDIO_DATA_URI } from "../lib/silentAudio";
 import { WaveformBar } from "./WaveformBar";
 import { SpectrogramBar } from "./SpectrogramBar";
 import { ImmersivePlayer } from "./ImmersivePlayer";
+import { QueuePanel } from "./QueuePanel";
 
 function formatTime(seconds: number): string {
   if (!isFinite(seconds) || seconds < 0) return "0:00";
@@ -94,6 +95,8 @@ function Slider({
 
 export function AudioPlayer() {
   const [showImmersive, setShowImmersive] = useState(false);
+  const [showQueue, setShowQueue] = useState(false);
+  const queueCount = usePlayerStore((s) => s.queue.length);
   // Near-silent looping element that keeps Chromium's MediaSession active.
   // Real audio plays in the Rust process (rodio), which the webview can't feed
   // to MediaSession — without a playing media element in the DOM, the OS media
@@ -333,6 +336,9 @@ export function AudioPlayer() {
       {/* Immersive (full-screen now playing) mode */}
       {showImmersive && <ImmersivePlayer onClose={() => setShowImmersive(false)} />}
 
+      {/* Up Next queue panel */}
+      {showQueue && <QueuePanel onClose={() => setShowQueue(false)} />}
+
       <div className="fixed bottom-0 left-0 right-0 z-50">
         <SpectrogramBar />
         <WaveformBar />
@@ -393,6 +399,20 @@ export function AudioPlayer() {
         <span className="w-10 shrink-0 text-xs text-neutral-500">
           {formatTime(duration)}
         </span>
+
+        {/* Up Next queue */}
+        <button
+          onClick={() => setShowQueue((v) => !v)}
+          className={`relative rounded p-1.5 transition-colors ${
+            showQueue ? "text-violet-400 hover:text-violet-300" : "text-neutral-400 hover:text-white"
+          }`}
+          title="Up next"
+        >
+          <ListMusic size={16} />
+          {queueCount > 1 && (
+            <span className="absolute -right-0.5 -top-0.5 h-1.5 w-1.5 rounded-full bg-violet-400" />
+          )}
+        </button>
 
         {/* Shuffle */}
         <button

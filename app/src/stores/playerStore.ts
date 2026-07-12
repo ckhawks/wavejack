@@ -37,6 +37,12 @@ interface PlayerStore {
   queueNext: (track: PlayerTrack) => void;
   /** Append a track to the end of the current playback queue. */
   addToQueue: (track: PlayerTrack) => void;
+  /** Drop a queued track by id (used by the Up Next panel). */
+  removeFromQueue: (id: string) => void;
+  /** Move a queued track between absolute queue positions (drag-to-reorder). */
+  reorderQueue: (from: number, to: number) => void;
+  /** Empty the whole playback queue without stopping the current track. */
+  clearQueue: () => void;
   toggleShuffle: () => void;
   togglePlayPause: () => void;
   setPlaying: (playing: boolean) => void;
@@ -124,6 +130,18 @@ export function insertIntoQueue(
   return next;
 }
 
+/** Move the element at `from` to `to`, clamping out-of-range indices. Returns a
+ *  new array (or the same reference when the move is a no-op). Exported for tests. */
+export function reorder<T>(arr: T[], from: number, to: number): T[] {
+  if (from < 0 || from >= arr.length || from === to) return arr;
+  const clampedTo = Math.max(0, Math.min(to, arr.length - 1));
+  if (from === clampedTo) return arr;
+  const next = [...arr];
+  const [moved] = next.splice(from, 1);
+  next.splice(clampedTo, 0, moved);
+  return next;
+}
+
 export const usePlayerStore = create<PlayerStore>((set, get) => ({
   currentTrack: null,
   isPlaying: false,
@@ -162,6 +180,12 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
     }
     set({ queue: insertIntoQueue(queue, currentTrack, track, "end") });
   },
+
+  removeFromQueue: (id) => set((s) => ({ queue: s.queue.filter((t) => t.id !== id) })),
+
+  reorderQueue: (from, to) => set((s) => ({ queue: reorder(s.queue, from, to) })),
+
+  clearQueue: () => set({ queue: [] }),
 
   toggleShuffle: () => {
     const next = !get().shuffle;
