@@ -2,6 +2,10 @@
 
 Desktop media app: (1) download/organize music+video via yt-dlp/Cobalt, (2) plug.dj-style DJ rooms with local music.
 
+## Ecosystem
+
+One of four sibling repos (all under `github.com/ckhawks`). Wavejack = acquisition + casual local library + Rooms — **not** the canonical DJ library (that's Rekordbox, managed by `music-library-tools` + `puck-festival-tools` on the Mac). Wavejack's SQLite library is casual/personal and hands tagged files to the Mac side via a synced inbox. Full cross-repo picture + settled decisions: https://github.com/ckhawks/puck-festival-tools/blob/main/ecosystem-map.md
+
 ## Structure
 
 - `app/` — Tauri v2 (Rust + React/TS), `cd app && pnpm tauri dev`
