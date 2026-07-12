@@ -36,16 +36,18 @@ export function LibraryCompactView({
                 : isActive ? "bg-[#141414]" : ""
             }`}
           >
-            {/* Faded cover art bleeding in from the right. Clipping lives on this
-                inner wrapper (not the row) so hover popovers can overflow. */}
+            {/* Full-bleed cover art tinting the whole row, with a scrim that
+                stays darkest on the left to keep the title/artist legible.
+                Clipping lives on this wrapper (not the row) so hover popovers
+                can overflow. */}
             {track.cover_art_base64 && (
               <div className="pointer-events-none absolute inset-0 overflow-hidden rounded">
                 <img
                   src={`data:image/jpeg;base64,${track.cover_art_base64}`}
                   alt=""
-                  className="absolute inset-y-0 right-0 h-full w-1/2 object-cover opacity-25 transition-opacity group-hover:opacity-40"
+                  className="absolute inset-0 h-full w-full object-cover opacity-60 transition-opacity group-hover:opacity-75"
                 />
-                <div className="absolute inset-0 bg-gradient-to-r from-[#0a0a0a] via-[#0a0a0a]/85 to-transparent" />
+                <div className="absolute inset-0 bg-gradient-to-r from-[#0a0a0a]/90 via-[#0a0a0a]/35 to-transparent" />
               </div>
             )}
 
