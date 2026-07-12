@@ -98,7 +98,7 @@ export function QueuePanel({ onClose }: { onClose: () => void }) {
 
       <div
         ref={listRef}
-        className="flex-1 overflow-y-auto [&::-webkit-scrollbar-thumb]:rounded [&::-webkit-scrollbar-thumb]:bg-[#333] [&::-webkit-scrollbar]:w-2"
+        className="flex-1 overflow-y-auto pb-2 [&::-webkit-scrollbar-thumb]:rounded [&::-webkit-scrollbar-thumb]:bg-[#333] [&::-webkit-scrollbar]:w-2"
       >
         {upcoming.length === 0 ? (
           <p className="px-3 py-6 text-center text-[11px] text-neutral-600">
