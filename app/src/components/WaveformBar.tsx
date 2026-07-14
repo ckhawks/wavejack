@@ -107,9 +107,15 @@ export function WaveformBar({
       return;
     }
 
-    // Static bar geometry inputs.
+    // Static bar geometry inputs. Position bars on a fixed stride of
+    // width/buckets so they ALWAYS span exactly 0..width. Deriving x from a
+    // clamped barWidth (min 1px) overflowed the canvas whenever there were more
+    // buckets than pixels — e.g. the narrower fullscreen waveform (~768px vs
+    // ~500 buckets) — which pushed the end of the song off the right edge and
+    // clipped it. The wide bottom bar stayed under the clamp, so it looked fine.
     const buckets = profile.length;
-    const barWidth = Math.max(1, (width - (buckets - 1) * BAR_GAP) / buckets);
+    const stride = width / buckets;
+    const barWidth = Math.max(1, stride - BAR_GAP);
     // Cascade-in: each bar grows from a flat line to full amplitude as a wave
     // sweeps left-to-right. CASCADE_SPAN = how many bars are mid-animation at
     // once (lower = sharper). Runs over ~600ms after load.
@@ -120,7 +126,7 @@ export function WaveformBar({
     const buildPath = (appearProgress: number) => {
       const path = new Path2D();
       for (let i = 0; i < buckets; i++) {
-        const x = i * (barWidth + BAR_GAP);
+        const x = i * stride;
         const amp = profile[i] / 255;
         const localT = Math.max(
           0,

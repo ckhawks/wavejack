@@ -8,10 +8,25 @@ interface RemoteAction {
   delta?: number;
 }
 
-const VOLUME_STEP = 0.1;
+// Perceptual volume ladder: closely spaced near silence, wider toward the top,
+// since perceived loudness is roughly logarithmic. Remote up/down moves one
+// stop. Note the small first step out of mute (0 → 0.01 → 0.03) for fine
+// control at the quiet end.
+export const VOLUME_STOPS = [
+  0, 0.01, 0.03, 0.06, 0.1, 0.15, 0.22, 0.3, 0.4, 0.52, 0.66, 0.82, 1,
+];
 
-function clamp(v: number, lo: number, hi: number): number {
-  return Math.max(lo, Math.min(hi, v));
+/** Next volume for a remote up/down press, one stop along VOLUME_STOPS. */
+export function nextVolume(current: number, direction: "up" | "down"): number {
+  // eps tolerates float drift and slider positions that land between stops.
+  const eps = 1e-4;
+  if (direction === "up") {
+    return VOLUME_STOPS.find((s) => s > current + eps) ?? 1;
+  }
+  for (let i = VOLUME_STOPS.length - 1; i >= 0; i--) {
+    if (VOLUME_STOPS[i] < current - eps) return VOLUME_STOPS[i];
+  }
+  return 0;
 }
 
 /**
@@ -33,9 +48,9 @@ export function useRemoteEvents() {
     const unlistenPlayer = listen<RemoteAction>("player:remote", (e) => {
       const player = usePlayerStore.getState();
       if (e.payload.action === "volume-up") {
-        player.setVolume(clamp(player.volume + VOLUME_STEP, 0, 1));
+        player.setVolume(nextVolume(player.volume, "up"));
       } else if (e.payload.action === "volume-down") {
-        player.setVolume(clamp(player.volume - VOLUME_STEP, 0, 1));
+        player.setVolume(nextVolume(player.volume, "down"));
       } else if (e.payload.action === "toggle") {
         player.togglePlayPause();
       }

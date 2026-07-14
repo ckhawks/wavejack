@@ -109,29 +109,21 @@ async fn discover_reject(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn volume_up(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<StatusCode, StatusCode> {
-    check_token(&state, &headers)?;
-    emit(&state, "player:remote", "volume-up", Some(10));
-    Ok(StatusCode::NO_CONTENT)
+// Player transport endpoints are unauthenticated: the server is loopback-only
+// and these actions are harmless and reversible (volume/play-pause). Skipping
+// the token lets a plain POST from a Stream Deck button work with no plugin.
+// The discover endpoints keep the token because they mutate the library.
+async fn volume_up(State(state): State<AppState>) -> StatusCode {
+    emit(&state, "player:remote", "volume-up", Some(7));
+    StatusCode::NO_CONTENT
 }
 
-async fn volume_down(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<StatusCode, StatusCode> {
-    check_token(&state, &headers)?;
-    emit(&state, "player:remote", "volume-down", Some(10));
-    Ok(StatusCode::NO_CONTENT)
+async fn volume_down(State(state): State<AppState>) -> StatusCode {
+    emit(&state, "player:remote", "volume-down", Some(7));
+    StatusCode::NO_CONTENT
 }
 
-async fn play_pause(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<StatusCode, StatusCode> {
-    check_token(&state, &headers)?;
+async fn play_pause(State(state): State<AppState>) -> StatusCode {
     emit(&state, "player:remote", "toggle", None);
-    Ok(StatusCode::NO_CONTENT)
+    StatusCode::NO_CONTENT
 }

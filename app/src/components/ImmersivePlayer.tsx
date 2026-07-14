@@ -3,9 +3,24 @@ import { X, Shuffle, Volume2, VolumeX } from "lucide-react";
 import { usePlayerStore } from "../stores/playerStore";
 import { extractDominantColors, type DominantColor } from "../lib/colorThief";
 import { WaveformBar } from "./WaveformBar";
+import { VisualizerCanvas } from "./visualizers/VisualizerCanvas";
+import { BACKDROP_OPTIONS, AMBIENT_ID } from "../lib/visualizers";
 
 interface Props {
   onClose: () => void;
+}
+
+/** Persist the chosen immersive backdrop across sessions. Frontend-only, so a
+ * localStorage key rather than a Rust-side setting. */
+const BACKDROP_KEY = "wj.immersive.backdrop";
+function loadBackdrop(): string {
+  try {
+    const v = localStorage.getItem(BACKDROP_KEY);
+    if (v && BACKDROP_OPTIONS.some((o) => o.id === v)) return v;
+  } catch {
+    // localStorage can throw in locked-down webviews; fall back to default.
+  }
+  return AMBIENT_ID;
 }
 
 /** Lift an RGB color's lightness in HSL space to at least `minL` (0..1).
@@ -91,7 +106,17 @@ export function ImmersivePlayer({ onClose }: Props) {
   const setVolume = usePlayerStore((s) => s.setVolume);
 
   const [colors, setColors] = useState<DominantColor[]>([]);
+  const [backdrop, setBackdrop] = useState<string>(loadBackdrop);
   const containerRef = useRef<HTMLDivElement | null>(null);
+
+  const selectBackdrop = (id: string) => {
+    setBackdrop(id);
+    try {
+      localStorage.setItem(BACKDROP_KEY, id);
+    } catch {
+      // Non-fatal: the choice just won't persist.
+    }
+  };
 
   // Extract dominant colors per track
   useEffect(() => {
@@ -130,11 +155,20 @@ export function ImmersivePlayer({ onClose }: Props) {
   const accent = palette.slice().sort((a, b) => luminance(b) - luminance(a))[0];
   const bright = brighten(accent, 0.7); // floor lightness at 70%
   const playedColor = `rgb(${bright.r},${bright.g},${bright.b})`;
-  const unplayedColor = `rgba(${bright.r},${bright.g},${bright.b},0.25)`;
+  // Unplayed must be OPAQUE, not a low-alpha tint: the immersive backdrop (color
+  // blobs / visualizer) shows through a translucent fill and, over a bright
+  // blob, washes the unplayed bars up to the same brightness as the played
+  // ones — hiding the playhead so it looks like the track isn't progressing. A
+  // dimmed-but-opaque accent keeps the hue while guaranteeing the seam is
+  // visible over any background.
+  const unplayedColor = `rgb(${Math.round(bright.r * 0.35)},${Math.round(
+    bright.g * 0.35,
+  )},${Math.round(bright.b * 0.35)})`;
 
   return (
     <div
       ref={containerRef}
+      data-tauri-drag-region
       className="fixed inset-0 z-[60] flex flex-col overflow-hidden bg-black text-white"
     >
       {/* Animated color background — each dominant color is its own slow-
@@ -154,30 +188,34 @@ export function ImmersivePlayer({ onClose }: Props) {
         }
       `}</style>
       <div className="pointer-events-none absolute inset-0 bg-[#0a0a0a]" />
-      {palette.map((c, i) => {
-        const placements = [
-          { left: "-15%", top: "-10%", w: "70vw", h: "70vh", anim: "wj-blob-drift-0", dur: "12s" },
-          { right: "-15%", top: "10%", w: "60vw", h: "60vh", anim: "wj-blob-drift-1", dur: "16s" },
-          { left: "20%", bottom: "-20%", w: "80vw", h: "60vh", anim: "wj-blob-drift-2", dur: "20s" },
-        ];
-        const p = placements[i % placements.length];
-        return (
-          <div
-            key={i}
-            className="pointer-events-none absolute rounded-full opacity-90 mix-blend-screen blur-3xl transition-[background] duration-1000"
-            style={{
-              left: p.left,
-              right: p.right,
-              top: p.top,
-              bottom: p.bottom,
-              width: p.w,
-              height: p.h,
-              background: `radial-gradient(circle, rgba(${c.r},${c.g},${c.b},0.85) 0%, rgba(${c.r},${c.g},${c.b},0) 70%)`,
-              animation: `${p.anim} ${p.dur} ease-in-out infinite`,
-            }}
-          />
-        );
-      })}
+      {backdrop === AMBIENT_ID ? (
+        palette.map((c, i) => {
+          const placements = [
+            { left: "-15%", top: "-10%", w: "70vw", h: "70vh", anim: "wj-blob-drift-0", dur: "12s" },
+            { right: "-15%", top: "10%", w: "60vw", h: "60vh", anim: "wj-blob-drift-1", dur: "16s" },
+            { left: "20%", bottom: "-20%", w: "80vw", h: "60vh", anim: "wj-blob-drift-2", dur: "20s" },
+          ];
+          const p = placements[i % placements.length];
+          return (
+            <div
+              key={i}
+              className="pointer-events-none absolute rounded-full opacity-90 mix-blend-screen blur-3xl transition-[background] duration-1000"
+              style={{
+                left: p.left,
+                right: p.right,
+                top: p.top,
+                bottom: p.bottom,
+                width: p.w,
+                height: p.h,
+                background: `radial-gradient(circle, rgba(${c.r},${c.g},${c.b},0.85) 0%, rgba(${c.r},${c.g},${c.b},0) 70%)`,
+                animation: `${p.anim} ${p.dur} ease-in-out infinite`,
+              }}
+            />
+          );
+        })
+      ) : (
+        <VisualizerCanvas visualizerId={backdrop} palette={palette} />
+      )}
       <div className="pointer-events-none absolute inset-0 bg-gradient-to-b from-black/40 via-transparent to-black/70" />
 
       {/* Close button */}
@@ -189,18 +227,49 @@ export function ImmersivePlayer({ onClose }: Props) {
         <X size={20} />
       </button>
 
-      {/* Center content: album art → title/artist → waveform */}
-      <div className="relative z-10 flex flex-1 flex-col items-center justify-center gap-6 px-8">
+      {/* Backdrop / visualizer picker */}
+      <div className="absolute left-6 top-6 z-30 flex items-center gap-1 rounded-full bg-black/40 p-1 backdrop-blur">
+        {BACKDROP_OPTIONS.map((o) => (
+          <button
+            key={o.id}
+            onClick={() => selectBackdrop(o.id)}
+            className={`rounded-full px-3 py-1 text-xs font-medium transition-colors ${
+              backdrop === o.id
+                ? "bg-white/90 text-black"
+                : "text-white/70 hover:bg-white/10 hover:text-white"
+            }`}
+            title={`${o.name} background`}
+          >
+            {o.name}
+          </button>
+        ))}
+      </div>
+
+      {/* Center content: album art → title/artist → waveform. The empty areas
+          and the album art are drag regions so the window can be moved while in
+          this fake-fullscreen overlay; interactive children (waveform, buttons)
+          still receive their own events. */}
+      <div
+        data-tauri-drag-region
+        className="relative z-10 flex flex-1 flex-col items-center justify-center gap-6 px-8"
+      >
         {/* Album art */}
-        <div className="aspect-square h-[50vh] max-h-[560px] min-h-[240px] overflow-hidden rounded-2xl shadow-[0_30px_80px_rgba(0,0,0,0.6)]">
+        <div
+          data-tauri-drag-region
+          className="aspect-square h-[50vh] max-h-[560px] min-h-[240px] overflow-hidden rounded-2xl shadow-[0_30px_80px_rgba(0,0,0,0.6)]"
+        >
           {currentTrack.coverArtBase64 ? (
             <img
+              data-tauri-drag-region
               src={`data:image/jpeg;base64,${currentTrack.coverArtBase64}`}
               alt=""
               className="h-full w-full object-cover"
             />
           ) : (
-            <div className="flex h-full w-full items-center justify-center bg-[#1a1a1a] text-neutral-700">
+            <div
+              data-tauri-drag-region
+              className="flex h-full w-full items-center justify-center bg-[#1a1a1a] text-neutral-700"
+            >
               <PlayIcon size={64} />
             </div>
           )}
@@ -221,8 +290,11 @@ export function ImmersivePlayer({ onClose }: Props) {
       </div>
 
       {/* Bottom row: playback controls + shuffle/volume on the right */}
-      <div className="relative z-10 flex items-center justify-between gap-6 px-8 pb-8">
-        <div className="w-40" />{/* spacer to balance the row */}
+      <div
+        data-tauri-drag-region
+        className="relative z-10 flex items-center justify-between gap-6 px-8 pb-8"
+      >
+        <div data-tauri-drag-region className="w-40" />{/* spacer to balance the row */}
         <div className="flex items-center gap-6">
           <button
             onClick={playPrev}

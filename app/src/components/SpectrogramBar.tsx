@@ -1,24 +1,17 @@
 import { useEffect, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
 import { usePlayerStore } from "../stores/playerStore";
+import { useSpectrum, SPECTRUM_BANDS as BANDS } from "../hooks/useSpectrum";
 
 const HEIGHT = 28;
-// Match SPECTRUM_BANDS in audio.rs. The Rust side log-buckets the FFT and
-// pushes a Vec<f32> at ~60Hz; we just render whatever it sends.
-const BANDS = 48;
-
-interface SpectrumPayload {
-  bins: number[];
-}
 
 export function SpectrogramBar() {
   const currentTrack = usePlayerStore((s) => s.currentTrack);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [width, setWidth] = useState(0);
-  // Latest bins from Rust. A ref so the listener doesn't trigger React
-  // re-renders on every event — the canvas redraw is rAF-driven.
-  const binsRef = useRef<number[]>(new Array(BANDS).fill(0));
+  // Latest bins from Rust, kept in a ref so events don't trigger re-renders —
+  // the canvas redraw is rAF-driven.
+  const binsRef = useSpectrum();
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -27,19 +20,6 @@ export function SpectrogramBar() {
     obs.observe(el);
     setWidth(el.clientWidth);
     return () => obs.disconnect();
-  }, []);
-
-  // Subscribe to spectrum events for the lifetime of the component.
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    listen<SpectrumPayload>("audio://spectrum", (e) => {
-      binsRef.current = e.payload.bins;
-    }).then((u) => {
-      unlisten = u;
-    });
-    return () => {
-      unlisten?.();
-    };
   }, []);
 
   useEffect(() => {

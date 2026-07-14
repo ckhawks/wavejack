@@ -324,13 +324,15 @@ export function Settings({ onClose }: Props) {
               </button>
             </div>
             <p className="mt-1.5 text-xs text-neutral-600">
-              Send <span className="font-mono">POST http://127.0.0.1:{remotePort ?? "7406"}/...</span>{" "}
-              with header <span className="font-mono">X-Wavejack-Token</span>.
-              Endpoints: <span className="font-mono">/discover/approve</span>,{" "}
-              <span className="font-mono">/discover/skip</span>,{" "}
+              Send <span className="font-mono">POST http://127.0.0.1:{remotePort ?? "7406"}/...</span>.
+              Player endpoints (no token needed):{" "}
               <span className="font-mono">/player/volume/up</span>,{" "}
               <span className="font-mono">/player/volume/down</span>,{" "}
-              <span className="font-mono">/player/play-pause</span>.
+              <span className="font-mono">/player/play-pause</span>. Discover
+              endpoints need header <span className="font-mono">X-Wavejack-Token</span>:{" "}
+              <span className="font-mono">/discover/approve</span>,{" "}
+              <span className="font-mono">/discover/skip</span>,{" "}
+              <span className="font-mono">/discover/reject</span>.
             </p>
           </div>
 
