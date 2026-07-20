@@ -2,6 +2,8 @@
 
 A desktop app for downloading, organizing, and sharing music.
 
+![Wavejack — Home](docs/screenshots/home.png)
+
 ## Where this fits
 
 Wavejack is the **acquisition + casual-playback** corner of a four-repo personal music/DJ tooling ecosystem (all under [`github.com/ckhawks`](https://github.com/ckhawks)):
@@ -33,6 +35,16 @@ Full picture — all four repos, how they connect, the shared inbox funnel, and 
 - Take turns playing music from your local library
 - Upvote, downvote, or save tracks to your own collection
 - Real-time chat and synchronized playback
+
+## Screenshots
+
+| Library — tagged tracks with live waveforms | Downloads — batch queue |
+| :---: | :---: |
+| ![Library](docs/screenshots/library.png) | ![Downloads](docs/screenshots/downloads.png) |
+| **Discover — Last.fm-style recommendations** | **Feed — channel & account subscriptions** |
+| ![Discover](docs/screenshots/discover.png) | ![Feed](docs/screenshots/feed.png) |
+| **Recent** | **Guessing game (Extras)** |
+| ![Recent](docs/screenshots/recent.png) | ![Guessing game](docs/screenshots/guessing-game.png) |
 
 ## Tech Stack
 
